@@ -26,6 +26,15 @@ static inline int serial_transmisor_vacio(void) {
     return leer_puerto_b(PUERTO_COM1 + 5) & 0x20;
 }
 
+int serial_hay_datos(void) {
+    return leer_puerto_b(PUERTO_COM1 + 5) & 0x01;
+}
+
+char serial_leer_caracter(void) {
+    while (serial_hay_datos() == 0);
+    return (char)leer_puerto_b(PUERTO_COM1);
+}
+
 void serial_escribir_caracter(char c) {
     while (serial_transmisor_vacio() == 0);
     escribir_puerto_b(PUERTO_COM1, (uint8_t)c);

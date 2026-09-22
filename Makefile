@@ -31,7 +31,10 @@ C_SRCS    = nucleo/principal.c \
             nucleo/base/tiempo.c \
             nucleo/controladores/pantalla.c \
             nucleo/controladores/audio_ac97.c \
-            nucleo/controladores/animacion_cangrejo.c
+            nucleo/controladores/animacion_cangrejo.c \
+            nucleo/controladores/teclado.c \
+            nucleo/controladores/consola.c \
+            nucleo/controladores/terminal.c
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
 
@@ -96,19 +99,20 @@ $(KERNEL): $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 
 $(IMG): $(KERNEL) boot/limine.conf
-	@echo "==> Generando Imagen de Arranque UEFI FAT32 (128 MB)..."
-	@rm -f $(IMG)
-	@dd if=/dev/zero of=$(IMG) bs=1M count=128 status=none
-	@mformat -i $(IMG) -F ::
-	@mmd -i $(IMG) ::/EFI
-	@mmd -i $(IMG) ::/EFI/BOOT
-	@mmd -i $(IMG) ::/boot
-	@mmd -i $(IMG) ::/boot/limine
-	@mcopy -i $(IMG) boot/limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-	@mcopy -i $(IMG) boot/limine.conf ::/boot/limine/limine.conf
-	@mcopy -i $(IMG) boot/limine.conf ::/limine.conf
-	@mcopy -i $(IMG) $(KERNEL) ::/boot/nucleo.elf
-	@echo "==> Imagen $(IMG) generada exitosamente!"
+	@echo "==> Generando / Actualizando Imagen de Arranque UEFI FAT32 (128 MB)..."
+	@if [ ! -f $(IMG) ]; then \
+		dd if=/dev/zero of=$(IMG) bs=1M count=128 status=none && \
+		mformat -i $(IMG) -F :: && \
+		mmd -i $(IMG) ::/EFI && \
+		mmd -i $(IMG) ::/EFI/BOOT && \
+		mmd -i $(IMG) ::/boot && \
+		mmd -i $(IMG) ::/boot/limine && \
+		mcopy -i $(IMG) boot/limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI; \
+	fi
+	@mcopy -o -i $(IMG) boot/limine.conf ::/boot/limine/limine.conf
+	@mcopy -o -i $(IMG) boot/limine.conf ::/limine.conf
+	@mcopy -o -i $(IMG) $(KERNEL) ::/boot/nucleo.elf
+	@echo "==> Imagen $(IMG) lista y sincronizada!"
 
 clean:
 	rm -rf $(BUILD_DIR)

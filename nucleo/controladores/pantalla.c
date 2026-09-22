@@ -1,4 +1,5 @@
 #include "pantalla.h"
+#include "fuente8x16.h"
 
 static void    *g_fb_base = NULL;
 static uint64_t g_ancho   = 0;
@@ -70,6 +71,48 @@ void pantalla_dibujar_imagen_centrada(int ancho, int alto, const uint32_t *pixel
         int copia_ancho = (inicio_x + ancho > (int)g_ancho) ? ((int)g_ancho - inicio_x) : ancho;
         for (int x = 0; x < copia_ancho; x++) {
             dest[x] = src[x];
+        }
+    }
+}
+
+void pantalla_dibujar_caracter(int col, int fila, uint8_t c, uint32_t fg, uint32_t bg) {
+    if (!g_fb_base) return;
+    int inicio_x = col * 8;
+    int inicio_y = fila * 16;
+    if (inicio_x + 8 > (int)g_ancho || inicio_y + 16 > (int)g_alto) return;
+
+    const uint8_t *glifo = g_fuente_8x16[c];
+    for (int y = 0; y < 16; y++) {
+        uint8_t bits = glifo[y];
+        uint32_t *dest = (uint32_t *)((uint8_t *)g_fb_base + (inicio_y + y) * g_pitch + inicio_x * 4);
+        for (int x = 0; x < 8; x++) {
+            dest[x] = (bits & (0x80 >> x)) ? fg : bg;
+        }
+    }
+}
+
+void pantalla_desplazar_arriba(int lineas, uint32_t color_fondo) {
+    if (!g_fb_base || lineas <= 0) return;
+    int pixeles_alto = lineas * 16;
+    if (pixeles_alto >= (int)g_alto) {
+        pantalla_limpiar(color_fondo);
+        return;
+    }
+
+    uint64_t bytes_a_copiar = (g_alto - pixeles_alto) * g_pitch;
+    uint64_t *dest = (uint64_t *)g_fb_base;
+    const uint64_t *src = (const uint64_t *)((const uint8_t *)g_fb_base + pixeles_alto * g_pitch);
+
+    uint64_t total_u64 = bytes_a_copiar / 8;
+    for (uint64_t i = 0; i < total_u64; i++) {
+        dest[i] = src[i];
+    }
+
+    // Limpiar las filas inferiores que quedaron libres
+    for (int y = (int)g_alto - pixeles_alto; y < (int)g_alto; y++) {
+        uint32_t *fila = (uint32_t *)((uint8_t *)g_fb_base + y * g_pitch);
+        for (uint64_t x = 0; x < g_ancho; x++) {
+            fila[x] = color_fondo;
         }
     }
 }

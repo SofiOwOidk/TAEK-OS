@@ -15,6 +15,7 @@
 #include "controladores/pantalla.h"
 #include "controladores/audio_ac97.h"
 #include "controladores/animacion_cangrejo.h"
+#include "controladores/terminal.h"
 
 // Revision 3 del protocolo Limine
 __attribute__((used, section(".requests")))
@@ -147,9 +148,14 @@ void principal(void) {
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("  [ OK ] Todas las etapas verificadas por El Huevo.           ");
     serial_imprimir_linea("  [ OK ] El Huevo sigue 100% INTACTO. Integridad: 100%.       ");
-    serial_imprimir_linea("  [ OK ] Sistema operativo listo. Entrando en reposo...       ");
+    serial_imprimir_linea("  [ OK ] Sistema operativo listo. Lanzando Terminal de Control... ");
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("");
+
+    esperar_milisegundos(1000);
+
+    // Iniciar la Terminal interactiva con el usuario 'sudo'
+    terminal_ejecutar();
 
     for (;;) {
         __asm__ volatile ("hlt");

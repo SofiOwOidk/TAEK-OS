@@ -99,6 +99,34 @@
 
 ---
 
+### [2026-09-22 17:15 - 17:21] — Hito 6: Terminal Gráfica Interactiva, Usuario «sudo» y Meme «sudo rm -rf /»
+* **Objetivo:** Implementar una terminal interactiva en Anillo 0 que arranque tras la secuencia musical de bienvenida, con el usuario `sudo` como usuario supremo (root por defecto), renderizado de texto gráfico sobre el Framebuffer GOP y el meme catastrófico de `sudo rm -rf /` conectado a Don Cangrejo.
+* **Archivos Creados / Modificados:**
+  * `nucleo/controladores/fuente8x16.h`: Matriz de fuente bitmap 8x16 CP437 completa (256 glifos, 4096 bytes) con soporte para caracteres españoles (`ñ`, `Ñ`, `á`, `é`, etc.) y caracteres de bloque/caja (`█`, `_`).
+  * `nucleo/controladores/teclado.h / .c`: Controlador de teclado PS/2 (puerto `0x60`/`0x64`) con Scancode Set 1, teclas modificadoras (Shift, Caps Lock) y decodificación no bloqueante.
+  * `nucleo/arquitectura/x86_64/serial.h / .c`: Implementadas funciones de lectura `serial_hay_datos()` y `serial_leer_caracter()` para permitir escribir también desde la consola serial.
+  * `nucleo/controladores/pantalla.h / .c`: Implementadas primitivas `pantalla_dibujar_caracter()` (dibujo directo de 8x16 píxeles a memoria de video) y `pantalla_desplazar_arriba()` (hardware scrolling copiando líneas en 64 bits con limpieza inferior).
+  * `nucleo/controladores/consola.h / .c`: Consola gráfica con cursor de bloque parpadeante, salto de línea, retroceso (`\b`), decodificación UTF-8 en vivo y entrada dual (PS/2 + Serial COM1).
+  * `nucleo/controladores/terminal.h / .c`: Terminal interactiva con el prompt `sudo@taek-os:~# `. Comandos soportados:
+    * `ayuda`: Menú de asistencia en español.
+    * `huevo`: Diagnóstico en tiempo real y arte ASCII de El Huevo.
+    * `info`: Datos técnicos del CPU x86_64, VMX Root y Framebuffer.
+    * `musica`: Reproducción de la sintonía por AC97 DMA.
+    * `cangrejo`: Ejecución manual de Don Cangrejo explotando.
+    * `calc <expr>`: Calculadora aritmética básica (estilo HolyC / C).
+    * `quiensoy`: Identidad del usuario (`sudo`).
+    * `eco <texto>`: Eco de texto.
+    * `limpiar` / `cls`: Limpieza de pantalla.
+    * `apagar`: Apagado limpio vía ACPI.
+    * `sudo rm -rf /`: Meme supremo: advierte del colapso del sistema, quiebra El Huevo y detona el protocolo Don Cangrejo en Ring -1 antes de apagar el equipo.
+  * `nucleo/principal.c`: Transición automática desde el splash screen y la música hacia `terminal_ejecutar()`.
+  * `Makefile`: Regla de generación de `taek-os.img` convertida a incremental (`mcopy -o`) para permitir compilar y actualizar el kernel sin necesidad de cerrar QEMU ni sufrir bloqueos de archivos en Windows.
+* **Pruebas y Verificación:**
+  * Happy Path: Arranque completo, prompt `sudo@taek-os:~# `, ejecución de `ayuda`, `quiensoy` y `calc 40 + 2` -> `42 (0x2A)`.
+  * Meme Path: Ejecución de `sudo rm -rf /` desencadenó la advertencia, fracturó El Huevo, lanzó los 2 bucles de Don Cangrejo con audio y apagó la máquina virtual con código 0.
+
+---
+
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
@@ -106,7 +134,7 @@
 | :--- | :--- | :--- |
 | **`instruction expected, found ' ['` en NASM** | `Set-Content -Encoding utf8` en PowerShell escribe una marca de orden de bytes (BOM `\xef\xbb\xbf`) al inicio del archivo. | Se creó una rutina con `sed -i '1s/^\xef\xbb\xbf//'` para eliminar el BOM de todos los archivos fuente. |
 | **`qemu: could not load PC BIOS`** | En QEMU moderno para x86_64, el firmware UEFI OVMF es una imagen pflash, no una BIOS legacy. | Se cambió el parámetro a `-drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd`. |
-| **`rm: cannot remove taek-os.img: Permission denied`** | QEMU seguía en ejecución en segundo plano o el usuario tenía la ventana abierta, bloqueando el archivo en Windows. | Se debe cerrar la ventana de QEMU antes de recompilar para liberar el manejador del archivo. |
+| **`rm: cannot remove taek-os.img: Permission denied`** | QEMU seguía en ejecución en segundo plano o el usuario tenía la ventana abierta, bloqueando el archivo en Windows. | Se modificó la regla del Makefile: ahora solo se crea la imagen si no existe, y las actualizaciones de `nucleo.elf` se hacen in-situ con `mcopy -o`, eliminando el bloqueo. |
 | **Mojibake `├▒` en consola** | La terminal de Windows usaba la página de códigos CP437 (DOS) en vez de UTF-8. | Se configuró `chcp 65001` y se añadió el módulo `utf8.c` en el núcleo. |
 | **`No rule to make target Recursos` en GNU Make** | El nombre de la carpeta contenía un espacio (`Recursos Asets`), rompiendo la sintaxis de prerequisitos en Make. | Se crearon enlaces simbólicos sin espacios (`recursos/fivenights.png` y `recursos/damonte.mp3`). |
 | **`limine.h API revision unsupported`** | `#define LIMINE_API_REVISION` se fijó en 3, pero la cabecera soporta hasta la revisión 2. | Se ajustó `#define LIMINE_API_REVISION 2` antes de incluir `limine.h`. |
