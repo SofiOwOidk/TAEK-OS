@@ -27,6 +27,35 @@ static int str_igual(const char *s1, const char *s2) {
     return s1[i] == s2[i];
 }
 
+static int str_igual_sin_caso(const char *s1, const char *s2) {
+    if (!s1 || !s2) return 0;
+    int i = 0;
+    while (s1[i] && s2[i]) {
+        char c1 = s1[i];
+        char c2 = s2[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return 0;
+        i++;
+    }
+    return s1[i] == s2[i];
+}
+
+static int g_el_comando_desbloqueado = 0;
+
+static uint32_t g_semilla_azar = 0x6A09E667;
+
+static uint32_t obtener_aleatorio(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    g_semilla_azar ^= (lo ^ (hi << 16));
+    // Generador Xorshift32
+    g_semilla_azar ^= g_semilla_azar << 13;
+    g_semilla_azar ^= g_semilla_azar >> 17;
+    g_semilla_azar ^= g_semilla_azar << 5;
+    return g_semilla_azar;
+}
+
 static int str_comienza_con(const char *str, const char *prefijo) {
     if (!str || !prefijo) return 0;
     int i = 0;
@@ -159,12 +188,86 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Muestra la identidad y privilegios del usuario.");
         consola_imprimir_color("  eco <texto>    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Imprime un texto en la consola.");
+        consola_imprimir_color("  ruleta         ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Ruleta Rusa (1/6 de morir tú, 1/6 de morir el sistema).");
+        if (g_el_comando_desbloqueado) {
+            consola_imprimir_color("  El comando     ", COLOR_USUARIO_DEFAULT);
+            consola_imprimir_linea(": [DESBLOQUEADO] Lo que hace es nada.");
+        }
         consola_imprimir_color("  limpiar / cls  ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Limpia la pantalla de la terminal.");
         consola_imprimir_color("  apagar         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Apaga el ordenador de forma limpia vía ACPI.");
         consola_imprimir_color("  sudo rm -rf /  ", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea_color(": [PELIGRO] No lo intentes si valoras tu existencia.", COLOR_ERROR_DEFAULT);
+        return;
+    }
+
+    // COMANDO: ruleta / ruleta_rusa / ruletarusa
+    if (str_igual_sin_caso(linea, "ruleta") || str_igual_sin_caso(linea, "ruleta rusa") ||
+        str_igual_sin_caso(linea, "ruleta_rusa") || str_igual_sin_caso(linea, "ruletarusa")) {
+        consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("  [ RULETA RUSA ] El tambor tiene 6 recámaras y 1 sola bala...", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("  [ RULETA RUSA ] Girando el cilindro: *chac-chac-chac-chac*...", COLOR_TEXTO_DEFAULT);
+        consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
+        esperar_milisegundos(1000);
+
+        // Turno del jugador (1 en 6 de morir)
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ TU TURNO ] Apuntas el revólver a tu cabeza y aprietas el gatillo...", COLOR_AVISO_DEFAULT);
+        esperar_milisegundos(1500);
+
+        uint32_t tiro_jugador = obtener_aleatorio() % 6;
+        if (tiro_jugador == 0) {
+            consola_imprimir_linea("");
+            consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("  *¡¡¡PUMMMMMMMMMMMMMMMMMMMMM!!!* ¡Bala en la recámara!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("  [ RULETA RUSA ] Has perdido. El proyectil atravesó el sistema.", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("  [ RULETA RUSA ] Borrando el sistema operativo... ¡Adiós!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea("");
+
+            esperar_milisegundos(1500);
+            huevo_quebrar("¡Perdiste en la Ruleta Rusa! El cartucho estaba cargado.", 0xDEADBEEF, 0, 0);
+            return;
+        }
+
+        consola_imprimir_linea_color("  *¡CLIC!* ... Recámara vacía. ¡Has sobrevivido!", COLOR_EXITO_DEFAULT);
+        esperar_milisegundos(1000);
+
+        // Turno del sistema (1 en 6 de perder)
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] El kernel TAEK OS toma el revólver...", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] Apunta a su propio silicio y aprieta el gatillo...", COLOR_TEXTO_DEFAULT);
+        esperar_milisegundos(1500);
+
+        uint32_t tiro_sistema = obtener_aleatorio() % 6;
+        if (tiro_sistema == 0) {
+            consola_imprimir_linea("");
+            consola_imprimir_linea_color("  *¡¡¡PUMMMMMMMMMMMMMMMMMMMMM!!!*", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("  [ RULETA RUSA ] ¡EL SISTEMA OPERATIVO HA PERDIDO!", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("  [ RULETA RUSA ] La bala perforó el kernel, pero el Huevo resistió.", COLOR_TEXTO_DEFAULT);
+            consola_imprimir_linea_color("  [ LOGRO DESBLOQUEADO ] ¡Has derrotado al sistema!", COLOR_EXITO_DEFAULT);
+            consola_imprimir_linea_color("  [ RECOMPENSA ] Se ha desbloqueado el comando: \"El comando\"", COLOR_USUARIO_DEFAULT);
+            consola_imprimir_linea("");
+            g_el_comando_desbloqueado = 1;
+            return;
+        }
+
+        consola_imprimir_linea_color("  *¡CLIC!* ... Recámara vacía. El sistema también sobrevive.", COLOR_TEXTO_DEFAULT);
+        consola_imprimir_linea_color("==> [ TABLAS ] Ambos siguen vivos. Vuelve a jugar si te atreves.", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
+    // COMANDO: "El comando" / el comando / el_comando / elcomando
+    if (str_igual_sin_caso(linea, "el comando") || str_igual_sin_caso(linea, "\"el comando\"") ||
+        str_igual_sin_caso(linea, "el_comando") || str_igual_sin_caso(linea, "elcomando")) {
+        if (!g_el_comando_desbloqueado) {
+            consola_imprimir_linea_color("Comando bloqueado. Debes vencer al sistema en la 'ruleta' primero.", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        // Lo que hace es nada. Literalmente nada.
         return;
     }
 

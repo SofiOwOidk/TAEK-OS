@@ -127,6 +127,23 @@
 
 ---
 
+### [2026-09-22 17:28 - 17:33] — Hito 7: Mecánica de «Ruleta Rusa» y Desbloqueo de «El comando»
+* **Objetivo:** Incorporar el comando `ruleta` con probabilidad 1 de 6 de borrar el sistema y 1 de 6 de que el kernel pierda, desbloqueando el comando secreto `"El comando"` (que no hace nada).
+* **Mecánica del Juego:**
+  1. El cilindro de 6 recámaras gira (`obtener_aleatorio() % 6`).
+  2. **Turno del usuario:** 1 de 6 de detonación. Si toca la bala, El Huevo se quiebra fatalmente (`huevo_quebrar`), reproduciendo la explosión de Don Cangrejo en bucle y apagando el sistema.
+  3. **Turno del sistema:** Si el jugador sobrevive, el sistema operativo aprieta el gatillo contra sí mismo (1 de 6). Si toca la bala, el kernel pierde y desbloquea el comando `"El comando"`.
+  4. **"El comando":** Si no está desbloqueado, la terminal indica que está bloqueado. Una vez desbloqueado, el comando se ejecuta y no hace absolutamente nada.
+* **Archivos Modificados:**
+  * `nucleo/controladores/terminal.c`:
+    * Implementación de `obtener_aleatorio()` con entropía combinada del contador de ciclos `rdtsc` y el algoritmo de permutación Xorshift32.
+    * Lógica de turnos en `ruleta` con pausas y efectos de texto.
+    * Manejo y desbloqueo de `El comando` (sin distinción de mayúsculas o comillas).
+* **Pruebas y Verificación:**
+  * Al ejecutar `ruleta`, el jugador sobrevivió (*¡CLIC!*), el kernel disparó la recámara cargada (*¡PUM!*), se desbloqueó `"El comando"`, y al invocar `El comando` no hizo absolutamente nada con total éxito.
+
+---
+
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
@@ -139,3 +156,4 @@
 | **`No rule to make target Recursos` en GNU Make** | El nombre de la carpeta contenía un espacio (`Recursos Asets`), rompiendo la sintaxis de prerequisitos en Make. | Se crearon enlaces simbólicos sin espacios (`recursos/fivenights.png` y `recursos/damonte.mp3`). |
 | **`limine.h API revision unsupported`** | `#define LIMINE_API_REVISION` se fijó en 3, pero la cabecera soporta hasta la revisión 2. | Se ajustó `#define LIMINE_API_REVISION 2` antes de incluir `limine.h`. |
 | **`No se puede llamar a un método en una expresión con valor NULL ($wslDir)`** | WSL escapa las contrabarras de Windows (`\U`, `\P`), haciendo fallar a `wslpath`, o `$PSScriptRoot` es nulo al invocar comandos interactivamente. | Se implementó resolución con respaldo a `(Get-Location).Path`, reemplazo de barras a POSIX (`/`) y conversión directa a `/mnt/<unidad>/`. |
+| **`Instruccion / Opcode Invalido (#UD)` al tirar del gatillo** | La CPU virtual por defecto de QEMU no tiene la instrucción de silicio `rdrand` activada, provocando que la CPU lance la excepción `#UD`. | Se reemplazó por un generador pseudoaleatorio Xorshift32 alimentado directamente por el Time Stamp Counter (`rdtsc`), 100% universal y sin riesgo de `#UD`. |
