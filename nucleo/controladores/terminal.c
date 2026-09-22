@@ -11,6 +11,20 @@
 extern const uint8_t _binary_audio_arranque_bin_start[];
 extern const uint8_t _binary_audio_arranque_bin_end[];
 
+extern const uint8_t _binary_duelo_audio_bin_start[];
+extern const uint8_t _binary_duelo_audio_bin_end[];
+
+static void esperar_con_audio_bucle(int ms, const uint8_t *audio, uint32_t tam) {
+    int paso = 50;
+    while (ms > 0) {
+        if (!audio_ac97_esta_reproduciendo() && tam > 0) {
+            audio_ac97_reproducir_pcm(audio, tam);
+        }
+        esperar_milisegundos(paso);
+        ms -= paso;
+    }
+}
+
 static int __attribute__((unused)) str_longitud(const char *s) {
     int len = 0;
     while (s && s[len]) len++;
@@ -206,46 +220,56 @@ static void procesar_comando(const char *linea_cruda) {
     // COMANDO: ruleta / ruleta_rusa / ruletarusa
     if (str_igual_sin_caso(linea, "ruleta") || str_igual_sin_caso(linea, "ruleta rusa") ||
         str_igual_sin_caso(linea, "ruleta_rusa") || str_igual_sin_caso(linea, "ruletarusa")) {
+        uint32_t tam_duelo = (uint32_t)(_binary_duelo_audio_bin_end - _binary_duelo_audio_bin_start);
+
+        // Iniciar sintonía de duelo del Spaghetti Western en bucle por DMA
+        if (tam_duelo > 0) {
+            audio_ac97_reproducir_pcm(_binary_duelo_audio_bin_start, tam_duelo);
+        }
+
         consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("  [ RULETA RUSA ] El tambor tiene 6 recámaras y 1 sola bala...", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("  [ DUELO 1 VS 1 ] El Bueno, El Feo y El Malo...              ", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("  [ RULETA RUSA ] El tambor tiene 6 recámaras y 1 sola bala...", COLOR_TEXTO_DEFAULT);
         consola_imprimir_linea_color("  [ RULETA RUSA ] Girando el cilindro: *chac-chac-chac-chac*...", COLOR_TEXTO_DEFAULT);
         consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
-        esperar_milisegundos(1000);
+        esperar_con_audio_bucle(1200, _binary_duelo_audio_bin_start, tam_duelo);
 
         // Turno del jugador (1 en 6 de morir)
         consola_imprimir_linea("");
-        consola_imprimir_linea_color("==> [ TU TURNO ] Apuntas el revólver a tu cabeza y aprietas el gatillo...", COLOR_AVISO_DEFAULT);
-        esperar_milisegundos(1500);
+        consola_imprimir_linea_color("==> [ TU TURNO ] Mirada fija... Colocas el revólver en tu sien y aprietas...", COLOR_AVISO_DEFAULT);
+        esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
 
         uint32_t tiro_jugador = obtener_aleatorio() % 6;
         if (tiro_jugador == 0) {
+            audio_ac97_detener();
             consola_imprimir_linea("");
             consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
             consola_imprimir_linea_color("  *¡¡¡PUMMMMMMMMMMMMMMMMMMMMM!!!* ¡Bala en la recámara!", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("  [ RULETA RUSA ] Has perdido. El proyectil atravesó el sistema.", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("  [ RULETA RUSA ] Has perdido el duelo. El proyectil atravesó el sistema.", COLOR_ERROR_DEFAULT);
             consola_imprimir_linea_color("  [ RULETA RUSA ] Borrando el sistema operativo... ¡Adiós!", COLOR_ERROR_DEFAULT);
             consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
             consola_imprimir_linea("");
 
             esperar_milisegundos(1500);
-            huevo_quebrar("¡Perdiste en la Ruleta Rusa! El cartucho estaba cargado.", 0xDEADBEEF, 0, 0);
+            huevo_quebrar("¡Perdiste el duelo de Ruleta Rusa! El cartucho estaba cargado.", 0xDEADBEEF, 0, 0);
             return;
         }
 
         consola_imprimir_linea_color("  *¡CLIC!* ... Recámara vacía. ¡Has sobrevivido!", COLOR_EXITO_DEFAULT);
-        esperar_milisegundos(1000);
+        esperar_con_audio_bucle(1200, _binary_duelo_audio_bin_start, tam_duelo);
 
         // Turno del sistema (1 en 6 de perder)
         consola_imprimir_linea("");
         consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] El kernel TAEK OS toma el revólver...", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] Apunta a su propio silicio y aprieta el gatillo...", COLOR_TEXTO_DEFAULT);
-        esperar_milisegundos(1500);
+        consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] Silicio contra plomo. Aprieta el gatillo...", COLOR_TEXTO_DEFAULT);
+        esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
 
         uint32_t tiro_sistema = obtener_aleatorio() % 6;
         if (tiro_sistema == 0) {
+            audio_ac97_detener();
             consola_imprimir_linea("");
             consola_imprimir_linea_color("  *¡¡¡PUMMMMMMMMMMMMMMMMMMMMM!!!*", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("  [ RULETA RUSA ] ¡EL SISTEMA OPERATIVO HA PERDIDO!", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("  [ RULETA RUSA ] ¡EL SISTEMA OPERATIVO HA PERDIDO EL DUELO!", COLOR_AVISO_DEFAULT);
             consola_imprimir_linea_color("  [ RULETA RUSA ] La bala perforó el kernel, pero el Huevo resistió.", COLOR_TEXTO_DEFAULT);
             consola_imprimir_linea_color("  [ LOGRO DESBLOQUEADO ] ¡Has derrotado al sistema!", COLOR_EXITO_DEFAULT);
             consola_imprimir_linea_color("  [ RECOMPENSA ] Se ha desbloqueado el comando: \"El comando\"", COLOR_USUARIO_DEFAULT);
@@ -254,6 +278,7 @@ static void procesar_comando(const char *linea_cruda) {
             return;
         }
 
+        audio_ac97_detener();
         consola_imprimir_linea_color("  *¡CLIC!* ... Recámara vacía. El sistema también sobrevive.", COLOR_TEXTO_DEFAULT);
         consola_imprimir_linea_color("==> [ TABLAS ] Ambos siguen vivos. Vuelve a jugar si te atreves.", COLOR_PROMPT_DEFAULT);
         return;

@@ -144,6 +144,23 @@
 
 ---
 
+### [2026-09-22 17:33 - 17:36] — Hito 8: Banda Sonora de Duelo en Ruleta Rusa («El Bueno, El Feo y El Malo»)
+* **Objetivo:** Reproducir en bucle la sintonía del Spaghetti Western (`El Bueno, El Feo Y El Malo - II Buono, II Brutto, Il Cattivo.mp3`) de fondo durante el enfrentamiento 1 vs 1 de la Ruleta Rusa contra el sistema.
+* **Pipeline de Audio:**
+  * Extracción de la icónica frase melódica inicial (silbido + arpegio de guitarra, 11 segundos) a PCM estéreo de 16 bits sin compresión a 44.1 kHz (~1.9 MB).
+  * Enlace mediante `objcopy` como objeto ELF64 (`duelo_audio.o`) en `Makefile`.
+* **Archivos Modificados:**
+  * `recursos/duelo.mp3`: Enlace simbólico al MP3 con espacios en el nombre para compatibilidad con GNU Make.
+  * `Makefile`: Regla para generar `duelo_audio.bin` y enlazar `duelo_audio.o` en `nucleo.elf`.
+  * `nucleo/controladores/terminal.c`:
+    * Función `esperar_con_audio_bucle(ms, audio, tam)`: monitoriza el estado del DMA AC97 y reinicia la reproducción de inmediato si el audio termina mientras el duelo continúa.
+    * Activación de la pista musical al iniciar el duelo y detención limpia si el jugador gana o hay empate.
+* **Pruebas y Verificación:**
+  * En QEMU, al ejecutar `ruleta`, el silbido legendario suena de fondo durante el suspenso y los turnos, deteniéndose limpiamente al resolverse el enfrentamiento.
+
+---
+
+
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 

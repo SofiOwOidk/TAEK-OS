@@ -43,7 +43,8 @@ OBJS      = $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS)) \
             $(BUILD_DIR)/imagen_arranque.o \
             $(BUILD_DIR)/audio_arranque.o \
             $(BUILD_DIR)/cangrejo_video.o \
-            $(BUILD_DIR)/cangrejo_audio.o
+            $(BUILD_DIR)/cangrejo_audio.o \
+            $(BUILD_DIR)/duelo_audio.o
 
 IMG       = $(BUILD_DIR)/taek-os.img
 KERNEL    = $(BUILD_DIR)/nucleo.elf
@@ -85,6 +86,15 @@ $(BUILD_DIR)/cangrejo_video.o: $(BUILD_DIR)/cangrejo_video.bin
 $(BUILD_DIR)/cangrejo_audio.o: $(BUILD_DIR)/cangrejo_audio.bin
 	@echo "==> Enlazando audio Don Cangrejo como objeto ELF64..."
 	@cd $(BUILD_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 cangrejo_audio.bin cangrejo_audio.o
+
+$(BUILD_DIR)/duelo_audio.bin: $(RECURSOS)/duelo.mp3
+	@mkdir -p $(BUILD_DIR)
+	@echo "==> Convirtiendo audio de duelo a PCM 44.1kHz 16-bit..."
+	ffmpeg -y -i "$<" -t 11 -ac 2 -ar 44100 -f s16le $@
+
+$(BUILD_DIR)/duelo_audio.o: $(BUILD_DIR)/duelo_audio.bin
+	@echo "==> Enlazando audio de duelo como objeto ELF64..."
+	@cd $(BUILD_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 duelo_audio.bin duelo_audio.o
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
