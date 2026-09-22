@@ -91,8 +91,8 @@ $(BUILD_DIR)/cangrejo_audio.o: $(BUILD_DIR)/cangrejo_audio.bin
 
 $(BUILD_DIR)/duelo_audio.bin: $(RECURSOS)/duelo.mp3
 	@mkdir -p $(BUILD_DIR)
-	@echo "==> Convirtiendo audio de duelo a PCM 44.1kHz 16-bit..."
-	ffmpeg -y -i "$<" -t 11 -ac 2 -ar 44100 -f s16le $@
+	@echo "==> Convirtiendo audio de duelo completo a PCM 44.1kHz 16-bit..."
+	ffmpeg -y -i "$<" -ac 2 -ar 44100 -f s16le $@
 
 $(BUILD_DIR)/duelo_audio.o: $(BUILD_DIR)/duelo_audio.bin
 	@echo "==> Enlazando audio de duelo como objeto ELF64..."

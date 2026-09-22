@@ -252,9 +252,34 @@
 
 ---
 
+### [2026-09-22 18:46 - 18:52] — Hito 12: Motor de Streaming de Audio AC97 de Larga Duración y Canción Completa de Duelo (2m 42s)
+* **Objetivo:** Resolver el problema reportado por el usuario donde el tema *El Bueno, El Feo y El Malo* se escuchaba solo como un fragmento breve de ~11 segundos en bucle, logrando que suene la pista completa de **2 minutos y 42 segundos** y que únicamente al finalizar toda la canción comience de nuevo el bucle si el duelo continúa.
+* **Causa Raíz Diagnosticada:**
+  1. En el `Makefile`, la regla `ffmpeg` tenía un parámetro forzado `-t 11`, truncando el archivo MP3 a solo 11 segundos de audio PCM.
+  2. En el controlador de hardware AC97 (`audio_ac97.c`), la tabla Buffer Descriptor List (BDL) de la arquitectura Intel ICH está estrictamente limitada por hardware a **32 entradas** de 64 KB cada una ($32 \times 65,536\text{ bytes} = 2,097,152\text{ bytes} \approx 11.88\text{ segundos}$). El driver original configuraba el BDL una sola vez; al agotarse los 11.88s, el DMA se detenía y la función `esperar_con_audio_bucle` volvía a disparar la pista desde el byte 0.
+* **Solución Arquitectónica:**
+  1. **Conversión Íntegra:** Se eliminó `-t 11` del `Makefile`, generando un archivo PCM lineal estéreo de 16 bits a 44.1 kHz de 27,972 KiB (~28 MB) que abarca los 162.38 segundos exactos de la canción.
+  2. **Motor de Streaming Circular en AC97:**
+     - Se rediseñó `nucleo/controladores/audio_ac97.c` implementando un buffer en anillo con puntero de reproducción continuo (`g_audio_cursor`), cola de descriptores activos (`g_entradas_en_cola`) y función de refresco no bloqueante `audio_ac97_actualizar()`.
+     - Mientras el hardware reproduce una entrada en el índice `CIV` (Current Index Value), el software recicla los descriptores liberados y los rellena con los siguientes 64 KB de la pista, actualizando en tiempo real el registro `LVI` (Last Valid Index).
+     - El cursor solo regresa al inicio (`g_audio_cursor = 0`) cuando se han transmitido los 28.6 MB completos (2m 42s).
+  3. **Sincronización Transparente:** La rutina `esperar_con_audio_bucle()` en la terminal invoca periódicamente a `audio_ac97_actualizar()` cada 50 ms, asegurando que la cola de hardware mantenga siempre hasta ~11.8 segundos de anticipación y nunca sufra microcortes o underruns.
+* **Archivos Modificados:**
+  * `Makefile`: Conversión completa sin `-t 11`.
+  * `nucleo/controladores/audio_ac97.h / .c`: Nuevas funciones `audio_ac97_reproducir_pcm_bucle()` y `audio_ac97_actualizar()`.
+  * `nucleo/controladores/terminal.c`: Invocación del streaming en el comando `ruleta_rusa`.
+* **Pruebas y Verificación:**
+  * El kernel enlazado (`build/nucleo.elf`) creció a 51 MB (alojando video, pantallas y los 28 MB de audio crudo en el archivo ELF64).
+  * La imagen UEFI FAT32 de 128 MB (`build/taek-os.img`) lo alojó con 80 MB de espacio libre restante.
+  * Verificación en QEMU: Arranque limpio de 512 MB, ejecución de la ruleta rusa con audio streaming continuo y activación fiel de las consecuencias (disparo mortal, quiebre de El Huevo y animación de Don Cangrejo).
+
+---
+
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |
+| :--- | :--- | :--- |
+| **Audio de duelo sonaba en bucle corto de 11s en vez de la canción completa** | 1) `Makefile` tenía `-t 11` forzando el corte en ffmpeg. 2) La lista de descriptores BDL de AC97 sólo tiene 32 entradas fijas (~11.8s de audio), y el driver original no tenía refresco circular dinámico, reiniciando desde el byte 0. | Se quitó el flag `-t 11` convirtiendo los 2m 42s completos (28 MB), y se rediseñó el controlador AC97 con un motor de streaming circular continuo (`audio_ac97_actualizar`) que rellena dinámicamente los descriptores reproducidos y solo reinicia el cursor tras agotar los 2m 42s. |
 | :--- | :--- | :--- |
 | **`instruction expected, found ' ['` en NASM** | `Set-Content -Encoding utf8` en PowerShell escribe una marca de orden de bytes (BOM `\xef\xbb\xbf`) al inicio del archivo. | Se creó una rutina con `sed -i '1s/^\xef\xbb\xbf//'` para eliminar el BOM de todos los archivos fuente. |
 | **`qemu: could not load PC BIOS`** | En QEMU moderno para x86_64, el firmware UEFI OVMF es una imagen pflash, no una BIOS legacy. | Se cambió el parámetro a `-drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd`. |

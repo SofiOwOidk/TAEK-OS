@@ -18,11 +18,11 @@ extern const uint8_t _binary_duelo_audio_bin_start[];
 extern const uint8_t _binary_duelo_audio_bin_end[];
 
 static void esperar_con_audio_bucle(int ms, const uint8_t *audio, uint32_t tam) {
+    (void)audio;
+    (void)tam;
     int paso = 50;
     while (ms > 0) {
-        if (!audio_ac97_esta_reproduciendo() && tam > 0) {
-            audio_ac97_reproducir_pcm(audio, tam);
-        }
+        audio_ac97_actualizar();
         esperar_milisegundos(paso);
         ms -= paso;
     }
@@ -472,13 +472,13 @@ static void procesar_comando(const char *linea_cruda) {
         str_igual_sin_caso(linea, "ruleta_rusa") || str_igual_sin_caso(linea, "ruletarusa")) {
         uint32_t tam_duelo = (uint32_t)(_binary_duelo_audio_bin_end - _binary_duelo_audio_bin_start);
 
-        // Iniciar sintonía de duelo del Spaghetti Western en bucle por DMA
+        // Iniciar sintonía de duelo completa en bucle continuo por DMA (2m 42s)
         if (tam_duelo > 0) {
-            audio_ac97_reproducir_pcm(_binary_duelo_audio_bin_start, tam_duelo);
+            audio_ac97_reproducir_pcm_bucle(_binary_duelo_audio_bin_start, tam_duelo);
         }
 
         consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("  [ DUELO A MUERTE 1 VS 1 ] EL BUENO, EL FEO Y EL MALO...     ", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("  [ DUELO A MUERTE 1 VS 1 ] EL BUENO, EL FEO Y EL MALO (2m 42s)", COLOR_AVISO_DEFAULT);
         consola_imprimir_linea_color("  [ MODO TENSIÓN EXTREMA ] Cada ronda aumentará la munición.  ", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea_color("  [ ADVERTENCIA ] Si tú pierdes: tu sistema colapsa y muere.  ", COLOR_TEXTO_DEFAULT);
         consola_imprimir_linea_color("  [ ADVERTENCIA ] Si la máquina pierde: desbloqueas El comando.", COLOR_TEXTO_DEFAULT);

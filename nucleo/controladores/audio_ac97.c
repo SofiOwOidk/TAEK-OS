@@ -20,6 +20,16 @@ static uint64_t g_base_fisica  = 0;
 static uint64_t g_base_virtual = 0;
 static int g_iniciado = 0;
 
+// Variables de estado del flujo de audio
+static const uint8_t *g_audio_datos          = 0;
+static uint32_t       g_audio_tamano         = 0;
+static uint32_t       g_audio_cursor         = 0;
+static int            g_audio_en_bucle       = 0;
+static int            g_audio_activo         = 0;
+static uint8_t        g_bdl_indice_escritura = 0;
+static uint8_t        g_bdl_ultimo_civ       = 0;
+static int            g_entradas_en_cola     = 0;
+
 static inline uint32_t virt_a_fisica(const void *ptr) {
     uint64_t v = (uint64_t)ptr;
     return (uint32_t)(v - g_base_virtual + g_base_fisica);
@@ -55,7 +65,7 @@ int audio_ac97_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel
     return 0;
 }
 
-int audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+static int audio_ac97_reproducir_flujo(const void *datos_pcm, uint32_t tamano_bytes, int bucle) {
     if (!g_iniciado || !datos_pcm || tamano_bytes == 0) {
         return 1;
     }
@@ -64,55 +74,144 @@ int audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
     escribir_puerto_b(g_nabmbar + 0x1B, 0x02); // Reset canal
     esperar_io();
 
-    // Cada muestra stereo de 16 bits = 4 bytes (2 canales * 2 bytes)
-    // El campo num_muestras en BDL cuenta muestras de 16 bits individuales
-    uint32_t total_muestras_16 = tamano_bytes / 2;
-    uint32_t muestras_por_bld  = 32768; // 64 KB por descriptor
-    uint32_t muestras_restantes = total_muestras_16;
-    const uint8_t *origen = (const uint8_t *)datos_pcm;
-    int entradas = 0;
+    g_audio_datos          = (const uint8_t *)datos_pcm;
+    g_audio_tamano         = tamano_bytes;
+    g_audio_cursor         = 0;
+    g_audio_en_bucle       = bucle;
+    g_audio_activo         = 1;
+    g_bdl_indice_escritura = 0;
+    g_bdl_ultimo_civ       = 0;
+    g_entradas_en_cola     = 0;
 
-    while (muestras_restantes > 0 && entradas < 32) {
-        uint32_t paquete = (muestras_restantes > muestras_por_bld) ? muestras_por_bld : muestras_restantes;
+    // Llenar descriptores iniciales del BDL (hasta 32 entradas de 64 KB = ~11.8s)
+    while (g_entradas_en_cola < 32 && g_audio_activo) {
+        if (g_audio_cursor < g_audio_tamano) {
+            uint32_t restante = g_audio_tamano - g_audio_cursor;
+            uint32_t paquete  = (restante > 65536) ? 65536 : restante;
+            paquete &= ~3; // Múltiplo de frame estéreo de 16 bits (4 bytes)
+            if (paquete == 0) paquete = restante;
 
-        g_bdl[entradas].dir_fisica   = virt_a_fisica(origen);
-        g_bdl[entradas].num_muestras = (uint16_t)paquete;
-        g_bdl[entradas].banderas     = 0;
+            g_bdl[g_bdl_indice_escritura].dir_fisica   = virt_a_fisica(g_audio_datos + g_audio_cursor);
+            g_bdl[g_bdl_indice_escritura].num_muestras = (uint16_t)(paquete / 2);
+            g_bdl[g_bdl_indice_escritura].banderas     = 0;
 
-        origen += paquete * 2;
-        muestras_restantes -= paquete;
-        entradas++;
+            g_audio_cursor += paquete;
+            if (g_audio_cursor >= g_audio_tamano) {
+                if (g_audio_en_bucle) {
+                    g_audio_cursor = 0; // Se reiniciará desde el principio tras recorrer toda la canción
+                } else {
+                    g_bdl[g_bdl_indice_escritura].banderas = 0x8000; // IOC en la última muestra
+                    g_audio_activo = 0;
+                }
+            }
+
+            g_bdl_indice_escritura = (g_bdl_indice_escritura + 1) % 32;
+            g_entradas_en_cola++;
+        } else if (g_audio_en_bucle) {
+            g_audio_cursor = 0;
+        } else {
+            break;
+        }
     }
 
-    if (entradas > 0) {
-        // En la ultima entrada marcamos IOC (Interrupt on Completion)
-        g_bdl[entradas - 1].banderas = 0x8000;
-    }
+    if (g_entradas_en_cola == 0) return 1;
 
-    // Configurar registro base de la BDL (NABMBAR + 0x10)
+    // Configurar dirección física base de la BDL (NABMBAR + 0x10)
     uint32_t dir_bdl_fisica = virt_a_fisica(g_bdl);
     escribir_puerto_l(g_nabmbar + 0x10, dir_bdl_fisica);
 
-    // Configurar Ultimo Indice Valido (LVI) (NABMBAR + 0x15)
-    escribir_puerto_b(g_nabmbar + 0x15, (uint8_t)(entradas - 1));
+    // Configurar Último Índice Válido (LVI) (NABMBAR + 0x15)
+    uint8_t lvi = (uint8_t)((g_bdl_indice_escritura + 31) % 32);
+    escribir_puerto_b(g_nabmbar + 0x15, lvi);
 
     // Limpiar banderas de estado (NABMBAR + 0x16)
     escribir_puerto_w(g_nabmbar + 0x16, 0x001C);
 
-    // Iniciar reproduccion DMA (Bit 0 de Control Register 0x1B = RUN)
+    // Iniciar reproducción DMA (Bit 0 de Control Register 0x1B = RUN)
     escribir_puerto_b(g_nabmbar + 0x1B, 0x01);
 
     return 0;
 }
 
+void audio_ac97_actualizar(void) {
+    if (!g_iniciado || (!g_audio_activo && g_entradas_en_cola == 0)) {
+        return;
+    }
+
+    uint8_t civ = (uint8_t)(leer_puerto_b(g_nabmbar + 0x14) & 0x1F);
+
+    if (civ != g_bdl_ultimo_civ) {
+        uint8_t avanzadas = (uint8_t)((civ - g_bdl_ultimo_civ + 32) % 32);
+        g_entradas_en_cola -= avanzadas;
+        if (g_entradas_en_cola < 0) g_entradas_en_cola = 0;
+        g_bdl_ultimo_civ = civ;
+    }
+
+    // Rellenar descriptores liberados por el hardware
+    while (g_entradas_en_cola < 32 && (g_audio_activo || (g_audio_en_bucle && g_audio_tamano > 0))) {
+        if (g_audio_cursor < g_audio_tamano) {
+            uint32_t restante = g_audio_tamano - g_audio_cursor;
+            uint32_t paquete  = (restante > 65536) ? 65536 : restante;
+            paquete &= ~3;
+            if (paquete == 0) paquete = restante;
+
+            g_bdl[g_bdl_indice_escritura].dir_fisica   = virt_a_fisica(g_audio_datos + g_audio_cursor);
+            g_bdl[g_bdl_indice_escritura].num_muestras = (uint16_t)(paquete / 2);
+            g_bdl[g_bdl_indice_escritura].banderas     = 0;
+
+            g_audio_cursor += paquete;
+            if (g_audio_cursor >= g_audio_tamano) {
+                if (g_audio_en_bucle) {
+                    // ¡Canción completa (2m 42s) terminada! Ahora vuelve al inicio para entrar en bucle.
+                    g_audio_cursor = 0;
+                } else {
+                    g_bdl[g_bdl_indice_escritura].banderas = 0x8000;
+                    g_audio_activo = 0;
+                }
+            }
+
+            // Actualizar LVI de hardware para que el DMA continúe sin detenerse
+            escribir_puerto_b(g_nabmbar + 0x15, g_bdl_indice_escritura);
+            g_bdl_indice_escritura = (g_bdl_indice_escritura + 1) % 32;
+            g_entradas_en_cola++;
+        } else if (g_audio_en_bucle) {
+            g_audio_cursor = 0;
+        } else {
+            break;
+        }
+    }
+
+    // Si el DMA se detuvo por falta momentánea de búfer pero ya hay datos en cola, reanudar
+    uint16_t sr = leer_puerto_w(g_nabmbar + 0x16);
+    if ((sr & 0x0001) && g_entradas_en_cola > 0) {
+        escribir_puerto_w(g_nabmbar + 0x16, 0x001C);
+        escribir_puerto_b(g_nabmbar + 0x1B, 0x01);
+    }
+}
+
+int audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+    return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
+}
+
+int audio_ac97_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes) {
+    return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 1);
+}
+
 int audio_ac97_esta_reproduciendo(void) {
     if (!g_iniciado) return 0;
+    audio_ac97_actualizar();
+    if (g_audio_activo || g_entradas_en_cola > 0) {
+        return 1;
+    }
     uint16_t estado = leer_puerto_w(g_nabmbar + 0x16);
-    // Bit 0 = DMA Controller Halted (DCH). Si es 0, sigue en marcha
     return ((estado & 0x0001) == 0);
 }
 
 void audio_ac97_detener(void) {
     if (!g_iniciado) return;
     escribir_puerto_b(g_nabmbar + 0x1B, 0x00);
+    g_audio_activo         = 0;
+    g_audio_en_bucle       = 0;
+    g_entradas_en_cola     = 0;
+    g_audio_cursor         = 0;
 }
