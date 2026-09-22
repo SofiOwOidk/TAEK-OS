@@ -191,6 +191,40 @@
 
 ---
 
+### [2026-09-22 18:25 - 18:31] — Hito 10: Tablas de Paginación x86_64 de 4 Niveles (PML4 / VMM) y Control Soberano de CR3
+* **Objetivo:** Cumplir el Paso 2 de la hoja de ruta solicitada por el usuario: tomar el control soberano del espacio de direcciones virtual en Anillo 0 mediante la construcción de un árbol PML4 propio de TAEK OS, permitiendo el mapeo dinámico de memoria virtual a física, la invalidación de TLB (`invlpg`), soporte para registros MMIO de hardware y el comando interactivo `paginacion`.
+* **Diseño Arquitectónico:**
+  1. **PML4 Soberano y Transición de CR3:**
+     - Lectura del registro `CR3` inicial configurado por el bootloader Limine.
+     - Asignación de una nueva página física de 4 KiB para el PML4 raíz del Kernel de TAEK OS con el PMM (`g_pml4_kernel_fisico`).
+     - Clonación limpia de las entradas superiores (256 a 511), preservando el Higher Half Direct Map (`0xFFFF800000000000`), el código del Kernel (`0xFFFFFFFF80000000`) y los búferes de hardware.
+     - Carga del nuevo PML4 en el registro de hardware `CR3` de la CPU (`mov %rax, %cr3`).
+     - Transición sin fallos ni interrupción del pipeline de ejecución, verificada con éxito por El Huevo.
+  2. **Árbol Jerárquico de 4 Niveles (PML4 -> PDPT -> PD -> PT):**
+     - Primitiva `paginacion_mapear(virt, phys, flags)` con asignación bajo demanda de tablas intermedias (PDPT, PD, PT) mediante el PMM de TAEK OS.
+     - Banderas en español: `PAGINA_PRESENTE`, `PAGINA_ESCRITURA`, `PAGINA_USUARIO`, `PAGINA_SIN_CACHE` (PCD/MMIO), `PAGINA_GLOBAL`, `PAGINA_NO_EJECUTABLE` (NX).
+     - Primitiva `paginacion_desmapear(virt)` con limpieza de entradas y purga de TLB.
+     - Primitiva `paginacion_obtener_fisica(virt)` con soporte para páginas de 4 KiB, páginas grandes de 2 MiB y páginas gigantes de 1 GiB.
+     - Invalidación de hardware en el Translation Lookaside Buffer mediante `invlpg` en ensamblador inline.
+  3. **Comando de Terminal `paginacion`:**
+     - Reporta: Modelo de 4 niveles x86_64, valor actual de `CR3`, PML4 físico de TAEK OS, mitigación NX, PCD e invalidación TLB.
+     - Subcomando `paginacion probar`: Autodiagnóstico en vivo que verifica el árbol de 4 niveles, mapea `0x00007FFF00000000` a un marco físico, escribe la firma mágica `TAEKOSVM` (`0x5441454B4F53564D`), comprueba la consistencia de datos a través del HHDM, valida la resolución inversa con `paginacion_obtener_fisica()`, desmapea la página e invalida el TLB con `invlpg`.
+* **Archivos Creados y Modificados:**
+  * `nucleo/base/paginacion.h`: Definición de la interfaz en español, banderas de bits y estructuras de tablas de 4 niveles.
+  * `nucleo/base/paginacion.c`: Implementación completa de la creación del PML4, carga de CR3, mapeo dinámico, desmapeo, resolución inversa y autodiagnóstico.
+  * `nucleo/principal.c`: Inicialización de `paginacion_iniciar()` tras `memoria_iniciar()`.
+  * `nucleo/controladores/terminal.c`: Comando `paginacion` (con soporte para `paginacion probar`), alias `paginas`, `vmm`, `paging`, y actualización del menú `ayuda`.
+  * `Makefile`: Inclusión de `nucleo/base/paginacion.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * En QEMU UEFI:
+    - Arranque con recarga de CR3 exitosa: `CR3 Limine: 0x000000001DD36000 -> CR3 TAEK OS Soberano: 0x000000001FEF3000`.
+    - Etapa validada con `[ OK ]` por El Huevo.
+    - Ejecución de `paginacion probar`: Pasos 1, 2 y 3 completados con `[OK - 100% CORRECTO]` y `[PRESERVADO OK]`.
+    - Comando `paginacion` reportó el árbol jerárquico y estado de protecciones.
+    - Apagado limpio por ACPI.
+
+---
+
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |

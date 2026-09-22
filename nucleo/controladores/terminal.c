@@ -7,6 +7,7 @@
 #include "../base/energia.h"
 #include "../base/tiempo.h"
 #include "../base/memoria.h"
+#include "../base/paginacion.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -341,6 +342,68 @@ static void ejecutar_comando_memoria(const char *arg) {
     consola_imprimir_linea_color("Tip: Usa 'memoria probar' para ejecutar autodiagnóstico de kmalloc/kfree.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_comando_paginacion(const char *arg) {
+    if (arg != NULL && (str_igual_sin_caso(arg, "probar") || str_igual_sin_caso(arg, "test") || str_igual_sin_caso(arg, "diagnostico"))) {
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO VMM ] Probando tablas de paginación x86_64...", COLOR_AVISO_DEFAULT);
+
+        consola_imprimir("  1. Comprobando árbol PML4 soberano y registro CR3... ");
+        uint64_t cr3 = paginacion_obtener_cr3();
+        if (cr3 == 0) {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_color("CR3: ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_hex(cr3);
+        consola_imprimir_linea_color(" [OK]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  2. Ejecutando ciclo de mapeo, firma mágica, traducción y TLB... ");
+        if (paginacion_ejecutar_autodiagnostico()) {
+            consola_imprimir_linea_color("[OK - 100% CORRECTO]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir("  3. Comprobando preservación de Mitad Superior (HHDM y Kernel)... ");
+        uint64_t phys_kernel = paginacion_obtener_fisica(0xFFFFFFFF80000000ULL);
+        if (phys_kernel != 0) {
+            consola_imprimir_linea_color("[PRESERVADO OK]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] VMM y Tablas PML4 funcionando al 100%.", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
+    uint64_t cr3 = paginacion_obtener_cr3();
+    uint64_t pml4_fis = paginacion_obtener_pml4_activo();
+
+    consola_imprimir_linea_color("================== PAGINACIÓN Y MEMORIA VIRTUAL ==================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Modelo de Paginación  : ");
+    consola_imprimir_linea_color("x86_64 Long Mode (Jerarquía de 4 Niveles)", COLOR_USUARIO_DEFAULT);
+    consola_imprimir("  Desglose de Niveles   : ");
+    consola_imprimir_linea("PML4 (L4) -> PDPT (L3) -> PD (L2) -> PT (L1) -> 4 KiB");
+    consola_imprimir("  Registro CR3 Activo   : ");
+    consola_imprimir_hex(cr3);
+    consola_imprimir_linea(" (Cargado en CPU)");
+    consola_imprimir("  PML4 Físico Soberano  : ");
+    consola_imprimir_hex(pml4_fis);
+    consola_imprimir_linea(" (Árbol Propio de TAEK OS)");
+    consola_imprimir("  Espacio Mitad Superior: ");
+    consola_imprimir_linea("0xFFFF800000000000 (HHDM + Kernel ELF 64-bit)");
+    consola_imprimir("  Espacio Mitad Inferior: ");
+    consola_imprimir_linea("0x0000000000000000 (Mapeos Dinámicos / VRAM)");
+    consola_imprimir("  Invalidación de TLB   : ");
+    consola_imprimir_linea_color("Instrucción nativa 'invlpg' habilitada", COLOR_EXITO_DEFAULT);
+    consola_imprimir("  Protecciones de Página: ");
+    consola_imprimir_linea("Bit NX (No-Execute), R/W, Supervisor/Usuario, PCD (MMIO)");
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Usa 'paginacion probar' para ejecutar autodiagnóstico de mapeo.", COLOR_TEXTO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -377,6 +440,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Información de CPU, Hipervisor VMX y Framebuffer.");
         consola_imprimir_color("  memoria        ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reporte de RAM, PMM, Heap kmalloc y canarios ('memoria probar').");
+        consola_imprimir_color("  paginacion     ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Memoria virtual, árbol PML4, CR3 e invlpg ('paginacion probar').");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -529,6 +594,18 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "free ")) arg = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "ram ")) arg = str_saltar_espacios(linea + 4);
         ejecutar_comando_memoria(arg);
+        return;
+    }
+
+    // COMANDO: paginacion / paginas / vmm / paging
+    if (str_comienza_con(linea, "paginacion") || str_comienza_con(linea, "paginas") ||
+        str_comienza_con(linea, "vmm") || str_comienza_con(linea, "paging")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "paginacion ")) arg = str_saltar_espacios(linea + 11);
+        else if (str_comienza_con(linea, "paginas ")) arg = str_saltar_espacios(linea + 8);
+        else if (str_comienza_con(linea, "vmm ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "paging ")) arg = str_saltar_espacios(linea + 7);
+        ejecutar_comando_paginacion(arg);
         return;
     }
 

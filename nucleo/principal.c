@@ -13,6 +13,7 @@
 #include "base/utf8.h"
 #include "base/tiempo.h"
 #include "base/memoria.h"
+#include "base/paginacion.h"
 #include "controladores/pantalla.h"
 #include "controladores/audio_ac97.h"
 #include "controladores/animacion_cangrejo.h"
@@ -75,6 +76,10 @@ void principal(void) {
 
     huevo_etapa("Gestor de Memoria Dinámica (PMM + Kernel Heap)");
     memoria_iniciar();
+    huevo_etapa_ok();
+
+    huevo_etapa("Tablas de Paginación x86_64 (PML4 / VMM)");
+    paginacion_iniciar();
     huevo_etapa_ok();
 
     huevo_etapa("Inicialización de Pantalla GOP UEFI");
