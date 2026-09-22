@@ -6,6 +6,8 @@
 #include "../base/huevo.h"
 #include "../base/energia.h"
 #include "../base/tiempo.h"
+#include "../base/memoria.h"
+#include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
 extern const uint8_t _binary_audio_arranque_bin_start[];
@@ -158,6 +160,187 @@ void terminal_iniciar(void) {
     imprimir_banner();
 }
 
+static void ejecutar_comando_memoria(const char *arg) {
+    if (arg != NULL && (str_igual_sin_caso(arg, "probar") || str_igual_sin_caso(arg, "test") || str_igual_sin_caso(arg, "diagnostico"))) {
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO ] Batería de pruebas en PMM y Kernel Heap...", COLOR_AVISO_DEFAULT);
+
+        // 1. Asignación con kmalloc (Shim Linux)
+        consola_imprimir("  1. Asignando 1024 bytes con kmalloc(GFP_KERNEL)... ");
+        uint8_t *bloque_a = (uint8_t *)kmalloc(1024, GFP_KERNEL);
+        if (!bloque_a) {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        for (int i = 0; i < 1024; i++) bloque_a[i] = 0xAA;
+        consola_imprimir_linea_color("[OK]", COLOR_EXITO_DEFAULT);
+
+        // 2. Asignación con asignar_memoria (Nativo español)
+        consola_imprimir("  2. Asignando 4096 bytes con asignar_memoria()... ");
+        uint8_t *bloque_b = (uint8_t *)asignar_memoria(4096);
+        if (!bloque_b) {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            kfree(bloque_a);
+            return;
+        }
+        for (int i = 0; i < 4096; i++) bloque_b[i] = 0x55;
+        consola_imprimir_linea_color("[OK]", COLOR_EXITO_DEFAULT);
+
+        // 3. Asignación con kzalloc (Inicializado a cero)
+        consola_imprimir("  3. Asignando 256 bytes con kzalloc() y comprobando ceros... ");
+        uint8_t *bloque_c = (uint8_t *)kzalloc(256, GFP_KERNEL);
+        int ceros_ok = 1;
+        if (!bloque_c) {
+            ceros_ok = 0;
+        } else {
+            for (int i = 0; i < 256; i++) {
+                if (bloque_c[i] != 0) {
+                    ceros_ok = 0;
+                    break;
+                }
+            }
+        }
+        if (!ceros_ok) {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            kfree(bloque_a);
+            liberar_memoria(bloque_b);
+            if (bloque_c) kfree(bloque_c);
+            return;
+        }
+        consola_imprimir_linea_color("[OK]", COLOR_EXITO_DEFAULT);
+
+        // 4. Reasignación dinámica (krealloc / reasignar_memoria)
+        consola_imprimir("  4. Reasignando bloque A de 1024 a 2048 bytes (krealloc)... ");
+        bloque_a = (uint8_t *)krealloc(bloque_a, 2048, GFP_KERNEL);
+        int datos_preservados = 1;
+        if (!bloque_a) {
+            datos_preservados = 0;
+        } else {
+            for (int i = 0; i < 1024; i++) {
+                if (bloque_a[i] != 0xAA) {
+                    datos_preservados = 0;
+                    break;
+                }
+            }
+        }
+        if (!datos_preservados) {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            liberar_memoria(bloque_b);
+            kfree(bloque_c);
+            return;
+        }
+        consola_imprimir_linea_color("[OK]", COLOR_EXITO_DEFAULT);
+
+        // 5. Asignación de página física de 4 KiB en PMM
+        consola_imprimir("  5. Solicitando marco de 4 KiB al PMM (pmm_asignar_pagina_virtual)... ");
+        void *pag_pmm = pmm_asignar_pagina_virtual();
+        if (!pag_pmm) {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[OK]", COLOR_EXITO_DEFAULT);
+        }
+
+        // 6. Auditoría de canarios e integridad estructural
+        consola_imprimir("  6. Verificando canarios de integridad con El Huevo... ");
+        if (memoria_verificar_integridad()) {
+            consola_imprimir_linea_color("[100% INTACTO]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[CORRUPTO]", COLOR_ERROR_DEFAULT);
+        }
+
+        // 7. Liberación y coalescing
+        consola_imprimir("  7. Liberando bloques y fusionando Heap (kfree/coalescing)... ");
+        kfree(bloque_a);
+        liberar_memoria(bloque_b);
+        kfree(bloque_c);
+        if (pag_pmm) {
+            uint64_t offset = memoria_obtener_hhdm_offset();
+            pmm_liberar_pagina_fisica((uint64_t)pag_pmm - offset);
+        }
+        consola_imprimir_linea_color("[OK]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] PMM y Kernel Heap funcionando al 100%.", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
+    memoria_estadisticas_t est;
+    memoria_obtener_estadisticas(&est);
+
+    consola_imprimir_linea_color("================== GESTIÓN DE MEMORIA TAEK OS ==================", COLOR_AVISO_DEFAULT);
+
+    consola_imprimir("  RAM Física Total      : ");
+    consola_imprimir_dec(est.ram_fisica_total / (1024 * 1024));
+    consola_imprimir(" MiB (");
+    consola_imprimir_dec(est.ram_fisica_total / (1024 * 1024 * 1024));
+    consola_imprimir_linea(" GiB)");
+
+    consola_imprimir("  RAM Usable (UEFI)     : ");
+    consola_imprimir_dec(est.ram_fisica_usable / (1024 * 1024));
+    consola_imprimir(" MiB (");
+    consola_imprimir_dec((est.ram_fisica_usable * 100) / (est.ram_fisica_total ? est.ram_fisica_total : 1));
+    consola_imprimir_linea("% del total)");
+
+    consola_imprimir("  Páginas Físicas 4 KiB : ");
+    consola_imprimir_dec(est.paginas_totales);
+    consola_imprimir(" totales | ");
+    consola_imprimir_dec(est.paginas_libres);
+    consola_imprimir(" libres | ");
+    consola_imprimir_dec(est.paginas_en_uso);
+    consola_imprimir_linea(" en uso");
+
+    consola_imprimir_linea_color("  --- Heap del Kernel (kmalloc / asignar_memoria) ---", COLOR_PROMPT_DEFAULT);
+
+    consola_imprimir("  Capacidad de Arena    : ");
+    consola_imprimir_dec(est.heap_capacidad_total / 1024);
+    consola_imprimir(" KiB (");
+    consola_imprimir_dec(est.heap_capacidad_total / (1024 * 1024));
+    consola_imprimir_linea(" MiB)");
+
+    consola_imprimir("  Memoria Heap en Uso   : ");
+    consola_imprimir_dec(est.heap_bytes_en_uso / 1024);
+    consola_imprimir(" KiB (");
+    consola_imprimir_dec(est.heap_bytes_en_uso);
+    consola_imprimir_linea(" bytes)");
+
+    uint64_t heap_libre = (est.heap_capacidad_total > est.heap_bytes_en_uso) ?
+                          (est.heap_capacidad_total - est.heap_bytes_en_uso) : 0;
+    consola_imprimir("  Memoria Heap Libre    : ");
+    consola_imprimir_dec(heap_libre / 1024);
+    consola_imprimir_linea(" KiB");
+
+    consola_imprimir("  Bloques de Asignación : ");
+    consola_imprimir_dec(est.heap_bloques_activos);
+    consola_imprimir(" activos | ");
+    consola_imprimir_dec(est.heap_bloques_libres);
+    consola_imprimir_linea(" libres");
+
+    consola_imprimir("  Integridad Canarios   : ");
+    if (est.canarios_intactos) {
+        consola_imprimir_linea_color("[ 100% INTACTO ] (Vigilado por El Huevo)", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("[ CORRUPCIÓN DETECTADA ]", COLOR_ERROR_DEFAULT);
+    }
+
+    // Barra visual de uso de RAM
+    uint64_t porcentaje_uso = (est.paginas_en_uso * 100) / (est.paginas_totales ? est.paginas_totales : 1);
+    consola_imprimir("  Uso de RAM Física     : [");
+    int barras_llenas = (int)(porcentaje_uso / 5);
+    if (barras_llenas > 20) barras_llenas = 20;
+    for (int i = 0; i < 20; i++) {
+        if (i < barras_llenas) {
+            consola_imprimir("=");
+        } else {
+            consola_imprimir("-");
+        }
+    }
+    consola_imprimir("] ");
+    consola_imprimir_dec(porcentaje_uso);
+    consola_imprimir_linea("%");
+
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Usa 'memoria probar' para ejecutar autodiagnóstico de kmalloc/kfree.", COLOR_TEXTO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -192,6 +375,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Muestra la integridad y salud de El Huevo.");
         consola_imprimir_color("  info           ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Información de CPU, Hipervisor VMX y Framebuffer.");
+        consola_imprimir_color("  memoria        ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Reporte de RAM, PMM, Heap kmalloc y canarios ('memoria probar').");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -334,6 +519,16 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(" (UEFI GOP 32bpp)");
         consola_imprimir("  Subsistema Audio  : ");
         consola_imprimir_linea("PCI Intel AC97 DMA Directo @ 44.1 kHz");
+        return;
+    }
+
+    // COMANDO: memoria / free / ram
+    if (str_comienza_con(linea, "memoria") || str_comienza_con(linea, "free") || str_comienza_con(linea, "ram")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "memoria ")) arg = str_saltar_espacios(linea + 8);
+        else if (str_comienza_con(linea, "free ")) arg = str_saltar_espacios(linea + 5);
+        else if (str_comienza_con(linea, "ram ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_memoria(arg);
         return;
     }
 

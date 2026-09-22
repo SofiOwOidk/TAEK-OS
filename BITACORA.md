@@ -160,7 +160,36 @@
 
 ---
 
+### [2026-09-22 18:05 - 18:15] — Hito 9: Gestor de Memoria Dinámica (PMM + Kernel Heap kmalloc/kfree) y Comando 'memoria'
+* **Objetivo:** Cumplir el Paso 1 de la hoja de ruta solicitada por el usuario: implementar un gestor de memoria física (PMM) y un asignador dinámico en el núcleo (Kernel Heap) vigilado por "El Huevo de la Estabilidad", proveyendo shims de compatibilidad con Linux (`kmalloc`, `kfree`, `kzalloc`) y un comando interactivo `memoria` con autodiagnóstico en vivo.
+* **Diseño Arquitectónico:**
+  1. **PMM (Page Frame Allocator de 4 KiB):**
+     - Consume el mapa de memoria UEFI entregado por Limine (`LIMINE_MEMMAP_REQUEST`) y el Higher Half Direct Map (`LIMINE_HHDM_REQUEST`).
+     - Utiliza una **pila intrusiva de marcos libres** en el espacio virtual mapeado por el HHDM: cada página libre de 4096 bytes aloja en sus primeros 8 bytes la dirección física de la página anterior en la pila.
+     - Complejidad $O(1)$ pura tanto para `pmm_asignar_pagina_fisica()` como para `pmm_liberar_pagina_fisica()`, con **0 bytes** de memoria desperdiciada en tablas de mapa de bits.
+  2. **Kernel Heap Allocator (Memoria Dinámica):**
+     - Arena inicial continua de 8 MiB (`TAMANO_ARENA_INICIAL`) reservada al inicio de la memoria física utilizable.
+     - Lista doblemente enlazada de bloques con división (*splitting*) en asignación y fusión (*coalescing*) bidireccional con bloques adyacentes continuos al liberar.
+     - **Canarios de Seguridad de El Huevo:** Cada bloque cuenta con cabecera y pie vigilados: `canario_inicio = 0x7AEECC05` ("TAEK OS") y `canario_fin = 0xCAFEBABEDEAD1000`. Si un puntero se desborda (*buffer overflow*) o se intenta liberar dos veces (*double free*), El Huevo se quiebra de inmediato invocando el protocolo Don Cangrejo.
+     - **Shims de Compatibilidad Linux:** Implementados en `memoria.h`: `kmalloc(size, flags)`, `kzalloc(size, flags)`, `kfree(ptr)`, `krealloc(ptr, size, flags)`, `vmalloc(size)`, `vfree(ptr)` con banderas `GFP_KERNEL`, `GFP_ATOMIC`, `GFP_DMA`.
+  3. **Comando de Terminal `memoria`:**
+     - Reporta: RAM física total, RAM usable, páginas de 4 KiB (totales, libres y en uso), capacidad del Heap del Kernel, memoria asignada y libre, bloques activos y estado de los canarios.
+     - Subcomando `memoria probar`: Batería de 7 pruebas en vivo (asignación `kmalloc`, `asignar_memoria`, comprobación de ceros en `kzalloc`, redimensionamiento con `krealloc`, marco físico de 4 KiB en PMM, auditoría de canarios con El Huevo, y liberación/coalescing limpio con `kfree`).
+* **Archivos Creados y Modificados:**
+  * `nucleo/base/memoria.h`: Definición de la interfaz en español, estadísticas de memoria y macros compatibles con Linux.
+  * `nucleo/base/memoria.c`: Implementación completa del PMM, Heap con canarios y funciones de biblioteca freestanding (`memset`, `memcpy`, `memmove`, `memcmp`).
+  * `nucleo/principal.c`: Inicialización de `memoria_iniciar()` tras la calibración del temporizador.
+  * `nucleo/base/huevo.c`: `huevo_verificar()` ahora inspecciona periódicamente la integridad estructural de todo el Heap.
+  * `nucleo/controladores/terminal.c`: Comando `memoria` (con soporte para `memoria probar`), atajos `free` y `ram`, y actualización del menú `ayuda`.
+  * `Makefile`: Inclusión de `nucleo/base/memoria.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * En QEMU UEFI (512 MB de RAM configurados):
+    - Detección de 455 MiB de RAM utilizable (114,364 páginas de 4 KiB disponibles en PMM).
+    - Creación de arena de Heap de 8192 KiB (8 MiB).
+    - Ejecución de `memoria probar`: Los 7 pasos completados con `[OK]` y canarios al `100% INTACTO`.
+    - Apagado ordenado mediante `apagar` por ACPI con código 0.
 
+---
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
@@ -174,3 +203,4 @@
 | **`limine.h API revision unsupported`** | `#define LIMINE_API_REVISION` se fijó en 3, pero la cabecera soporta hasta la revisión 2. | Se ajustó `#define LIMINE_API_REVISION 2` antes de incluir `limine.h`. |
 | **`No se puede llamar a un método en una expresión con valor NULL ($wslDir)`** | WSL escapa las contrabarras de Windows (`\U`, `\P`), haciendo fallar a `wslpath`, o `$PSScriptRoot` es nulo al invocar comandos interactivamente. | Se implementó resolución con respaldo a `(Get-Location).Path`, reemplazo de barras a POSIX (`/`) y conversión directa a `/mnt/<unidad>/`. |
 | **`Instruccion / Opcode Invalido (#UD)` al tirar del gatillo** | La CPU virtual por defecto de QEMU no tiene la instrucción de silicio `rdrand` activada, provocando que la CPU lance la excepción `#UD`. | Se reemplazó por un generador pseudoaleatorio Xorshift32 alimentado directamente por el Time Stamp Counter (`rdtsc`), 100% universal y sin riesgo de `#UD`. |
+| **Bloqueo / Congelamiento en 4174 bytes al redirigir salida de QEMU en PowerShell** | Deadlock clásico del búfer de pipe anónimo en Windows (4096 bytes). Si el hijo escribe más de 4 KB y el padre duerme sin drenar el pipe, `WriteFile` bloquea el UART en el kernel. | Se implementó lectura con streaming continuo asíncrono en Python (`subprocess.Popen` con hilo lector en tiempo real) y drenaje constante. |

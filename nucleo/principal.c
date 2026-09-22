@@ -12,6 +12,7 @@
 #include "base/energia.h"
 #include "base/utf8.h"
 #include "base/tiempo.h"
+#include "base/memoria.h"
 #include "controladores/pantalla.h"
 #include "controladores/audio_ac97.h"
 #include "controladores/animacion_cangrejo.h"
@@ -70,6 +71,10 @@ void principal(void) {
 
     huevo_etapa("Calibración del Temporizador TSC / PIT");
     tiempo_iniciar();
+    huevo_etapa_ok();
+
+    huevo_etapa("Gestor de Memoria Dinámica (PMM + Kernel Heap)");
+    memoria_iniciar();
     huevo_etapa_ok();
 
     huevo_etapa("Inicialización de Pantalla GOP UEFI");

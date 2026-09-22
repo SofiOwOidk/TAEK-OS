@@ -29,6 +29,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/base/energia.c \
             nucleo/base/utf8.c \
             nucleo/base/tiempo.c \
+            nucleo/base/memoria.c \
             nucleo/controladores/pantalla.c \
             nucleo/controladores/audio_ac97.c \
             nucleo/controladores/animacion_cangrejo.c \

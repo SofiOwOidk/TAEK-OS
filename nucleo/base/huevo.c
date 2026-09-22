@@ -39,10 +39,13 @@ void huevo_etapa_ok(void) {
     serial_imprimir_linea("[ OK ]");
 }
 
+int memoria_verificar_integridad(void);
+
 void huevo_verificar(void) {
     if (g_huevo.magico != HUEVO_MAGICO || g_huevo.canario != HUEVO_CANARIO) {
         huevo_quebrar("¡Corrupción de memoria detectada! ¡El canario ha muerto!", 0, 0, 0);
     }
+    memoria_verificar_integridad();
 }
 
 void huevo_agrietar(const char *motivo) {
