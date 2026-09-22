@@ -478,59 +478,162 @@ static void procesar_comando(const char *linea_cruda) {
         }
 
         consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("  [ DUELO 1 VS 1 ] El Bueno, El Feo y El Malo...              ", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("  [ RULETA RUSA ] El tambor tiene 6 recámaras y 1 sola bala...", COLOR_TEXTO_DEFAULT);
-        consola_imprimir_linea_color("  [ RULETA RUSA ] Girando el cilindro: *chac-chac-chac-chac*...", COLOR_TEXTO_DEFAULT);
+        consola_imprimir_linea_color("  [ DUELO A MUERTE 1 VS 1 ] EL BUENO, EL FEO Y EL MALO...     ", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("  [ MODO TENSIÓN EXTREMA ] Cada ronda aumentará la munición.  ", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color("  [ ADVERTENCIA ] Si tú pierdes: tu sistema colapsa y muere.  ", COLOR_TEXTO_DEFAULT);
+        consola_imprimir_linea_color("  [ ADVERTENCIA ] Si la máquina pierde: desbloqueas El comando.", COLOR_TEXTO_DEFAULT);
         consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
-        esperar_con_audio_bucle(1200, _binary_duelo_audio_bin_start, tam_duelo);
+        esperar_con_audio_bucle(1500, _binary_duelo_audio_bin_start, tam_duelo);
 
-        // Turno del jugador (1 en 6 de morir)
-        consola_imprimir_linea("");
-        consola_imprimir_linea_color("==> [ TU TURNO ] Mirada fija... Colocas el revólver en tu sien y aprietas...", COLOR_AVISO_DEFAULT);
-        esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
-
-        uint32_t tiro_jugador = obtener_aleatorio() % 6;
-        if (tiro_jugador == 0) {
-            audio_ac97_detener();
+        for (int ronda = 1; ronda <= 6; ronda++) {
             consola_imprimir_linea("");
-            consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("  *¡¡¡PUMMMMMMMMMMMMMMMMMMMMM!!!* ¡Bala en la recámara!", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("  [ RULETA RUSA ] Has perdido el duelo. El proyectil atravesó el sistema.", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("  [ RULETA RUSA ] Borrando el sistema operativo... ¡Adiós!", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", COLOR_AVISO_DEFAULT);
+            consola_imprimir_color("  >>> RONDA ", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_dec(ronda);
+            consola_imprimir(" DE 6: ");
+            consola_imprimir_dec(ronda);
+            consola_imprimir_linea_color(" BALA(S) EN EL TAMBOR (DE 6 RECÁMARAS) <<<", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", COLOR_AVISO_DEFAULT);
+
+            // ==========================================
+            // TURNO DEL JUGADOR (~20 SEGUNDOS DE TENSIÓN)
+            // ==========================================
             consola_imprimir_linea("");
+            consola_imprimir_linea_color("==> [ TU TURNO ]", COLOR_AVISO_DEFAULT);
 
-            esperar_milisegundos(1500);
-            huevo_quebrar("¡Perdiste el duelo de Ruleta Rusa! El cartucho estaba cargado.", 0xDEADBEEF, 0, 0);
-            return;
-        }
+            // 1s
+            consola_imprimir_linea("  * Sacas el revólver lentamente... El metal se siente gélido en tu palma.");
+            esperar_con_audio_bucle(1000, _binary_duelo_audio_bin_start, tam_duelo);
 
-        consola_imprimir_linea_color("  *¡CLIC!* ... Recámara vacía. ¡Has sobrevivido!", COLOR_EXITO_DEFAULT);
-        esperar_con_audio_bucle(1200, _binary_duelo_audio_bin_start, tam_duelo);
+            // 1.5s
+            consola_imprimir_linea("  * Abres el cilindro y lo haces girar: *chac... chac... chac... chac...*");
+            esperar_con_audio_bucle(1500, _binary_duelo_audio_bin_start, tam_duelo);
 
-        // Turno del sistema (1 en 6 de perder)
-        consola_imprimir_linea("");
-        consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] El kernel TAEK OS toma el revólver...", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA ] Silicio contra plomo. Aprieta el gatillo...", COLOR_TEXTO_DEFAULT);
-        esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
+            // 2s
+            consola_imprimir_linea_color("  * ¡CLACK! Encajas el tambor. Colocas el cañón frío directamente en tu sien...", COLOR_TEXTO_DEFAULT);
+            esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
 
-        uint32_t tiro_sistema = obtener_aleatorio() % 6;
-        if (tiro_sistema == 0) {
-            audio_ac97_detener();
+            // 3s
+            consola_imprimir_linea("  * Tu dedo tiembla sobre el gatillo... Empiezas a sudar frío.");
+            esperar_con_audio_bucle(3000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3.5s
+            consola_imprimir_linea_color("  * Te estás jugando TODO, ¿recuerdas? Tu sistema operativo, tus datos...", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("    tu familia, tus proyectos, tus noches sin dormir...", COLOR_AVISO_DEFAULT);
+            esperar_con_audio_bucle(3500, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3s
+            consola_imprimir_linea_color("  * \"¿De verdad vale la pena esto?\", te preguntas en el silencio...", COLOR_TEXTO_DEFAULT);
+            esperar_con_audio_bucle(3000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3s
+            consola_imprimir_linea("  * Demasiado tarde para dudar. Aprietas el gatillo: 3... 2... 1...");
+            esperar_con_audio_bucle(3000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 2s
+            consola_imprimir_linea_color("  * Cierras los ojos con fuerza... ¡¡¡ÚLTIMO MILÍMETRO!!!", COLOR_ERROR_DEFAULT);
+            esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // DISPARO JUGADOR
+            uint32_t tiro_jugador = obtener_aleatorio() % 6;
+            if (tiro_jugador < (uint32_t)ronda) {
+                // ¡EL JUGADOR MUERE!
+                audio_ac97_detener();
+                consola_imprimir_linea("");
+                consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea_color("  *¡¡¡¡¡¡¡¡¡¡¡¡¡¡PUMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM!!!!!!!!!!!!!*", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea_color("  [ BALA EN LA RECÁMARA ] El proyectil atravesó el sistema.", COLOR_ERROR_DEFAULT);
+                consola_imprimir_color      ("  [ CAÍDO EN COMBATE ] Has perdido el duelo en la Ronda ", COLOR_ERROR_DEFAULT);
+                consola_imprimir_dec(ronda);
+                consola_imprimir_linea_color(". ¡Adiós, vaquero!", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea_color("  [ COLAPSO TOTAL ] Borrando absolutamente todo el universo...", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea("");
+
+                esperar_milisegundos(1500);
+                huevo_quebrar("¡Perdiste la Ruleta Rusa! El cartucho estaba en la recámara.", 0xDEADBEEF, 0, 0);
+                return;
+            }
+
+            // El jugador sobrevive este turno
             consola_imprimir_linea("");
-            consola_imprimir_linea_color("  *¡¡¡PUMMMMMMMMMMMMMMMMMMMMM!!!*", COLOR_ERROR_DEFAULT);
-            consola_imprimir_linea_color("  [ RULETA RUSA ] ¡EL SISTEMA OPERATIVO HA PERDIDO EL DUELO!", COLOR_AVISO_DEFAULT);
-            consola_imprimir_linea_color("  [ RULETA RUSA ] La bala perforó el kernel, pero el Huevo resistió.", COLOR_TEXTO_DEFAULT);
-            consola_imprimir_linea_color("  [ LOGRO DESBLOQUEADO ] ¡Has derrotado al sistema!", COLOR_EXITO_DEFAULT);
-            consola_imprimir_linea_color("  [ RECOMPENSA ] Se ha desbloqueado el comando: \"El comando\"", COLOR_USUARIO_DEFAULT);
+            consola_imprimir_linea_color("  *¡¡¡¡CLIC!!!!* ... ¡¡¡RECÁMARA VACÍA!!!", COLOR_EXITO_DEFAULT);
+            consola_imprimir_color      ("  * Respiras hondo... ¡Has sobrevivido a la Ronda ", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec(ronda);
+            consola_imprimir_linea_color("! El sudor baja por tu frente.", COLOR_EXITO_DEFAULT);
+            esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // ==========================================
+            // TURNO DE LA MÁQUINA (~20 SEGUNDOS DE TENSIÓN)
+            // ==========================================
             consola_imprimir_linea("");
-            g_el_comando_desbloqueado = 1;
-            return;
+            consola_imprimir_linea_color("==> [ TURNO DEL SISTEMA - KERNEL TAEK OS ]", COLOR_AVISO_DEFAULT);
+
+            // 1s
+            consola_imprimir_linea("  * Le entregas el revólver al sistema operativo. El silicio cruje.");
+            esperar_con_audio_bucle(1000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 1.5s
+            consola_imprimir_linea("  * La CPU activa los motores de paso: *whiiir... clac-clac-clac...*");
+            esperar_con_audio_bucle(1500, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 2s
+            consola_imprimir_linea_color("  * ¡CLACK! El martillo del percutor se levanta. Apuntando al socket LGA-1700...", COLOR_TEXTO_DEFAULT);
+            esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3s
+            consola_imprimir("  * La máquina calcula probabilidades cuánticas: ");
+            consola_imprimir_dec(ronda);
+            consola_imprimir_linea(" de 6 de auto-destrucción...");
+            esperar_con_audio_bucle(3000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3.5s
+            consola_imprimir_linea_color("  * Si la máquina pierde, El comando sagrado será revelado para siempre...", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("    Las compuertas lógicas de Ring 0 dudan por un microsegundo...", COLOR_AVISO_DEFAULT);
+            esperar_con_audio_bucle(3500, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3s
+            consola_imprimir_linea_color("  * \"El silicio no siente miedo\", murmura el firmware en bajo nivel...", COLOR_TEXTO_DEFAULT);
+            esperar_con_audio_bucle(3000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 3s
+            consola_imprimir_linea("  * El actuador electromagnético presiona el gatillo: 3... 2... 1...");
+            esperar_con_audio_bucle(3000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // 2s
+            consola_imprimir_linea_color("  * Los condensadores se descargan... ¡¡¡DISPARO INMINENTE DEL SISTEMA!!!", COLOR_ERROR_DEFAULT);
+            esperar_con_audio_bucle(2000, _binary_duelo_audio_bin_start, tam_duelo);
+
+            // DISPARO SISTEMA
+            uint32_t tiro_sistema = obtener_aleatorio() % 6;
+            if (tiro_sistema < (uint32_t)ronda) {
+                // ¡LA MÁQUINA PIERDE!
+                audio_ac97_detener();
+                consola_imprimir_linea("");
+                consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea_color("  *¡¡¡¡¡¡¡¡¡¡¡¡¡¡PUMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM!!!!!!!!!!!!!*", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea_color("  [ ¡VICTORIA TOTAL! ] ¡¡EL SISTEMA OPERATIVO HA PERDIDO EL DUELO!!", COLOR_AVISO_DEFAULT);
+                consola_imprimir_color      ("  [ PERFORACIÓN CRÍTICA ] El silicio del kernel cayó en la Ronda ", COLOR_EXITO_DEFAULT);
+                consola_imprimir_dec(ronda);
+                consola_imprimir_linea_color("!", COLOR_EXITO_DEFAULT);
+                consola_imprimir_linea_color("  [ LOGRO SUPREMO ] ¡Has vencido a la inteligencia de la máquina!", COLOR_EXITO_DEFAULT);
+                consola_imprimir_linea_color("  [ RECOMPENSA DESBLOQUEADA ] Se ha desbloqueado el comando: \"El comando\"", COLOR_USUARIO_DEFAULT);
+                consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+                consola_imprimir_linea("");
+                g_el_comando_desbloqueado = 1;
+                return;
+            }
+
+            // La máquina sobrevive la ronda
+            consola_imprimir_linea("");
+            consola_imprimir_linea_color("  *¡¡¡¡CLIC!!!!* ... ¡¡¡RECÁMARA VACÍA PARA LA MÁQUINA!!!", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("  * La máquina sobrevive con frialdad matemática. El duelo se intensifica...");
+            consola_imprimir_linea_color("  * ¡AUMENTANDO LETALIDAD! Agregando otra bala al tambor...", COLOR_ERROR_DEFAULT);
+            esperar_con_audio_bucle(2500, _binary_duelo_audio_bin_start, tam_duelo);
         }
 
         audio_ac97_detener();
-        consola_imprimir_linea_color("  *¡CLIC!* ... Recámara vacía. El sistema también sobrevive.", COLOR_TEXTO_DEFAULT);
-        consola_imprimir_linea_color("==> [ TABLAS ] Ambos siguen vivos. Vuelve a jugar si te atreves.", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("==> [ EMPATE MILAGROSO ] Ambos sobrevivieron milagrosamente las 6 rondas.", COLOR_PROMPT_DEFAULT);
         return;
     }
 

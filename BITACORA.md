@@ -225,6 +225,33 @@
 
 ---
 
+### [2026-09-22 18:35 - 18:45] — Hito 11: Ruleta Rusa Cinematográfica (Modo Tensión Extrema de 20s y Munición Progresiva Acumulativa)
+* **Objetivo:** Rediseñar por completo la mecánica del duelo de Ruleta Rusa en la terminal de TAEK OS para convertirlo en una experiencia cinematográfica de alta tensión psicológica (inspirada en *Buckshot Roulette* y el cine de Sergio Leone):
+  1. Cada turno dura aproximadamente **20 segundos** con pausas milimétricas y narración introspectiva antes de la caída del percutor.
+  2. Mecánica de munición progresiva acumulativa: En cada ronda ganada/sobrevivida, la letalidad aumenta (+1 proyectil en el tambor de 6 recámaras, desde la Ronda 1 con 1/6 hasta la Ronda 6 con 6/6 donde la muerte es certera).
+  3. Bucle interactivo por turnos: Jugador $\rightarrow$ Máquina $\rightarrow$ Siguiente ronda con mayor calibre y tensión.
+  4. Banda sonora continua: Reproducción en bucle del tema *El Bueno, El Feo y El Malo* vía DMA en el chip de audio Intel AC97 durante todo el conteo y la agonía de ambos bandos.
+  5. Consecuencias implacables:
+     - Si el jugador pierde: La bala atraviesa el sistema, **El Huevo de la Estabilidad** se quiebra fatalmente (`huevo_quebrar`), se dispara la animación de Don Cangrejo explotando a 30 FPS con su chillido y el sistema se apaga de golpe.
+     - Si la máquina pierde: El silicio del kernel colapsa, la recámara vacía salva al jugador y se desbloquea de por vida el comando legendario: `"El comando"`.
+* **Desglose de los 20 Segundos de Tensión por Turno:**
+  - **Segundo 0 - 1:** Sacas el revólver de la cartuchera (espera 1s).
+  - **Segundo 1 - 2.5:** Haces girar el tambor de acero: `*whiiir... clac-clac-clac...*` (espera 1.5s).
+  - **Segundo 2.5 - 4.5:** Levantas el cañón frío y lo apoyas temblando contra tu sien (espera 2s).
+  - **Segundo 4.5 - 7.5:** El sudor frío recorre tu nuca. El pulso se acelera en el silencio absoluto (espera 3s).
+  - **Segundo 7.5 - 11:** *Introspección:* Recuerdas todo lo que te estás jugando: tu sistema operativo, tus datos, tu familia, tus hijos... (espera 3.5s).
+  - **Segundo 11 - 14:** *Duda existencial:* *"¿De verdad vale la pena esto?"*, te preguntas en lo más profundo de tu alma... (espera 3s).
+  - **Segundo 14 - 17:** Tu dedo índice acaricia el gatillo metálico... 3... 2... 1... (espera 3s).
+  - **Segundo 17 - 19:** El gatillo cede el último milímetro de recorrido... ¡¡¡DISPARO INMINENTE!!! (espera 2s).
+  - **Segundo 19 - 20:** *¡CLIC!* salvador o *¡PUM!* mortal.
+* **Archivos Modificados:**
+  * `nucleo/controladores/terminal.c`: Reescritura del comando `ruleta_rusa` con bucle de rondas 1 a 6, probabilidades dinámicas `tiro < (uint32_t)ronda`, pausas de 20s orquestadas con `esperar_con_audio_bucle()`, y mensajes inmersivos.
+* **Pruebas y Verificación:**
+  * Compilación limpia con Clang/LLD en WSL (`taek-os.img` generada y actualizada).
+  * Soporte de audio estéreo AC97 para los turnos de 20 segundos sin interrupciones ni bloqueos de búfer.
+
+---
+
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |
