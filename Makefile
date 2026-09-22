@@ -24,19 +24,23 @@ C_SRCS    = nucleo/principal.c \
             nucleo/arquitectura/x86_64/gdt.c \
             nucleo/arquitectura/x86_64/idt.c \
             nucleo/arquitectura/x86_64/pci.c \
+            nucleo/arquitectura/x86_64/vmx.c \
             nucleo/base/huevo.c \
             nucleo/base/energia.c \
             nucleo/base/utf8.c \
             nucleo/base/tiempo.c \
             nucleo/controladores/pantalla.c \
-            nucleo/controladores/audio_ac97.c
+            nucleo/controladores/audio_ac97.c \
+            nucleo/controladores/animacion_cangrejo.c
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
 
 OBJS      = $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS)) \
             $(patsubst %.s, $(BUILD_DIR)/%.o, $(S_SRCS)) \
             $(BUILD_DIR)/imagen_arranque.o \
-            $(BUILD_DIR)/audio_arranque.o
+            $(BUILD_DIR)/audio_arranque.o \
+            $(BUILD_DIR)/cangrejo_video.o \
+            $(BUILD_DIR)/cangrejo_audio.o
 
 IMG       = $(BUILD_DIR)/taek-os.img
 KERNEL    = $(BUILD_DIR)/nucleo.elf
@@ -53,6 +57,16 @@ $(BUILD_DIR)/audio_arranque.bin: $(RECURSOS)/damonte.mp3
 	@echo "==> Convirtiendo cancion a PCM 44.1kHz 16-bit..."
 	ffmpeg -y -i "$<" -ac 2 -ar 44100 -f s16le $@
 
+$(BUILD_DIR)/cangrejo_video.bin: $(RECURSOS)/cangrejo.mp4
+	@mkdir -p $(BUILD_DIR)
+	@echo "==> Extrayendo fotogramas de Don Cangrejo (288x360 BGRA32)..."
+	ffmpeg -y -i "$<" -pix_fmt bgra -f rawvideo $@
+
+$(BUILD_DIR)/cangrejo_audio.bin: $(RECURSOS)/cangrejo.mp4
+	@mkdir -p $(BUILD_DIR)
+	@echo "==> Extrayendo audio de explosion de Don Cangrejo a PCM..."
+	ffmpeg -y -i "$<" -ac 2 -ar 44100 -f s16le $@
+
 $(BUILD_DIR)/imagen_arranque.o: $(BUILD_DIR)/imagen_arranque.bin
 	@echo "==> Enlazando imagen binaria como objeto ELF64..."
 	@cd $(BUILD_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 imagen_arranque.bin imagen_arranque.o
@@ -60,6 +74,14 @@ $(BUILD_DIR)/imagen_arranque.o: $(BUILD_DIR)/imagen_arranque.bin
 $(BUILD_DIR)/audio_arranque.o: $(BUILD_DIR)/audio_arranque.bin
 	@echo "==> Enlazando audio binario como objeto ELF64..."
 	@cd $(BUILD_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 audio_arranque.bin audio_arranque.o
+
+$(BUILD_DIR)/cangrejo_video.o: $(BUILD_DIR)/cangrejo_video.bin
+	@echo "==> Enlazando video Don Cangrejo como objeto ELF64..."
+	@cd $(BUILD_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 cangrejo_video.bin cangrejo_video.o
+
+$(BUILD_DIR)/cangrejo_audio.o: $(BUILD_DIR)/cangrejo_audio.bin
+	@echo "==> Enlazando audio Don Cangrejo como objeto ELF64..."
+	@cd $(BUILD_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 cangrejo_audio.bin cangrejo_audio.o
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -74,9 +96,9 @@ $(KERNEL): $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 
 $(IMG): $(KERNEL) boot/limine.conf
-	@echo "==> Generando Imagen de Arranque UEFI FAT32..."
+	@echo "==> Generando Imagen de Arranque UEFI FAT32 (128 MB)..."
 	@rm -f $(IMG)
-	@dd if=/dev/zero of=$(IMG) bs=1M count=64 status=none
+	@dd if=/dev/zero of=$(IMG) bs=1M count=128 status=none
 	@mformat -i $(IMG) -F ::
 	@mmd -i $(IMG) ::/EFI
 	@mmd -i $(IMG) ::/EFI/BOOT

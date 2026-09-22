@@ -1,4 +1,4 @@
-﻿# Bitácora de Desarrollo e Historial de Cambios: TAEK OS
+# Bitácora de Desarrollo e Historial de Cambios: TAEK OS
 > **Proyecto:** TAEK OS (TelAvivEpsteinKirkOS)  
 > **Arquitectura:** x86_64 UEFI Freestanding (Ring 0)  
 > **Procesador Objetivo:** Intel Core i9-14900HX Compatible  
@@ -69,9 +69,36 @@
   * `Makefile`: Reglas automáticas para convertir con `ffmpeg` el PNG a BGRA32 crudo y el MP3 a PCM estéreo de 16 bits, incrustándolos en `nucleo.elf` con `objcopy`.
   * `run.ps1`: Añadidos parámetros de QEMU `-audiodev dsound,id=snd0 -device AC97,audiodev=snd0`.
   * `nucleo/principal.c`: Orquestación del arranque con dibujo de la imagen, lanzamiento del audio DMA y conteo regresivo de 9 segundos en la consola serial.
-* **Resultado:** Imagen centrada en pantalla, música sonando por los altavoces de Windows y conteo segundo a segundo verificado por El Huevo.
+### [2026-09-22 16:45 - 16:55] — Hito 5: Hipervisor en Ring -1 (Intel VMX) y Protocolo de Autodestrucción Don Cangrejo
+* **Objetivo:** Implementar la infraestructura de virtualización por hardware (Intel VMX Root Operation / Ring -1) para interceptar colapsos totales (Triple Faults) y reproducir la animación de Don Cangrejo explotando con audio antes de apagar el equipo.
+* **Inspección y Caracterización del Video (`Don cangrejo explota meme.mp4`):**
+  * **Resolución nativa:** 288 x 360 píxeles.
+  * **Tasa de fotogramas:** 30.00 FPS.
+  * **Duración y conteo:** 49 fotogramas (~1.63 segundos).
+  * **Pista de Audio:** AAC 44.1 kHz estéreo.
+  * **Estrategia de Decodificación:** Para evitar la sobrecarga y complejidad inmanejable de un decodificador H.264/MP4 en Ring -1 / Anillo 0, se aplicó pre-conversión en el `Makefile` usando `ffmpeg` a fotogramas planos BGRA32 (49 * 288 * 360 * 4 ≈ 20 MB) y audio PCM crudo de 16 bits firmado a 44.1 kHz (~304 KB).
+* **Archivos Creados / Modificados:**
+  * `nucleo/arquitectura/x86_64/vmx.h / .c`:
+    * Detección de soporte VMX en el procesador mediante CPUID (Hoja 1, bit 5 de ECX).
+    * Configuración y desbloqueo del MSR `IA32_FEATURE_CONTROL` (`0x3A`, bits 0 y 2).
+    * Habilitación del bit VMXE (bit 13) en el registro de control `CR4`.
+    * Lectura del VMCS Revision ID desde el MSR `IA32_VMX_BASIC` (`0x480`).
+    * Asignación alineada a 4096 bytes de la región VMXON y cálculo de su dirección física mediante el protocolo de direcciones de Limine.
+    * Ejecución de la instrucción ensamblador `vmxon` para ingresar en VMX Root Operation (Ring -1).
+  * `nucleo/controladores/animacion_cangrejo.h / .c`:
+    * Motor de renderizado directo al Framebuffer físico UEFI GOP de los 49 fotogramas de 288x360 a 30 FPS (33 ms por fotograma mediante calibración TSC/PIT).
+    * Disparo simultáneo del audio de explosión vía DMA en el chip PCI Intel AC97.
+  * `nucleo/base/huevo.c`:
+    * Conexión directa: cuando el huevo sufre una fractura fatal (`huevo_quebrar`), antes de apagar el hardware invoca a `animacion_don_cangrejo_explotar(2)` para realizar la secuencia de explosión en bucle.
+  * `Makefile`:
+    * Nuevas reglas de extracción de video/audio de `cangrejo.mp4` hacia objetos ELF64 (`cangrejo_video.o`, `cangrejo_audio.o`) con `objcopy`.
+    * Expansión de la imagen UEFI FAT32 a 128 MB para alojar los 23 MB del kernel con assets pre-renderizados.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpio con Clang 22 y LLD.
+  * Ejecución exitosa en QEMU UEFI: el hipervisor entra en VMX Root Operation, el huevo valida todas las etapas del arranque sin fallos, el audio suena durante 9 segundos y la máquina queda lista.
 
 ---
+
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 

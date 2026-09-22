@@ -1,5 +1,6 @@
 #include "huevo.h"
 #include "energia.h"
+#include "../controladores/animacion_cangrejo.h"
 #include "../arquitectura/x86_64/serial.h"
 
 static huevo_estabilidad_t g_huevo;
@@ -40,7 +41,7 @@ void huevo_etapa_ok(void) {
 
 void huevo_verificar(void) {
     if (g_huevo.magico != HUEVO_MAGICO || g_huevo.canario != HUEVO_CANARIO) {
-        huevo_quebrar("¡Corrupcion de memoria detectada! ¡El canario ha muerto!", 0, 0, 0);
+        huevo_quebrar("¡Corrupción de memoria detectada! ¡El canario ha muerto!", 0, 0, 0);
     }
 }
 
@@ -55,7 +56,7 @@ void huevo_agrietar(const char *motivo) {
         huevo_quebrar(motivo, 0, 0, 0);
     }
 
-    serial_imprimir("\n[ ADVERTENCIA DEL HUEVO ] Cascaron fisurado: ");
+    serial_imprimir("\n[ ADVERTENCIA DEL HUEVO ] Cascarón fisurado: ");
     serial_imprimir(motivo);
     serial_imprimir(" | Salud restante: ");
     serial_imprimir_dec(g_huevo.salud);
@@ -70,7 +71,7 @@ void huevo_quebrar(const char *motivo_fatal, uint64_t rip, uint64_t rsp, uint64_
     serial_imprimir_linea("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     serial_imprimir_linea("     .---.     ");
     serial_imprimir_linea("    / / \\ \\    [FATAL] ¡EL HUEVO DE LA ESTABILIDAD SE HA QUEBRADO!");
-    serial_imprimir_linea("   | X   X |   [FATAL] ¡COLAPSO TOTAL DEL SISTEMA EN EJECUCION!");
+    serial_imprimir_linea("   | X   X |   [FATAL] ¡COLAPSO TOTAL DEL SISTEMA DETECTADO!");
     serial_imprimir_linea("    \\ \\ / /    [FATAL] Motivo del colapso: ");
     serial_imprimir_linea("     `---'     ");
     serial_imprimir("               ");
@@ -78,18 +79,19 @@ void huevo_quebrar(const char *motivo_fatal, uint64_t rip, uint64_t rsp, uint64_
     serial_imprimir_linea("--------------------------------------------------");
     serial_imprimir("  Etapa del fallo       : ");
     serial_imprimir_linea(g_huevo.etapa_actual ? g_huevo.etapa_actual : "Desconocida");
-    serial_imprimir("  Puntero de instruccion: ");
+    serial_imprimir("  Puntero de instrucción: ");
     serial_imprimir_hex(rip);
     serial_imprimir_linea("");
     serial_imprimir("  Puntero de pila (RSP) : ");
     serial_imprimir_hex(rsp);
     serial_imprimir_linea("");
-    serial_imprimir("  Codigo de error de CPU: ");
+    serial_imprimir("  Código de error CPU   : ");
     serial_imprimir_hex(codigo_error);
     serial_imprimir_linea("");
     serial_imprimir_linea("==================================================");
-    serial_imprimir_linea("[ EL HUEVO ] APAGANDO LA MAQUINA DE INMEDIATO...");
-    serial_imprimir_linea("==================================================");
+
+    // Invocar el protocolo Don Cangrejo del Hipervisor
+    animacion_don_cangrejo_explotar(2);
 
     apagar_equipo();
 }
