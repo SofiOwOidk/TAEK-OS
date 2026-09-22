@@ -1,0 +1,8 @@
+﻿build/
+*.img
+*.iso
+*.bin
+*.elf
+*.o
+
+recursos
