@@ -38,6 +38,8 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/consola.c \
             nucleo/controladores/gpu.c \
             nucleo/compatibilidad/linux.c \
+            nucleo/compatibilidad/nv_os_interface.c \
+            nucleo/controladores/video/nvidia/core/nvidia_core.c \
             nucleo/controladores/terminal.c
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s

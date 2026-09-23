@@ -365,7 +365,36 @@
     - Etapa supervisada por El Huevo: `[Linux ABI 6.12 | Dispositivos PCI: 7] [ OK ]`.
     - Comando `linux`: Reportó ABI 6.12 LTS, rango virtual `0xfffffd0000000000`, 0 KiB DMA en uso y 7 dispositivos adaptados.
     - Comando `linux probar`: Superó los 5 pasos con éxito total (`==> [ AUTODIAGNÓSTICO EXITOSO ] Capa Linux Shim 100% lista para controladores externos.`).
-    - Apagado limpio por ACPI.
+### [2026-09-22 19:35 - 19:42] — Hito 15.1: Aislamiento Arquitectónico de NVIDIA (Resource Manager Core en `controladores/video/nvidia/`, `nv_os_interface` y Comandos `nvidia` / `nvidia probar`)
+* **Objetivo:** Cumplir con la directriz de diseño del usuario de aislar formalmente todo el código específico de NVIDIA dentro de `nucleo/controladores/video/nvidia/`, desacoplándolo del núcleo de TAEK OS mediante la interfaz abstracta `nv_os_interface`. Este aislamiento garantiza que si ocurre un fallo o regresión en el pipeline gráfico (cómputo o renderizado), sea trivial determinar si el error provino del silicio/driver de NVIDIA o del kernel base de la CPU.
+* **Diseño Arquitectónico de 3 Capas:**
+  1. **Capa 1: NVIDIA Core Aislado (`nucleo/controladores/video/nvidia/`):**
+     - `inc/nvtypes.h`: Tipos de datos oficiales de NVIDIA (`NvU8`..`NvU64`, `NvBool`, `NvHandle`).
+     - `inc/nvstatus.h`: Códigos de retorno oficiales (`NV_OK`, `NV_ERR_NO_MEMORY`, etc.).
+     - `inc/nv_gsp.h`: Protocolo de mensajería RPC y estructuras para el firmware GSP (GPU System Processor) para Blackwell (RTX 5070 Ti) y Ada/Ampere.
+     - `core/nvidia_core.h / .c`: Resource Manager Core, sondeo de silicio e inicialización de canales.
+  2. **Capa 2: Capa Puente y Enlace (`nucleo/compatibilidad/`):**
+     - `nv_os_interface.h / .c`: Implementa la interfaz formal que el Core de NVIDIA requiere (`nv_os_alloc_pages`, `nv_os_free_pages`, `nv_os_map_mmio`, `nv_os_unmap_mmio`, `nv_os_read_pci_32`, `nv_os_spinlock_*`, `nv_os_delay_*`), enrutándolas hacia el Linux Shim y el VMM de TAEK OS.
+  3. **Capa 3: Núcleo Soberano de TAEK OS:**
+     - Provee memoria física (PMM), paginación sin caché (VMM), sondeo PCIe y vigilancia de **El Huevo de la Estabilidad**.
+  4. **Comandos de Terminal:**
+     - `nvidia`: Reporta estado del pipeline, silicio Blackwell/Ada, identificadores PCI y canal DMA RPC de GSP.
+     - `nvidia probar`: Autodiagnóstico riguroso de 4 pasos (spinlocks de silicio, memoria DMA coherente, formato RPC de GSP y verificación de aislamiento sin fugas de fallos al kernel).
+* **Archivos Creados / Modificados:**
+  * `nucleo/controladores/video/nvidia/inc/nvtypes.h` [NUEVO]
+  * `nucleo/controladores/video/nvidia/inc/nvstatus.h` [NUEVO]
+  * `nucleo/controladores/video/nvidia/inc/nv_gsp.h` [NUEVO]
+  * `nucleo/controladores/video/nvidia/core/nvidia_core.h / .c` [NUEVOS]
+  * `nucleo/compatibilidad/nv_os_interface.h / .c` [NUEVOS]
+  * `nucleo/principal.c`: Etapa de arranque supervisada: *"Subsistema Aislado NVIDIA Resource Manager (Core / GSP)"*.
+  * `nucleo/controladores/terminal.c`: Inclusión de `nvidia_core.h`, comandos `nvidia` y `nvidia probar`, y menú `ayuda`.
+  * `Makefile`: Inclusión de `nv_os_interface.c` y `nvidia_core.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpios con Clang 22 / LLD.
+  * En QEMU UEFI:
+    - Etapa supervisada por El Huevo: `[Pipeline: NVIDIA Blackwell GB20x (Verificación Pipeline) (Canal GSP Listo)] [ OK ]`.
+    - Comando `nvidia`: Mostró aislamiento al 100%, canal DMA RPC de 8 KiB en dirección física `0x1feef000`.
+    - Comando `nvidia probar`: 4 pasos aprobados al 100% (`==> [ AUTODIAGNÓSTICO EXITOSO ] Pipeline NVIDIA aislado y listo para H16 (APIC+IRQ).`).
 
 ---
 

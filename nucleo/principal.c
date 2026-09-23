@@ -20,6 +20,7 @@
 #include "controladores/animacion_cangrejo.h"
 #include "controladores/gpu.h"
 #include "compatibilidad/linux.h"
+#include "controladores/video/nvidia/core/nvidia_core.h"
 #include "controladores/terminal.h"
 
 // Revision 3 del protocolo Limine
@@ -120,6 +121,15 @@ void principal(void) {
     linux_shim_obtener_estadisticas(&dma_asig, &ioremap_cnt, &pci_devs);
     serial_imprimir("[Linux ABI 6.12 | Dispositivos PCI: ");
     serial_imprimir_dec((uint64_t)pci_devs);
+    serial_imprimir("] ");
+    huevo_etapa_ok();
+
+    huevo_etapa("Subsistema Aislado NVIDIA Resource Manager (Core / GSP)");
+    nvidia_core_iniciar();
+    const struct nvidia_dispositivo *ndev = nvidia_core_obtener_dispositivo();
+    serial_imprimir("[Pipeline: ");
+    serial_imprimir(ndev->chip_name);
+    serial_imprimir(ndev->presente ? " (Hardware MoDT Activo)" : " (Canal GSP Listo)");
     serial_imprimir("] ");
     huevo_etapa_ok();
 
