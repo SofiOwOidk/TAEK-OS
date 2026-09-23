@@ -31,6 +31,8 @@ Reinicia la PC y presiona `Supr` o `F2` para ingresar al menú de configuración
 
 | Parámetro | Configuración | Justificación Técnica |
 | :--- | :--- | :--- |
+| **Primary Display / Initial Display** | **IGFX / iGPU / CPU Graphics** | Fuerza que el video UEFI GOP salga por el HDMI/DP de la motherboard (Intel UHD 770). |
+| **Internal Graphics / Multi-Monitor** | **Enabled** | Evita que la placa desactive los gráficos del i9-14900HX al detectar la RTX 5070 Ti en el PCIe. |
 | **Secure Boot** | **Disabled** (o *Other OS*) | TAEK OS corre su propio kernel ELF64 sin clave criptográfica de Microsoft KEK. |
 | **Boot Mode** | **Pure UEFI** (*CSM Disabled*) | Requerido por el bootloader Limine 8.7.0 y el Framebuffer UEFI GOP a 32bpp. |
 | **Above 4G Decoding** | **Enabled** | Permite asignar los 16 GiB de VRAM de la RTX 5070 Ti por encima de los 4 GB de RAM física. |
@@ -38,6 +40,11 @@ Reinicia la PC y presiona `Supr` o `F2` para ingresar al menú de configuración
 | **Intel Virtualization (VT-x)** | **Enabled** | Requerido para el Hipervisor VMX en Ring -1 de TAEK OS. |
 | **Intel VT-d (IOMMU)** | **Enabled** | Permite que el analizador ACPI DMAR descubra las unidades DRHD y opere en Pass-Through (PT). |
 | **Serial Port (COM1)** | **Enabled** (*0x3F8 / IRQ 4*) | Activa el chip Super I/O para transmitir toda la telemetría en caso de usar cable serie. |
+
+> [!TIP]
+> **Conexión de Cable de Video (HDMI / DisplayPort):**  
+> **Conéctalo SIEMPRE a la salida de video de la motherboard (Panel trasero de la placa)**, NO a la tarjeta RTX 5070 Ti.  
+> *¿Por qué?* El procesador Intel Core i9-14900HX cuenta con gráficos integrados Intel UHD 770. Si conectaras el monitor a la RTX 5070 Ti, cualquier fallo en los registros de la GPU durante el desarrollo de nuestro driver apagaría la pantalla por completo (*blackout*). Conectando a la motherboard, la terminal y El Huevo mantienen la señal de video 100% visible sin importar lo que ocurra con la tarjeta NVIDIA.
 
 ---
 
