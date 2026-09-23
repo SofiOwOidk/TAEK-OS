@@ -45,6 +45,12 @@ void pci_escribir_config_16(uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_
     escribir_puerto_w(PUERTO_CONFIG_DATOS + (desplazamiento & 2), valor);
 }
 
+void pci_escribir_config_8(uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_t desplazamiento, uint8_t valor) {
+    uint32_t dir = pci_direccion_bus(bus, ranura, funcion, desplazamiento);
+    escribir_puerto_l(PUERTO_CONFIG_DIR, dir);
+    escribir_puerto_b(PUERTO_CONFIG_DATOS + (desplazamiento & 3), valor);
+}
+
 const char *pci_nombre_proveedor(uint16_t id_proveedor) {
     switch (id_proveedor) {
         case 0x10DE: return "NVIDIA Corporation";

@@ -330,7 +330,42 @@
   * En QEMU UEFI:
     - El Huevo validó la etapa de GPU sin agrietarse: `[Silicio: Bochs / QEMU Extended VGA | MMIO Virt: 0x0xFFFFFE0000000000] [ OK ]`.
     - Comando `gpu`: Mostró el dispositivo `00:01.0 [1234:1111]`, MMIO Físico `0x81085000` (4 KiB), MMIO Virtual `0xfffffe0000000000 [ACTIVO - SIN CACHÉ / PCD]` y VRAM `0x80000000` (16 MiB).
-    - Comando `gpu probar`: Superó los 5 pasos con éxito total (`==> [ AUTODIAGNÓSTICO EXITOSO ] Pipeline de comunicación MMIO con GPU operativo.`) registrando ~35,000 ciclos de latencia de bus.
+### [2026-09-22 19:25 - 19:30] — Hito 15: Capa de Compatibilidad Linux Kernel Shim (Ring 0), Adaptador PCI, Memoria DMA Coherente y Comandos `linux` / `linux probar`
+* **Objetivo:** Construir el puente de compatibilidad ABI con el núcleo de Linux (`nucleo/compatibilidad/linux.h` y `linux.c`) para permitir la integración y ejecución directa de módulos de controladores de video (NVIDIA Open GPU Kernel Modules y VirtIO-GPU), contemplando la arquitectura de placa MoDT de escritorio (Intel Core i9-14900HX con GPU dedicada en bus PCIe directo a la CPU sin intermediarios Optimus).
+* **Diseño Arquitectónico:**
+  1. **Tipos de Datos y Códigos de Error POSIX/Linux:**
+     - Definición de enteros canónicos (`u8`, `u16`, `u32`, `u64`), tipos de direcciones físicas y DMA (`dma_addr_t`, `phys_addr_t`, `resource_size_t`) y códigos de error estándar (`EINVAL`, `ENOMEM`, `EIO`, `EBUSY`, `ENODEV`).
+  2. **Primitivas de Concurrencia y Sincronización:**
+     - Spinlocks de Anillo 0 (`spinlock_t`, `spin_lock`, `spin_unlock`, `spin_lock_irqsave`) con ensamblador atómico y mitigación de contienda mediante instrucción `pause`.
+     - Variables atómicas (`atomic_t`, `atomic_read`, `atomic_set`, `atomic_inc`, `atomic_dec`) con ordenamiento de memoria secuencial.
+     - Barreras de hardware x86_64: `mb()` (`mfence`), `rmb()` (`lfence`), `wmb()` (`sfence`).
+  3. **Memoria DMA Coherente para Silicio (`dma_alloc_coherent`):**
+     - Asignación de páginas físicas contiguas mediante el PMM de TAEK OS para alojar las colas de comandos (*ring buffers*) y el firmware GSP de NVIDIA.
+     - Devolución simultánea del puntero virtual HHDM y la dirección física (`dma_handle`).
+  4. **Mapeo MMIO sin Caché (`ioremap` / `iounmap`):**
+     - Rango virtual canónico exclusivo asignado: `LINUX_SHIM_IOREMAP_BASE` (`0xFFFFFD0000000000ULL`), aislado del espacio del kernel y de la terminal.
+     - Páginas de protección (guard pages) de 4 KiB entre mapeos para aislar fallos de desbordamiento.
+  5. **Adaptador de Dispositivos PCI (`struct pci_dev`):**
+     - Adaptación en tiempo de arranque de los dispositivos físicos descubiertos en el escáner del Hito 13 hacia las estructuras `struct pci_dev` de Linux.
+     - Funciones de sondeo: `pci_get_device()`, `pci_get_class()`, `pci_enable_device()`, `pci_set_master()`.
+     - Primitivas de lectura y escritura en el espacio de configuración PCI: `pci_read_config_*` y `pci_write_config_*` (8, 16 y 32 bits).
+  6. **Subsistema de Telemetría y Comandos:**
+     - Implementación de `printk()` con soporte de niveles de registro (`KERN_INFO`, etc.) y macros `pr_info()`, `pr_warn()`, `pr_err()`.
+     - Comando `linux` / `shim`: Reporta estadísticas de memoria DMA, rango virtual y dispositivos registrados.
+     - Comando `linux probar`: Autodiagnóstico de 5 pasos que certifica el correcto funcionamiento del puente.
+* **Archivos Creados / Modificados:**
+  * `nucleo/compatibilidad/linux.h / .c`: Implementación completa de la capa shim.
+  * `nucleo/arquitectura/x86_64/pci.h / .c`: Incorporación de la primitiva de escritura en 8 bits `pci_escribir_config_8()`.
+  * `nucleo/principal.c`: Etapa de arranque supervisada por El Huevo: *"Capa de Compatibilidad Linux Kernel Shim (Ring 0)"*.
+  * `nucleo/controladores/terminal.c`: Comandos `linux` y `linux probar`, e inclusión en el menú `ayuda`.
+  * `Makefile`: Inclusión de `nucleo/compatibilidad/linux.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpios con Clang 22 / LLD.
+  * En QEMU UEFI:
+    - Etapa supervisada por El Huevo: `[Linux ABI 6.12 | Dispositivos PCI: 7] [ OK ]`.
+    - Comando `linux`: Reportó ABI 6.12 LTS, rango virtual `0xfffffd0000000000`, 0 KiB DMA en uso y 7 dispositivos adaptados.
+    - Comando `linux probar`: Superó los 5 pasos con éxito total (`==> [ AUTODIAGNÓSTICO EXITOSO ] Capa Linux Shim 100% lista para controladores externos.`).
+    - Apagado limpio por ACPI.
 
 ---
 

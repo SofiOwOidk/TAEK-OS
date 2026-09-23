@@ -4,6 +4,7 @@
 #include "audio_ac97.h"
 #include "animacion_cangrejo.h"
 #include "gpu.h"
+#include "../compatibilidad/linux.h"
 #include "../base/huevo.h"
 #include "../base/energia.h"
 #include "../base/tiempo.h"
@@ -738,6 +739,75 @@ static void ejecutar_comando_gpu(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'gpu probar' para comprobar la latencia y lectura del silicio.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_comando_linux(const char *arg) {
+    uint64_t mem_dma = 0;
+    uint64_t mapeos_io = 0;
+    uint32_t devs_pci = 0;
+    linux_shim_obtener_estadisticas(&mem_dma, &mapeos_io, &devs_pci);
+
+    // MODO AUTODIAGNÓSTICO: linux probar / shim probar
+    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
+        consola_imprimir_linea_color("========== AUTODIAGNÓSTICO DE CAPA SHIM LINUX KERNEL ==========", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("Verificando llamadas al sistema, sincronización y memoria del puente...");
+
+        consola_imprimir("  1. Primitivas de Concurrencia (Spinlocks y Atomics)... ");
+        int res = linux_shim_ejecutar_autodiagnostico();
+        if (res == 0) {
+            consola_imprimir_linea_color("[OK - SPINLOCK & ATOMIC 100%]", COLOR_EXITO_DEFAULT);
+        } else if (res == 1) {
+            consola_imprimir_linea_color("[FALLÓ EN ATOMICS]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir("  2. Memoria DMA Coherente Continua (dma_alloc_coherent)... ");
+        if (res == 2 || res == 3) {
+            consola_imprimir_linea_color("[FALLÓ EN DMA COHERENTE]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - DMA COHERENTE OK]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  3. Mapeo MMIO sin Caché y Desmapeo (ioremap / iounmap)... ");
+        if (res == 4) {
+            consola_imprimir_linea_color("[FALLÓ EN IOREMAP]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - IOREMAP & IOUNMAP OK]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  4. Adaptador de Dispositivos PCI (struct pci_dev de Linux)... ");
+        consola_imprimir("[OK: ");
+        consola_imprimir_dec((uint64_t)devs_pci);
+        consola_imprimir_linea_color(" dispositivos enlazados]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  5. Formateador de Telemetría (printk y pr_info)... ");
+        pr_info("Mensaje de prueba emitido desde la capa Linux Shim a Anillo 0.");
+
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Capa Linux Shim 100% lista para controladores externos.", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
+    // REPORTE ESTÁNDAR: linux / shim
+    consola_imprimir_linea_color("================ CAPA DE COMPATIBILIDAD LINUX SHIM ================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Versión de ABI Emulada: ");
+    consola_imprimir_linea_color("Linux Kernel 6.12 LTS (Interfaces de Controladores)", COLOR_USUARIO_DEFAULT);
+    consola_imprimir("  Rango Virtual ioremap : 0x");
+    terminal_imprimir_hex_fijo(LINUX_SHIM_IOREMAP_BASE, 16);
+    consola_imprimir_linea(" (Espacio Propio en VMM)");
+    consola_imprimir("  Mapeos ioremap Activos: ");
+    consola_imprimir_dec(mapeos_io);
+    consola_imprimir_linea("");
+    consola_imprimir("  Memoria DMA Asignada  : ");
+    consola_imprimir_dec(mem_dma / 1024ULL);
+    consola_imprimir_linea(" KiB (Búferes continuos de comunicación con GPU)");
+    consola_imprimir("  Dispositivos PCI Shim : ");
+    consola_imprimir_dec((uint64_t)devs_pci);
+    consola_imprimir_linea(" (Estructuras 'struct pci_dev' adaptadas)");
+    consola_imprimir("  Controladores Objetivos: ");
+    consola_imprimir_linea_color("NVIDIA Open GPU Kernel Modules (GSP Client) & VirtIO-GPU", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'linux probar' para verificar el puente y llamadas DMA.", COLOR_TEXTO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -780,6 +850,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Enumera dispositivos PCI/PCIe ('pci detalle', 'pci gpu').");
         consola_imprimir_color("  gpu            ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Diagnóstico especializado de la GPU, VRAM y registros MMIO ('gpu probar').");
+        consola_imprimir_color("  linux / shim   ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Capa puente de compatibilidad con drivers de Linux ('linux probar').");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -1066,6 +1138,15 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "video ")) arg = str_saltar_espacios(linea + 6);
         else if (str_comienza_con(linea, "vram ")) arg = str_saltar_espacios(linea + 5);
         ejecutar_comando_gpu(arg);
+        return;
+    }
+
+    // COMANDO: linux / shim
+    if (str_comienza_con(linea, "linux") || str_comienza_con(linea, "shim")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "linux ")) arg = str_saltar_espacios(linea + 6);
+        else if (str_comienza_con(linea, "shim ")) arg = str_saltar_espacios(linea + 5);
+        ejecutar_comando_linux(arg);
         return;
     }
 

@@ -19,6 +19,7 @@
 #include "controladores/audio_ac97.h"
 #include "controladores/animacion_cangrejo.h"
 #include "controladores/gpu.h"
+#include "compatibilidad/linux.h"
 #include "controladores/terminal.h"
 
 // Revision 3 del protocolo Limine
@@ -110,6 +111,17 @@ void principal(void) {
         serial_imprimir("[Sin acelerador GPU dedicado - Operando en modo GOP] ");
         huevo_etapa_ok();
     }
+
+    huevo_etapa("Capa de Compatibilidad Linux Kernel Shim (Ring 0)");
+    linux_shim_iniciar();
+    uint64_t dma_asig = 0;
+    uint64_t ioremap_cnt = 0;
+    uint32_t pci_devs = 0;
+    linux_shim_obtener_estadisticas(&dma_asig, &ioremap_cnt, &pci_devs);
+    serial_imprimir("[Linux ABI 6.12 | Dispositivos PCI: ");
+    serial_imprimir_dec((uint64_t)pci_devs);
+    serial_imprimir("] ");
+    huevo_etapa_ok();
 
     huevo_etapa("Inicialización de Pantalla GOP UEFI");
     if (g_peticion_framebuffer.response == NULL || g_peticion_framebuffer.response->framebuffer_count < 1) {

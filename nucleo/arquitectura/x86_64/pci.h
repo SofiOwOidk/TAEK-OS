@@ -43,6 +43,7 @@ uint16_t pci_leer_config_16(uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_
 uint8_t  pci_leer_config_8 (uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_t desplazamiento);
 void     pci_escribir_config_32(uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_t desplazamiento, uint32_t valor);
 void     pci_escribir_config_16(uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_t desplazamiento, uint16_t valor);
+void     pci_escribir_config_8 (uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_t desplazamiento, uint8_t valor);
 
 void pci_iniciar(void);
 int  pci_obtener_conteo(void);
