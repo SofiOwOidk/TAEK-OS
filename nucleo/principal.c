@@ -7,6 +7,7 @@
 #include "arquitectura/x86_64/serial.h"
 #include "arquitectura/x86_64/gdt.h"
 #include "arquitectura/x86_64/idt.h"
+#include "arquitectura/x86_64/pci.h"
 #include "arquitectura/x86_64/vmx.h"
 #include "base/huevo.h"
 #include "base/energia.h"
@@ -80,6 +81,19 @@ void principal(void) {
 
     huevo_etapa("Tablas de Paginación x86_64 (PML4 / VMM)");
     paginacion_iniciar();
+    huevo_etapa_ok();
+
+    huevo_etapa("Enumeración del Bus PCI / PCIe y Dispositivos de Video");
+    pci_iniciar();
+    serial_imprimir("[Dispositivos PCI: ");
+    serial_imprimir_dec((uint64_t)pci_obtener_conteo());
+    serial_imprimir("] ");
+    const struct dispositivo_pci *gpu_init = pci_obtener_gpu_primaria();
+    if (gpu_init) {
+        serial_imprimir("[GPU: ");
+        serial_imprimir(pci_nombre_proveedor(gpu_init->id_proveedor));
+        serial_imprimir("] ");
+    }
     huevo_etapa_ok();
 
     huevo_etapa("Inicialización de Pantalla GOP UEFI");

@@ -8,6 +8,7 @@
 #include "../base/tiempo.h"
 #include "../base/memoria.h"
 #include "../base/paginacion.h"
+#include "../arquitectura/x86_64/pci.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -404,6 +405,206 @@ static void ejecutar_comando_paginacion(const char *arg) {
     consola_imprimir_linea_color("Tip: Usa 'paginacion probar' para ejecutar autodiagnóstico de mapeo.", COLOR_TEXTO_DEFAULT);
 }
 
+static void terminal_imprimir_hex_fijo(uint64_t val, int digitos) {
+    const char hex_chars[] = "0123456789abcdef";
+    for (int i = digitos - 1; i >= 0; i--) {
+        uint8_t nibble = (uint8_t)((val >> (i * 4)) & 0x0F);
+        consola_escribir_caracter(hex_chars[nibble]);
+    }
+}
+
+static void imprimir_tamano_barra(uint64_t tam) {
+    if (tam >= 1024ULL * 1024ULL * 1024ULL) {
+        consola_imprimir_dec(tam / (1024ULL * 1024ULL * 1024ULL));
+        consola_imprimir(" GiB");
+    } else if (tam >= 1024ULL * 1024ULL) {
+        consola_imprimir_dec(tam / (1024ULL * 1024ULL));
+        consola_imprimir(" MiB");
+    } else if (tam >= 1024ULL) {
+        consola_imprimir_dec(tam / 1024ULL);
+        consola_imprimir(" KiB");
+    } else {
+        consola_imprimir_dec(tam);
+        consola_imprimir(" B");
+    }
+}
+
+static void ejecutar_comando_lspci(const char *arg) {
+    int conteo = pci_obtener_conteo();
+
+    // MODO: pci gpu / lspci gpu / gpu
+    if (arg && (str_igual(arg, "gpu") || str_igual(arg, "-g") || str_igual(arg, "video"))) {
+        consola_imprimir_linea_color("================== CONTROLADORAS DE VIDEO Y GPU ==================", COLOR_AVISO_DEFAULT);
+        int gpus_encontradas = 0;
+
+        for (int i = 0; i < conteo; i++) {
+            const struct dispositivo_pci *dev = pci_obtener_dispositivo(i);
+            if (!dev) continue;
+
+            if (dev->clase == 0x03 || (dev->clase == 0x00 && dev->subclase == 0x01)) {
+                gpus_encontradas++;
+                consola_imprimir("  [ GPU ");
+                consola_imprimir_dec(gpus_encontradas);
+                consola_imprimir(" ] BDF: ");
+                terminal_imprimir_hex_fijo(dev->bus, 2);
+                consola_imprimir(":");
+                terminal_imprimir_hex_fijo(dev->ranura, 2);
+                consola_imprimir(".");
+                terminal_imprimir_hex_fijo(dev->funcion, 1);
+
+                consola_imprimir(" | ID: ");
+                terminal_imprimir_hex_fijo(dev->id_proveedor, 4);
+                consola_imprimir(":");
+                terminal_imprimir_hex_fijo(dev->id_dispositivo, 4);
+                consola_imprimir(" | ");
+                consola_imprimir_linea_color(pci_nombre_proveedor(dev->id_proveedor), COLOR_EXITO_DEFAULT);
+
+                consola_imprimir("    Clase: ");
+                consola_imprimir_linea(pci_nombre_clase(dev->clase, dev->subclase));
+
+                consola_imprimir("    Línea IRQ: ");
+                consola_imprimir_dec(dev->linea_irq);
+                consola_imprimir(" | Pin: ");
+                consola_imprimir_dec(dev->pin_irq);
+                consola_imprimir_linea("");
+
+                // Detalle de los BARs de la GPU
+                for (int b = 0; b < 6; b++) {
+                    const struct barra_pci *barra = &dev->barras[b];
+                    if (!barra->valida) continue;
+
+                    consola_imprimir("    -> BAR");
+                    consola_imprimir_dec(b);
+                    consola_imprimir(": Base Física: 0x");
+                    terminal_imprimir_hex_fijo(barra->dir_base, barra->es_64bits ? 16 : 8);
+                    consola_imprimir(" | Tamaño: ");
+                    imprimir_tamano_barra(barra->tamano);
+
+                    if (barra->es_io) {
+                        consola_imprimir_linea_color(" [PUERTO I/O]", COLOR_TEXTO_DEFAULT);
+                    } else if (barra->predecible) {
+                        consola_imprimir_linea_color(" [VRAM APERTURE - WRITE-COMBINING]", COLOR_EXITO_DEFAULT);
+                    } else {
+                        consola_imprimir_linea_color(" [REGISTROS MMIO]", COLOR_AVISO_DEFAULT);
+                    }
+                }
+
+                // Diagnóstico según arquitectura de la GPU
+                if (dev->id_proveedor == 0x10DE) {
+                    consola_imprimir_linea_color("    [ NVIDIA GPU ] Silicio listo para mapeo MMIO y carga de firmware GSP.", COLOR_USUARIO_DEFAULT);
+                } else if (dev->id_proveedor == 0x8086) {
+                    consola_imprimir_linea_color("    [ INTEL GPU ] Acelerador gráfico integrado listo.", COLOR_USUARIO_DEFAULT);
+                } else if (dev->id_proveedor == 0x1AF4) {
+                    consola_imprimir_linea_color("    [ VIRTIO-GPU ] Acelerador paravirtualizado activo para QEMU.", COLOR_USUARIO_DEFAULT);
+                } else if (dev->id_proveedor == 0x1234) {
+                    consola_imprimir_linea_color("    [ BOCHS/QEMU VGA ] Framebuffer lineal GOP activo.", COLOR_TEXTO_DEFAULT);
+                }
+                consola_imprimir_linea("");
+            }
+        }
+
+        if (gpus_encontradas == 0) {
+            consola_imprimir_linea_color("  [ AVISO ] No se detectaron controladoras de pantalla en el bus PCI.", COLOR_AVISO_DEFAULT);
+        }
+        consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+        return;
+    }
+
+    // MODO DETALLADO: lspci -v / pci detalle / pci -v
+    int detalle = (arg && (str_igual(arg, "-v") || str_igual(arg, "detalle") || str_igual(arg, "verbose")));
+
+    consola_imprimir_linea_color("======================= BUS PCI / PCI EXPRESS =======================", COLOR_AVISO_DEFAULT);
+    if (!detalle) {
+        consola_imprimir_linea_color("BDF       ID DISP    FABRICANTE               CLASE / TIPO", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea("------------------------------------------------------------------");
+    }
+
+    for (int i = 0; i < conteo; i++) {
+        const struct dispositivo_pci *dev = pci_obtener_dispositivo(i);
+        if (!dev) continue;
+
+        uint32_t color_linea = COLOR_TEXTO_DEFAULT;
+        if (dev->clase == 0x03) {
+            color_linea = COLOR_EXITO_DEFAULT; // Destacar GPUs
+        } else if (dev->clase == 0x04) {
+            color_linea = COLOR_USUARIO_DEFAULT; // Destacar Audio
+        }
+
+        if (!detalle) {
+            // Formato compacto tipo tabla
+            terminal_imprimir_hex_fijo(dev->bus, 2);
+            consola_imprimir(":");
+            terminal_imprimir_hex_fijo(dev->ranura, 2);
+            consola_imprimir(".");
+            terminal_imprimir_hex_fijo(dev->funcion, 1);
+            consola_imprimir("   ");
+
+            terminal_imprimir_hex_fijo(dev->id_proveedor, 4);
+            consola_imprimir(":");
+            terminal_imprimir_hex_fijo(dev->id_dispositivo, 4);
+            consola_imprimir("  ");
+
+            consola_imprimir_color(pci_nombre_proveedor(dev->id_proveedor), color_linea);
+            consola_imprimir(" - ");
+            consola_imprimir_linea_color(pci_nombre_clase(dev->clase, dev->subclase), color_linea);
+        } else {
+            // Formato extendido detallado
+            consola_imprimir("[ ");
+            terminal_imprimir_hex_fijo(dev->bus, 2);
+            consola_imprimir(":");
+            terminal_imprimir_hex_fijo(dev->ranura, 2);
+            consola_imprimir(".");
+            terminal_imprimir_hex_fijo(dev->funcion, 1);
+            consola_imprimir(" ] ");
+
+            terminal_imprimir_hex_fijo(dev->id_proveedor, 4);
+            consola_imprimir(":");
+            terminal_imprimir_hex_fijo(dev->id_dispositivo, 4);
+            consola_imprimir(" | ");
+            consola_imprimir_color(pci_nombre_proveedor(dev->id_proveedor), color_linea);
+            consola_imprimir(" - ");
+            consola_imprimir_linea_color(pci_nombre_clase(dev->clase, dev->subclase), color_linea);
+
+            consola_imprimir("  Rev: ");
+            terminal_imprimir_hex_fijo(dev->revision, 2);
+            consola_imprimir(" | Cabecera: ");
+            terminal_imprimir_hex_fijo(dev->tipo_cabecera, 2);
+            consola_imprimir(" | IRQ: ");
+            consola_imprimir_dec(dev->linea_irq);
+            consola_imprimir_linea("");
+
+            for (int b = 0; b < 6; b++) {
+                const struct barra_pci *barra = &dev->barras[b];
+                if (!barra->valida) continue;
+
+                consola_imprimir("  -> BAR");
+                consola_imprimir_dec(b);
+                consola_imprimir(": 0x");
+                terminal_imprimir_hex_fijo(barra->dir_base, barra->es_64bits ? 16 : 8);
+                consola_imprimir(" | Tamaño: ");
+                imprimir_tamano_barra(barra->tamano);
+
+                if (barra->es_io) {
+                    consola_imprimir_linea(" [I/O]");
+                } else if (barra->predecible) {
+                    consola_imprimir_linea_color(" [MMIO 64b Prefetchable / VRAM]", COLOR_EXITO_DEFAULT);
+                } else {
+                    consola_imprimir_linea(" [MMIO]");
+                }
+            }
+            consola_imprimir_linea("");
+        }
+    }
+
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("Total dispositivos PCI/PCIe detectados: ");
+    consola_imprimir_dec(conteo);
+    consola_imprimir_linea("");
+    if (!detalle) {
+        consola_imprimir_linea_color("Tip: Usa 'lspci -v' para ver BARs físicos, o 'pci gpu' para ver la GPU.", COLOR_TEXTO_DEFAULT);
+    }
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -442,6 +643,10 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Reporte de RAM, PMM, Heap kmalloc y canarios ('memoria probar').");
         consola_imprimir_color("  paginacion     ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Memoria virtual, árbol PML4, CR3 e invlpg ('paginacion probar').");
+        consola_imprimir_color("  lspci / pci    ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Enumera dispositivos PCI/PCIe ('pci detalle', 'pci gpu').");
+        consola_imprimir_color("  gpu            ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Diagnóstico especializado de la GPU, VRAM y registros MMIO.");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -709,6 +914,21 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "vmm ")) arg = str_saltar_espacios(linea + 4);
         else if (str_comienza_con(linea, "paging ")) arg = str_saltar_espacios(linea + 7);
         ejecutar_comando_paginacion(arg);
+        return;
+    }
+
+    // COMANDO: lspci / pci
+    if (str_comienza_con(linea, "lspci") || str_comienza_con(linea, "pci")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "lspci ")) arg = str_saltar_espacios(linea + 6);
+        else if (str_comienza_con(linea, "pci ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_lspci(arg);
+        return;
+    }
+
+    // COMANDO: gpu (acceso directo a diagnóstico de video)
+    if (str_igual(linea, "gpu") || str_igual(linea, "video") || str_igual(linea, "vram")) {
+        ejecutar_comando_lspci("gpu");
         return;
     }
 

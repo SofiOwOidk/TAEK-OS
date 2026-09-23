@@ -275,12 +275,45 @@
 
 ---
 
+### [2026-09-22 19:05 - 19:12] — Hito 13: Subsistema de Enumeración PCI/PCIe, Cálculo Dinámico de BARs, Detección de GPU y Comandos `lspci` / `pci gpu`
+* **Objetivo:** Cumplir el Paso 1 de la ruta hacia el driver de NVIDIA y aceleración gráfica: construir un escáner de hardware PCI / PCI Express de bajo nivel que explore todos los buses (0..255), ranuras y funciones, calcule por sondeo los tamaños y tipos de los Base Address Registers (BARs), identifique la GPU primaria (tanto en QEMU como en metal real) y proporcione herramientas de diagnóstico interactivas en la terminal.
+* **Diseño Arquitectónico:**
+  1. **Exploración de la Topología PCIe:**
+     - Sondeo de los 256 buses, 32 ranuras y hasta 8 funciones (respetando el bit de multi-función en el registro `Header Type` `0x0E`).
+     - Almacenamiento en tabla de dispositivos de tamaño dinámico con metadatos completos: Vendor ID, Device ID, Clase, Subclase, Prog IF, Revisión, Header Type, Subsystem IDs, Línea y Pin de Interrupción.
+  2. **Algoritmo de Sondeo Físico de BARs (0 a 5):**
+     - Lectura del valor original configurado por el firmware UEFI.
+     - Escritura temporal de `0xFFFFFFFF` a los puertos `0xCF8/0xCFC` para revelar los bits alambrados en el silicio.
+     - Restauración inmediata del valor original para no romper el direccionamiento del hardware.
+     - Cálculo matemático del tamaño: `~(mask & ~0xF) + 1` (para memoria) o `~(mask & ~0x3) + 1` (para I/O).
+     - Detección de BARs de 64 bits (tipo `0x02` en bits 2:1): Consumo conjunto del par (BAR $N$ y BAR $N+1$) y ensamblado de direcciones físicas de 64 bits (`dir_base` y `tamano` de 64 bits).
+     - Clasificación semántica de memoria: MMIO sin caché vs. VRAM Aperture Prefetchable (ideal para Write-Combining con nuestro VMM).
+  3. **Diccionario de Fabricantes y Clases:**
+     - Identificación inmediata de NVIDIA (`0x10DE`), Intel (`0x8086`), AMD/ATI (`0x1002`), Red Hat VirtIO (`0x1AF4`), Bochs/QEMU (`0x1234`), Realtek (`0x10EC`), etc.
+     - Identificación de clases de pantalla (`0x0300` VGA, `0x0302` 3D/Acelerador dedicado, etc.).
+  4. **Comandos de Terminal:**
+     - `lspci` / `pci`: Vista tabular compacta con resaltado en verde para GPUs y en cyan para audio.
+     - `lspci -v` / `pci detalle`: Desglose exhaustivo de cada dispositivo con sus BARs físicos, tamaño en KiB/MiB/GiB, modo 64b/32b y flags.
+     - `pci gpu` / `gpu`: Diagnóstico especializado de la controladora gráfica, mostrando la apertura de VRAM y registros MMIO listos para el futuro mapeo con `paginacion_mapear()`.
+* **Archivos Modificados:**
+  * `nucleo/arquitectura/x86_64/pci.h / .c`: Estructuras `struct barra_pci`, `struct dispositivo_pci`, sondeo de BARs, diccionarios y funciones de consulta.
+  * `nucleo/principal.c`: Nueva etapa de arranque supervisada por El Huevo: *"Enumeración del Bus PCI / PCIe y Dispositivos de Video"*.
+  * `nucleo/controladores/terminal.c`: Comandos `lspci`, `pci`, `pci gpu`, `gpu` y actualización del menú `ayuda`.
+* **Pruebas y Verificación:**
+  * En QEMU UEFI:
+    - Etapa validada con éxito por El Huevo: 7 dispositivos PCI detectados (`[Dispositivos PCI: 7] [GPU: Bochs / QEMU Standard VGA]`).
+    - `lspci`: Listó el Puente Host Q35 (`8086:29c0`), VGA (`1234:1111`), Ethernet (`8086:10d3`), Audio AC97 (`8086:2415`), Puente ISA (`8086:2918`), SATA AHCI (`8086:2922`) y SMBus (`8086:2930`).
+    - `pci gpu`: Detectó la GPU en BDF `00:01.0`, reportó BAR0 de VRAM de 16 MiB en `0x80000000` con `[VRAM APERTURE - WRITE-COMBINING]` y BAR2 MMIO de 4 KiB en `0x81085000`.
+    - `lspci -v`: Desglosó todos los BARs con precisión matemática.
+    - Apagado limpio por ACPI.
+
+---
+
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |
 | :--- | :--- | :--- |
 | **Audio de duelo sonaba en bucle corto de 11s en vez de la canción completa** | 1) `Makefile` tenía `-t 11` forzando el corte en ffmpeg. 2) La lista de descriptores BDL de AC97 sólo tiene 32 entradas fijas (~11.8s de audio), y el driver original no tenía refresco circular dinámico, reiniciando desde el byte 0. | Se quitó el flag `-t 11` convirtiendo los 2m 42s completos (28 MB), y se rediseñó el controlador AC97 con un motor de streaming circular continuo (`audio_ac97_actualizar`) que rellena dinámicamente los descriptores reproducidos y solo reinicia el cursor tras agotar los 2m 42s. |
-| :--- | :--- | :--- |
 | **`instruction expected, found ' ['` en NASM** | `Set-Content -Encoding utf8` en PowerShell escribe una marca de orden de bytes (BOM `\xef\xbb\xbf`) al inicio del archivo. | Se creó una rutina con `sed -i '1s/^\xef\xbb\xbf//'` para eliminar el BOM de todos los archivos fuente. |
 | **`qemu: could not load PC BIOS`** | En QEMU moderno para x86_64, el firmware UEFI OVMF es una imagen pflash, no una BIOS legacy. | Se cambió el parámetro a `-drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd`. |
 | **`rm: cannot remove taek-os.img: Permission denied`** | QEMU seguía en ejecución en segundo plano o el usuario tenía la ventana abierta, bloqueando el archivo en Windows. | Se modificó la regla del Makefile: ahora solo se crea la imagen si no existe, y las actualizaciones de `nucleo.elf` se hacen in-situ con `mcopy -o`, eliminando el bloqueo. |
