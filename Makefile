@@ -59,8 +59,9 @@ OBJS      = $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS)) \
 
 IMG       = $(BUILD_DIR)/taek-os.img
 KERNEL    = $(BUILD_DIR)/nucleo.elf
+ISO       = $(BUILD_DIR)/taek-os.iso
 
-all: $(IMG)
+all: $(IMG) $(ISO)
 
 $(BUILD_DIR)/imagen_arranque.bin: $(RECURSOS)/fivenights.png
 	@mkdir -p $(BUILD_DIR)
@@ -134,6 +135,24 @@ $(IMG): $(KERNEL) boot/limine.conf
 	@mcopy -o -i $(IMG) boot/limine.conf ::/limine.conf
 	@mcopy -o -i $(IMG) $(KERNEL) ::/boot/nucleo.elf
 	@echo "==> Imagen $(IMG) lista y sincronizada!"
+
+$(ISO): $(KERNEL) boot/limine.conf
+	@echo "==> Generando Imagen ISO Booteable UEFI/BIOS Híbrida..."
+	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine $(BUILD_DIR)/iso_root/EFI/BOOT
+	@cp boot/limine/limine-bios-cd.bin boot/limine/limine-bios.sys boot/limine/limine-uefi-cd.bin $(BUILD_DIR)/iso_root/boot/limine/
+	@cp boot/limine/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/
+	@cp boot/limine.conf $(BUILD_DIR)/iso_root/boot/limine/
+	@cp boot/limine.conf $(BUILD_DIR)/iso_root/
+	@cp $(KERNEL) $(BUILD_DIR)/iso_root/boot/nucleo.elf
+	@xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
+	        -no-emul-boot -boot-load-size 4 -boot-info-table \
+	        --efi-boot boot/limine/limine-uefi-cd.bin \
+	        -efi-boot-part --efi-boot-image --protective-msdos-label \
+	        $(BUILD_DIR)/iso_root -o $@ > /dev/null 2>&1
+	@if [ -f boot/limine/limine ]; then \
+		boot/limine/limine bios-install $@ > /dev/null 2>&1; \
+	fi
+	@echo "==> Imagen ISO $(ISO) lista para grabar en USB con Rufus / Ventoy / Etcher!"
 
 clean:
 	rm -rf $(BUILD_DIR)

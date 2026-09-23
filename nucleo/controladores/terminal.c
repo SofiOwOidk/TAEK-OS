@@ -815,6 +815,64 @@ static void ejecutar_comando_linux(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'linux probar' para verificar el puente y llamadas DMA.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_comando_guia(const char *arg) {
+    (void)arg;
+    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("   GUÍA OFICIAL DE TESTEO DE GPU NVIDIA BLACKWELL EN HARDWARE REAL (MoDT)       ", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("   Objetivo: Intel Core i9-14900HX + NVIDIA GeForce RTX 5070 Ti (PCIe Gen 5)    ", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea("");
+
+    consola_imprimir_linea_color("[ PASO 1: VERIFICAR DETECCIÓN FÍSICA EN EL BUS PCIE ]", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  Comando a ejecutar: lspci  o  pci gpu", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("  * En tu placa MoDT física con la RTX 5070 Ti debes ver:");
+    consola_imprimir_linea("    - Vendor ID: 0x10DE (NVIDIA Corporation)");
+    consola_imprimir_linea("    - Device ID: 0x2F04 (GeForce RTX 5070 Ti Desktop)");
+    consola_imprimir_linea("    - Clase    : 0x0300 (VGA Compatible Controller)");
+    consola_imprimir_linea("  * Si en 'Modo de Operación' indica 'Hardware Real MoDT', tu tarjeta está");
+    consola_imprimir_linea("    correctamente alimentada y enlazada a las 16 líneas PCIe del procesador.");
+    consola_imprimir_linea("");
+
+    consola_imprimir_linea_color("[ PASO 2: INSPECCIONAR REGISTROS BAR0 MMIO Y BAR1 VRAM ]", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  Comando a ejecutar: gpu  o  gpu probar", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("  * BAR0 Físico: Espacio de control MMIO asignado por la BIOS UEFI (16 MiB).");
+    consola_imprimir_linea("  * BAR1 Físico: Apertura de memoria VRAM (16 GiB en direccionamiento de 64 bits).");
+    consola_imprimir_linea("  * Registro PMC_BOOT_0: Comprueba la lectura directa de silicio (0x190xxxxx para Blackwell).");
+    consola_imprimir_linea("");
+
+    consola_imprimir_linea_color("[ PASO 3: INSPECCIONAR EL SUBSISTEMA GSP ANTES DEL ARRANQUE ]", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  Comando a ejecutar: nvidia gsp", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("  * Comprobarás que el microcódigo GSP aún no está cargado.");
+    consola_imprimir_linea("  * Las colas CMD_Q y STAT_Q de 64 KiB en RAM física estarán inactivas.");
+    consola_imprimir_linea("");
+
+    consola_imprimir_linea_color("[ PASO 4: DISPARAR LA SECUENCIA DE ARRANQUE GPU DE 6 PASOS ]", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  Comando a ejecutar: nvidia inicializar", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("  * Observarás en vivo la telemetría del silicio paso a paso:");
+    consola_imprimir_linea("    1. Detección y validación en PCIe -> [OK]");
+    consola_imprimir_linea("    2. Asignación WPR de 16 MiB en DMA contiguo (Base física alineada a 64 KiB) -> [OK]");
+    consola_imprimir_linea("    3. Inicialización de colas circulares CMD/STAT y enlace Falcon Mailbox -> [OK]");
+    consola_imprimir_linea("    4. Handshake RPC inicial con coprocesador GSP (ABI v1.0) -> [OK]");
+    consola_imprimir_linea("    5. Consulta de topología y extracción de capacidades de silicio -> [OK]");
+    consola_imprimir_linea("    6. Transición formal al ESTADO OPERATIVO.");
+    consola_imprimir_linea("");
+
+    consola_imprimir_linea_color("[ PASO 5: VERIFICAR TELEMETRÍA Y CAPACIDADES ACTIVAS ]", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  Comando a ejecutar: nvidia", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("  * Verifica que el Estado Operativo marque: 'OPERATIVO (SILICIO BLACKWELL ACTIVO)' en verde.");
+    consola_imprimir_linea("  * VRAM Dedicada: 16 GiB GDDR7 (Bus 256 bits a 28 Gbps).");
+    consola_imprimir_linea("  * Cómputo: 70 SMs | 8,960 CUDA Cores | Tensor Cores Gen 4 | RT Cores Gen 5.");
+    consola_imprimir_linea("  * Frecuencias: 2,160 MHz Base / 2,520 MHz Boost.");
+    consola_imprimir_linea("");
+
+    consola_imprimir_linea_color("[ PASO 6: EJECUTAR EL AUTODIAGNÓSTICO INTEGRAL EXTREMO A EXTREMO ]", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  Comando a ejecutar: nvidia probar", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("  * Audita los 5 puntos críticos de la arquitectura (Spinlocks, WPR DMA, RPC, Silicio y Caps).");
+    consola_imprimir_linea("  * Debe concluir con: '==> [ AUTODIAGNÓSTICO EXITOSO ] Coprocesador GSP y GPU Blackwell 100% Operativos.'");
+    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Si tienes un pendrive USB, grábale 'build/taek-os.iso' con Rufus o Ventoy y pruébalo.", COLOR_TEXTO_DEFAULT);
+}
+
 static void ejecutar_comando_nvidia(const char *arg) {
     const struct nvidia_dispositivo *ndev = nvidia_core_obtener_dispositivo();
 
@@ -1408,6 +1466,8 @@ static void procesar_comando(const char *linea_cruda) {
     // COMANDO: ayuda / comandos / help
     if (str_igual(linea, "ayuda") || str_igual(linea, "comandos") || str_igual(linea, "help")) {
         consola_imprimir_linea_color("--- COMANDOS DISPONIBLES EN TAEK OS ---", COLOR_AVISO_DEFAULT);
+        consola_imprimir_color("  guia gpu       ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": [RECOMENDADO] Guía paso a paso para testear la GPU en hardware real MoDT.", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  ayuda          ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Muestra este menú de asistencia.");
         consola_imprimir_color("  huevo          ", COLOR_PROMPT_DEFAULT);
@@ -1677,6 +1737,16 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(" (UEFI GOP 32bpp)");
         consola_imprimir("  Subsistema Audio  : ");
         consola_imprimir_linea("PCI Intel AC97 DMA Directo @ 44.1 kHz");
+        return;
+    }
+
+    // COMANDO: guia / tutorial / ayuda gpu
+    if (str_comienza_con(linea, "guia") || str_comienza_con(linea, "tutorial") ||
+        str_igual(linea, "ayuda gpu") || str_igual(linea, "help gpu")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "guia ")) arg = str_saltar_espacios(linea + 5);
+        else if (str_comienza_con(linea, "tutorial ")) arg = str_saltar_espacios(linea + 9);
+        ejecutar_comando_guia(arg);
         return;
     }
 
