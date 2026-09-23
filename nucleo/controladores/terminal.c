@@ -757,39 +757,70 @@ static void ejecutar_comando_linux(const char *arg) {
         consola_imprimir_linea_color("========== AUTODIAGNÓSTICO DE CAPA SHIM LINUX KERNEL ==========", COLOR_AVISO_DEFAULT);
         consola_imprimir_linea("Verificando llamadas al sistema, sincronización y memoria del puente...");
 
-        consola_imprimir("  1. Primitivas de Concurrencia (Spinlocks y Atomics)... ");
+        consola_imprimir("  1. Primitivas de Concurrencia (Spinlocks, Atomics, Mutex, Semáforos)... ");
         int res = linux_shim_ejecutar_autodiagnostico();
         if (res == 0) {
-            consola_imprimir_linea_color("[OK - SPINLOCK & ATOMIC 100%]", COLOR_EXITO_DEFAULT);
-        } else if (res == 1) {
-            consola_imprimir_linea_color("[FALLÓ EN ATOMICS]", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("[OK - SPINLOCK, ATOMICS, MUTEX, SEMÁFOROS 100%]", COLOR_EXITO_DEFAULT);
+        } else if (res >= 1 && res <= 4) {
+            consola_imprimir_linea_color("[FALLÓ EN MUTEX/ATOMICS]", COLOR_ERROR_DEFAULT);
+            return;
+        } else if (res == 5 || res == 6) {
+            consola_imprimir_linea_color("[FALLÓ EN SEMÁFOROS]", COLOR_ERROR_DEFAULT);
             return;
         }
 
-        consola_imprimir("  2. Memoria DMA Coherente Continua (dma_alloc_coherent)... ");
-        if (res == 2 || res == 3) {
+        consola_imprimir("  2. Colas de Espera y Notificación (wait_queue_head_t / wake_up)... ");
+        if (res == 7) {
+            consola_imprimir_linea_color("[FALLÓ EN WAITQUEUES]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - WAITQUEUES OK]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  3. Colas de Trabajo Asíncronas (struct work_struct / schedule_work)... ");
+        if (res == 8) {
+            consola_imprimir_linea_color("[FALLÓ EN WORKQUEUES]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - TAREAS ASÍNCRONAS EJECUTADAS]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  4. Temporización y Ticks del Kernel (jiffies, timer_list, ktime)... ");
+        if (res == 9 || res == 10) {
+            consola_imprimir_linea_color("[FALLÓ EN TIMERS/JIFFIES]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - JIFFIES Y TIMERS OK]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  5. Memoria DMA Coherente Continua (dma_alloc_coherent 64 KiB)... ");
+        if (res == 11 || res == 12) {
             consola_imprimir_linea_color("[FALLÓ EN DMA COHERENTE]", COLOR_ERROR_DEFAULT);
             return;
         }
         consola_imprimir_linea_color("[OK - DMA COHERENTE OK]", COLOR_EXITO_DEFAULT);
 
-        consola_imprimir("  3. Mapeo MMIO sin Caché y Desmapeo (ioremap / iounmap)... ");
-        if (res == 4) {
+        consola_imprimir("  6. Mapeo MMIO sin Caché y Desmapeo (ioremap / iounmap)... ");
+        if (res == 13) {
             consola_imprimir_linea_color("[FALLÓ EN IOREMAP]", COLOR_ERROR_DEFAULT);
             return;
         }
         consola_imprimir_linea_color("[OK - IOREMAP & IOUNMAP OK]", COLOR_EXITO_DEFAULT);
 
-        consola_imprimir("  4. Adaptador de Dispositivos PCI (struct pci_dev de Linux)... ");
+        consola_imprimir("  7. Infraestructura MSI / MSI-X e Interrupciones (request_irq)... ");
+        if (res == 14) {
+            consola_imprimir_linea_color("[FALLÓ EN MSI/IRQ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - PUENTE MSI/IRQ ENLAZADO]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  8. Adaptador de Dispositivos PCI (struct pci_dev de Linux)... ");
         consola_imprimir("[OK: ");
         consola_imprimir_dec((uint64_t)devs_pci);
         consola_imprimir_linea_color(" dispositivos enlazados]", COLOR_EXITO_DEFAULT);
 
-        consola_imprimir("  5. Formateador de Telemetría (printk y pr_info)... ");
+        consola_imprimir("  9. Formateador de Telemetría (printk y pr_info)... ");
         pr_info("Mensaje de prueba emitido desde la capa Linux Shim a Anillo 0.");
 
         consola_imprimir_linea("");
-        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Capa Linux Shim 100% lista para controladores externos.", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Linux Shim 100% operativo como host para open-gpu-kernel-modules.", COLOR_PROMPT_DEFAULT);
         return;
     }
 
@@ -910,6 +941,15 @@ static void ejecutar_comando_nvidia(const char *arg) {
     if (arg && (str_igual(arg, "inicializar") || str_igual(arg, "init") ||
                 str_igual(arg, "arrancar") || str_igual(arg, "boot"))) {
         consola_imprimir_linea_color("========== SECUENCIA DE ARRANQUE GPU NVIDIA BLACKWELL (HITO 20) ==========", COLOR_AVISO_DEFAULT);
+
+        if (!ndev->presente) {
+            consola_imprimir_linea_color("  [AVISO] Silicio NVIDIA no detectado en bus PCIe.", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("  Estás ejecutando en un entorno virtual sin GPU física NVIDIA (ej. QEMU).");
+            consola_imprimir_linea("  Para inicializar el silicio real, graba 'build/taek-os.iso' en un pendrive");
+            consola_imprimir_linea("  y bootea en tu equipo MoDT físico con Intel Core i9-14900HX + RTX 5070 Ti.");
+            return;
+        }
+
         consola_imprimir_linea("Ejecutando secuencia de inicialización del silicio y firmware GSP...");
 
         consola_imprimir("  Paso 1: Detección y verificación de silicio en bus PCIe... ");
@@ -1064,6 +1104,13 @@ static void ejecutar_comando_nvidia(const char *arg) {
         nv_os_spinlock_release(&core_lock);
         consola_imprimir_linea_color("[OK - SPINLOCKS DE SILICIO OK]", COLOR_EXITO_DEFAULT);
 
+        if (!ndev->presente) {
+            consola_imprimir_linea_color("  [AVISO] Silicio NVIDIA no detectado en bus PCI (Entorno QEMU).", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("  [OK] Primitivas de concurrencia y búfer DMA listos para hospedar hardware real.", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea("  Para auditar el silicio real: bootea build/taek-os.iso en la máquina MoDT.");
+            return;
+        }
+
         consola_imprimir("  2. Cargador de Firmware GSP y Región WPR en DMA (Hito 18)... ");
         int fw_diag = gsp_firmware_autodiagnostico((struct nvidia_dispositivo *)ndev);
         if (fw_diag == 0) {
@@ -1132,7 +1179,7 @@ static void ejecutar_comando_nvidia(const char *arg) {
     if (ndev->presente) {
         consola_imprimir_linea_color("Hardware Real MoDT (PCIe Directo x16 a CPU i9-14900HX)", COLOR_EXITO_DEFAULT);
     } else {
-        consola_imprimir_linea_color("Pipeline Verificado (Listo para detección de hardware en placa MoDT)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("Emulación QEMU (Silicio NVIDIA ausente en bus PCI)", COLOR_AVISO_DEFAULT);
     }
 
     consola_imprimir("  Memoria VRAM Dedicada     : ");
@@ -1141,10 +1188,12 @@ static void ejecutar_comando_nvidia(const char *arg) {
         consola_imprimir(" GiB GDDR7 (Bus ");
         consola_imprimir_dec((uint64_t)ndev->caps.vram_bus_width);
         consola_imprimir_linea_color(" bits / 28 Gbps)", COLOR_EXITO_DEFAULT);
-    } else {
-        consola_imprimir("16 GiB GDDR7 (BAR1 Fís: 0x");
+    } else if (ndev->presente) {
+        consola_imprimir("BAR1 Fís: 0x");
         terminal_imprimir_hex_fijo(ndev->bar1_phys, 16);
-        consola_imprimir_linea(")");
+        consola_imprimir_linea(" (16 GiB GDDR7)");
+    } else {
+        consola_imprimir_linea_color("No detectada (Requiere hardware físico)", COLOR_TEXTO_DEFAULT);
     }
 
     consola_imprimir("  Núcleos y Cómputo         : ");
@@ -1153,8 +1202,10 @@ static void ejecutar_comando_nvidia(const char *arg) {
         consola_imprimir(" SMs | ");
         consola_imprimir_dec((uint64_t)ndev->caps.cuda_cores);
         consola_imprimir_linea(" CUDA Cores | 4th Gen Tensor | 5th Gen RT");
+    } else if (ndev->presente) {
+        consola_imprimir_linea("Pendiente de extracción vía GSP GET_CAPS");
     } else {
-        consola_imprimir_linea("70 SMs | 8,960 CUDA Cores | RT Cores Gen 5");
+        consola_imprimir_linea_color("No disponibles (GPU ausente)", COLOR_TEXTO_DEFAULT);
     }
 
     consola_imprimir("  Frecuencias de Reloj      : ");
@@ -1163,8 +1214,10 @@ static void ejecutar_comando_nvidia(const char *arg) {
         consola_imprimir(" MHz Base / ");
         consola_imprimir_dec((uint64_t)ndev->caps.reloj_boost_mhz);
         consola_imprimir_linea(" MHz Boost");
+    } else if (ndev->presente) {
+        consola_imprimir_linea("Pendiente de extracción vía GSP");
     } else {
-        consola_imprimir_linea("2,160 MHz Base / 2,520 MHz Boost");
+        consola_imprimir_linea_color("No disponibles", COLOR_TEXTO_DEFAULT);
     }
 
     consola_imprimir("  Capa de Interfaz (Bridge) : ");

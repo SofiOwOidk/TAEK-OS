@@ -100,17 +100,16 @@ NV_STATUS nvidia_core_iniciar(void) {
     }
 
     if (!encontrada) {
-        // En emulación QEMU estándar (sin passthrough físico), inicializamos el dispositivo en modo verificación
         g_nv_dev.presente  = NV_FALSE;
-        g_nv_dev.vendor_id = 0x10DE;
-        g_nv_dev.device_id = 0x2F04; // RTX 5070 Ti Desktop ID
-        g_nv_dev.chip_id   = 0x190000A1; // Arquitectura Blackwell GB20x
-        g_nv_dev.bar0_phys = 0xF6000000ULL;
-        g_nv_dev.bar0_size = 16ULL * 1024ULL * 1024ULL;
-        g_nv_dev.bar1_phys = 0x38000000000ULL;
-        g_nv_dev.bar1_size = 16ULL * 1024ULL * 1024ULL * 1024ULL; // 16 GiB
-        str_copiar(g_nv_dev.chip_name, "NVIDIA GeForce RTX 5070 Ti (Blackwell GB20x)", sizeof(g_nv_dev.chip_name));
-        g_nv_dev.estado = NV_GPU_ESTADO_RESET;
+        g_nv_dev.vendor_id = 0;
+        g_nv_dev.device_id = 0;
+        g_nv_dev.chip_id   = 0;
+        g_nv_dev.bar0_phys = 0;
+        g_nv_dev.bar0_size = 0;
+        g_nv_dev.bar1_phys = 0;
+        g_nv_dev.bar1_size = 0;
+        str_copiar(g_nv_dev.chip_name, "No detectada (Silicio ausente en bus PCI)", sizeof(g_nv_dev.chip_name));
+        g_nv_dev.estado = NV_GPU_ESTADO_NO_INICIADO;
     }
 
     // Asignación de búfer DMA coherente para el canal GSP vía nv_os_interface
@@ -132,6 +131,14 @@ NV_STATUS nvidia_gpu_inicializar_completo(void) {
     if (!g_nv_iniciado) {
         NV_STATUS st = nvidia_core_iniciar();
         if (st != NV_OK) return st;
+    }
+
+    if (!g_nv_dev.presente) {
+        serial_imprimir_linea("=== INICIALIZACIÓN GPU CANCELADA ===");
+        serial_imprimir_linea("  [AVISO] Silicio NVIDIA ausente en bus PCIe.");
+        serial_imprimir_linea("          Para arrancar la GPU física, grabe build/taek-os.iso en un pendrive");
+        serial_imprimir_linea("          y bootee en su equipo MoDT con Intel Core i9-14900HX + RTX 5070 Ti.");
+        return NV_ERR_CARD_NOT_PRESENT;
     }
 
     if (g_nv_dev.estado == NV_GPU_ESTADO_OPERATIVO) {
@@ -225,6 +232,13 @@ NV_STATUS nvidia_core_autodiagnostico(void) {
     // 2. Verificar canal DMA para GSP RPC
     if (!g_nv_dev.gsp_buffer_listo || !g_nv_dev.gsp_shared_virt) {
         return NV_ERR_NO_MEMORY;
+    }
+
+    if (!g_nv_dev.presente) {
+        serial_imprimir_linea("--- AUTODIAGNÓSTICO NVIDIA CORE ---");
+        serial_imprimir_linea("  [AVISO] Silicio NVIDIA ausente en bus PCI (Entorno QEMU / Sin passthrough).");
+        serial_imprimir_linea("  [OK] Primitivas de concurrencia y búfer DMA listos para enlace de silicio.");
+        return NV_OK;
     }
 
     // 3. Autodiagnóstico del cargador de firmware GSP (Hito 18)

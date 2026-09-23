@@ -57,3 +57,11 @@ void esperar_milisegundos(uint32_t ms) {
         __asm__ volatile ("pause");
     }
 }
+
+uint64_t tiempo_obtener_milisegundos(void) {
+    if (g_ciclos_por_ms == 0) {
+        tiempo_iniciar();
+    }
+    return rdtsc_interno() / g_ciclos_por_ms;
+}
+

@@ -5,6 +5,7 @@
 
 void     tiempo_iniciar(void);
 void     esperar_milisegundos(uint32_t ms);
+uint64_t tiempo_obtener_milisegundos(void);
 uint64_t rdtsc(void);
 
 #endif // BASE_TIEMPO_H
