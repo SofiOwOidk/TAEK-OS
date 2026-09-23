@@ -30,7 +30,10 @@ struct marco_interrupcion {
     uint64_t ss;
 } __attribute__((packed));
 
+typedef void (*manejador_irq_fn)(struct marco_interrupcion *marco);
+
 void idt_iniciar(void);
-void manejador_excepciones(struct marco_interrupcion *marco);
+void idt_registrar_manejador(uint8_t vector, manejador_irq_fn manejador);
+void despachador_interrupciones(struct marco_interrupcion *marco);
 
 #endif // ARQUITECTURA_X86_64_IDT_H

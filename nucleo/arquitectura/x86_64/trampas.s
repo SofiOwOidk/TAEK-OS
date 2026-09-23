@@ -1,6 +1,6 @@
 [bits 64]
 
-extern manejador_excepciones
+extern despachador_interrupciones
 
 %macro TRAMPA_SIN_ERROR 1
 global trampa%1
@@ -17,6 +17,7 @@ trampa%1:
     jmp trampa_comun_stub
 %endmacro
 
+; Excepciones de CPU (0 a 31)
 TRAMPA_SIN_ERROR 0
 TRAMPA_SIN_ERROR 1
 TRAMPA_SIN_ERROR 2
@@ -50,6 +51,13 @@ TRAMPA_CON_ERROR 29
 TRAMPA_CON_ERROR 30
 TRAMPA_SIN_ERROR 31
 
+; Interrupciones de Hardware y APIC (32 a 255)
+%assign i 32
+%rep 224
+TRAMPA_SIN_ERROR i
+%assign i i+1
+%endrep
+
 trampa_comun_stub:
     push rax
     push rbx
@@ -67,9 +75,9 @@ trampa_comun_stub:
     push r14
     push r15
 
-    mov rdi, rsp        ; 1er parametro segun System V ABI: puntero a marco_interrupcion
-    cld                 ; Limpiar bandera de direccion
-    call manejador_excepciones
+    mov rdi, rsp        ; 1er parametro: puntero a struct marco_interrupcion
+    cld
+    call despachador_interrupciones
 
     pop r15
     pop r14
@@ -87,5 +95,14 @@ trampa_comun_stub:
     pop rbx
     pop rax
 
-    add rsp, 16         ; Limpiar numero de interrupcion y codigo de error
+    add rsp, 16         ; Limpiar vector y codigo de error
     iretq
+
+section .rodata
+global tabla_trampas
+tabla_trampas:
+%assign i 0
+%rep 256
+    dq trampa%+i
+%assign i i+1
+%endrep

@@ -2,38 +2,8 @@
 #include "../../base/huevo.h"
 #include "serial.h"
 
-extern void trampa0(void);
-extern void trampa1(void);
-extern void trampa2(void);
-extern void trampa3(void);
-extern void trampa4(void);
-extern void trampa5(void);
-extern void trampa6(void);
-extern void trampa7(void);
-extern void trampa8(void);
-extern void trampa9(void);
-extern void trampa10(void);
-extern void trampa11(void);
-extern void trampa12(void);
-extern void trampa13(void);
-extern void trampa14(void);
-extern void trampa15(void);
-extern void trampa16(void);
-extern void trampa17(void);
-extern void trampa18(void);
-extern void trampa19(void);
-extern void trampa20(void);
-extern void trampa21(void);
-extern void trampa22(void);
-extern void trampa23(void);
-extern void trampa24(void);
-extern void trampa25(void);
-extern void trampa26(void);
-extern void trampa27(void);
-extern void trampa28(void);
-extern void trampa29(void);
-extern void trampa30(void);
-extern void trampa31(void);
+extern void *tabla_trampas[256];
+extern void apic_despachar_irq(struct marco_interrupcion *marco);
 
 static const char *g_nombres_excepciones[32] = {
     "Division por Cero (#DE)",
@@ -67,12 +37,13 @@ static const char *g_nombres_excepciones[32] = {
 
 static struct entrada_idt g_idt[256];
 static struct puntero_idt g_puntero_idt;
+static manejador_irq_fn   g_manejadores_irq[256];
 
 static void idt_configurar_puerta(int num, uint64_t dir_manejador) {
     g_idt[num].manejador_bajo  = (uint16_t)(dir_manejador & 0xFFFF);
     g_idt[num].selector_cs     = 0x08;
     g_idt[num].ist             = 0;
-    g_idt[num].atributos       = 0x8E; // Puerta de Interrupcion 64-bit (Presente, Anillo 0)
+    g_idt[num].atributos       = 0x8E; // Presente, Anillo 0, Interrupt Gate 64-bit
     g_idt[num].manejador_medio = (uint16_t)((dir_manejador >> 16) & 0xFFFF);
     g_idt[num].manejador_alto  = (uint32_t)((dir_manejador >> 32) & 0xFFFFFFFF);
     g_idt[num].reservado       = 0;
@@ -82,26 +53,31 @@ void idt_iniciar(void) {
     g_puntero_idt.limite = sizeof(g_idt) - 1;
     g_puntero_idt.base   = (uint64_t)&g_idt;
 
-    void *trampas[32] = {
-        trampa0,  trampa1,  trampa2,  trampa3,  trampa4,  trampa5,  trampa6,  trampa7,
-        trampa8,  trampa9,  trampa10, trampa11, trampa12, trampa13, trampa14, trampa15,
-        trampa16, trampa17, trampa18, trampa19, trampa20, trampa21, trampa22, trampa23,
-        trampa24, trampa25, trampa26, trampa27, trampa28, trampa29, trampa30, trampa31
-    };
-
-    for (int i = 0; i < 32; i++) {
-        idt_configurar_puerta(i, (uint64_t)trampas[i]);
+    for (int i = 0; i < 256; i++) {
+        g_manejadores_irq[i] = 0;
+        idt_configurar_puerta(i, (uint64_t)tabla_trampas[i]);
     }
 
     __asm__ volatile ("lidt %0" : : "m"(g_puntero_idt));
 }
 
-void manejador_excepciones(struct marco_interrupcion *marco) {
-    const char *nombre = "Excepcion Desconocida";
+void idt_registrar_manejador(uint8_t vector, manejador_irq_fn manejador) {
+    g_manejadores_irq[vector] = manejador;
+}
+
+void despachador_interrupciones(struct marco_interrupcion *marco) {
     if (marco->num_interrupcion < 32) {
-        nombre = g_nombres_excepciones[marco->num_interrupcion];
+        // Excepción de CPU: invocar autopsia forense de El Huevo
+        const char *nombre = g_nombres_excepciones[marco->num_interrupcion];
+        huevo_quebrar(nombre, marco->rip, marco->rsp, marco->codigo_error);
+        return;
     }
 
-    // Transferir control a El Huevo de la Estabilidad para autopsia y apagado
-    huevo_quebrar(nombre, marco->rip, marco->rsp, marco->codigo_error);
+    // Interrupción de hardware o APIC (vector >= 32)
+    if (g_manejadores_irq[marco->num_interrupcion]) {
+        g_manejadores_irq[marco->num_interrupcion](marco);
+    }
+
+    // Notificar al subsistema APIC para estadísticas y EOI
+    apic_despachar_irq(marco);
 }

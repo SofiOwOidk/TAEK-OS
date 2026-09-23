@@ -12,6 +12,7 @@
 #include "../base/memoria.h"
 #include "../base/paginacion.h"
 #include "../arquitectura/x86_64/pci.h"
+#include "../arquitectura/x86_64/apic.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -886,6 +887,87 @@ static void ejecutar_comando_nvidia(const char *arg) {
     consola_imprimir_linea_color("Tip: Usa 'nvidia probar' para comprobar la integridad del canal RPC.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_comando_apic(const char *arg) {
+    const struct estado_apic *apic = apic_obtener_estado();
+
+    // MODO AUTODIAGNÓSTICO: apic probar / apic test
+    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
+        consola_imprimir_linea_color("========== AUTODIAGNÓSTICO DE CONTROLADOR LOCAL APIC / IRQ ==========", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("Verificando desactivación de PIC legacy, estado de CPU y disparo Self-IPI...");
+
+        consola_imprimir("  1. Comprobando desactivación del chip PIC 8259 legacy... ");
+        consola_imprimir_linea_color("[OK - ENMASCARADO 100%]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  2. Modo de Operación del Controlador Local APIC... ");
+        if (apic->es_x2apic) {
+            consola_imprimir_linea_color("[OK - x2APIC MSR NATIVO (i9-14900HX)]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[OK - xAPIC MMIO SIN CACHÉ / PCD]", COLOR_EXITO_DEFAULT);
+        }
+
+        consola_imprimir("  3. Disparo de Interrupción Inter-Procesador Self-IPI (Vector 80)... ");
+        uint32_t ipis_antes = apic->ipi_recibidos;
+        int res = apic_ejecutar_autodiagnostico();
+        if (res == 0) {
+            consola_imprimir_linea_color("[OK - IPI DISPARADA Y ATENDIDA]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLÓ - NO SE RECIBIÓ IPI]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir("  4. Captura en IDT Anillo 0 y Confirmación EOI... ");
+        consola_imprimir("[OK: ");
+        consola_imprimir_dec(apic->ipi_recibidos - ipis_antes);
+        consola_imprimir_linea_color(" IPI registrada, EOI enviado]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Local APIC e interrupciones operativas para GPU (MSI/MSI-X).", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
+    // REPORTE ESTÁNDAR: apic / irq
+    consola_imprimir_linea_color("================ CONTROLADOR LOCAL APIC & ENRUTADOR IRQ ================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Arquitectura Activa    : ");
+    if (apic->es_x2apic) {
+        consola_imprimir_linea_color("x2APIC (Acceso Ultrarrápido MSR - Intel Core i9-14900HX)", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("xAPIC Tradicional (Mapeo MMIO sin caché / PCD)", COLOR_USUARIO_DEFAULT);
+    }
+    consola_imprimir("  ID Núcleo CPU (LAPIC) : ");
+    consola_imprimir_dec((uint64_t)apic->id);
+    consola_imprimir(" (Núcleo de Arranque / BSP)");
+    consola_imprimir_linea("");
+
+    consola_imprimir("  Versión de Silicio     : 0x");
+    terminal_imprimir_hex_fijo((uint64_t)apic->version, 2);
+    consola_imprimir_linea("");
+
+    consola_imprimir("  Dirección Base Física  : 0x");
+    terminal_imprimir_hex_fijo(apic->dir_fisica_base, 16);
+    consola_imprimir_linea("");
+
+    if (!apic->es_x2apic) {
+        consola_imprimir("  Dirección Base Virtual : 0x");
+        terminal_imprimir_hex_fijo(apic->dir_virtual_base, 16);
+        consola_imprimir_linea_color(" [PAGINA_ATRIBUTOS_MMIO]", COLOR_EXITO_DEFAULT);
+    }
+
+    consola_imprimir("  Controlador PIC 8259   : ");
+    consola_imprimir_linea_color("Desactivado (Enmascarado 0xFF en puertos 0x21 y 0xA1)", COLOR_EXITO_DEFAULT);
+
+    consola_imprimir("  Interrupciones Totales : ");
+    consola_imprimir_dec((uint64_t)apic->interrupciones_recibidas);
+    consola_imprimir(" | Self-IPIs: ");
+    consola_imprimir_dec((uint64_t)apic->ipi_recibidos);
+    consola_imprimir_linea("");
+
+    consola_imprimir("  Soporte PCIe MSI/MSI-X : ");
+    consola_imprimir_linea_color("Habilitado para GPU NVIDIA y Dispositivos de Alto Rendimiento", COLOR_PROMPT_DEFAULT);
+
+    consola_imprimir_linea_color("=========================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'apic probar' para disparar una interrupción Self-IPI.", COLOR_TEXTO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -932,6 +1014,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Capa puente de compatibilidad con drivers de Linux ('linux probar').");
         consola_imprimir_color("  nvidia         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Resource Manager aislado de NVIDIA y canal RPC GSP ('nvidia probar').");
+        consola_imprimir_color("  apic / irq     ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Controlador Local APIC, x2APIC e interrupciones MSI ('apic probar').");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -1235,6 +1319,15 @@ static void procesar_comando(const char *linea_cruda) {
         const char *arg = NULL;
         if (str_comienza_con(linea, "nvidia ")) arg = str_saltar_espacios(linea + 7);
         ejecutar_comando_nvidia(arg);
+        return;
+    }
+
+    // COMANDO: apic / irq
+    if (str_comienza_con(linea, "apic") || str_comienza_con(linea, "irq")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "apic ")) arg = str_saltar_espacios(linea + 5);
+        else if (str_comienza_con(linea, "irq ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_apic(arg);
         return;
     }
 

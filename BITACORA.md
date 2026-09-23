@@ -398,10 +398,51 @@
 
 ---
 
+### [2026-09-22 19:43 - 19:48] — Hito 16: Controlador Local APIC, x2APIC (Intel Core i9-14900HX), Desactivación de PIC 8259 Legacy, IDT de 256 Vectores y Disparo Self-IPI (Comandos `apic` y `apic probar`)
+* **Objetivo:** Cumplir el siguiente eslabón crítico de la ruta hacia la GPU: desactivar el chip PIC 8259 legacy de 1981, habilitar el Local APIC de 64 bits con detección automática de x2APIC para el Intel Core i9-14900HX, expandir la IDT de 32 a 256 vectores completos en ensamblador con macros NASM y habilitar el canal de interrupciones necesario para que la GPU envíe eventos por Message Signaled Interrupts (MSI / MSI-X).
+* **Diseño Arquitectónico:**
+  1. **Enmascaramiento Total del PIC 8259:**
+     - Escritura de `0xFF` en los puertos I/O `0x21` y `0xA1` (`pic_desactivar()`). El controlador arcaico queda totalmente silenciado, eliminando colisiones con las excepciones de la CPU en modo largo.
+  2. **Detección Dinámica x2APIC vs. xAPIC:**
+     - Sondeo por CPUID (Hoja 1, bit 21 de ECX). Si está soportado (como en el procesador Intel Core i9-14900HX de la placa MoDT), se activan los bits 10 y 11 del MSR `IA32_APIC_BASE` (`0x1B`) y todos los accesos al APIC se realizan mediante MSRs de 64 bits ultrarrápidos (`0x800..0x83F`), sin sobrecarga de memoria MMIO.
+     - En entornos de emulación sin x2APIC, se activa xAPIC mapeando la dirección física `0xFEE00000` en el VMM de TAEK OS en `APIC_MMIO_VIRTUAL_BASE` (`0xFFFFFE0001000000ULL`) con atributos `PAGINA_ATRIBUTOS_MMIO` (PCD/PWT sin caché).
+  3. **Configuración de Registros del Local APIC:**
+     - SVR (`0x0F0`): Vector espurio fijado en `0xFF` con el bit 8 activo (Software Enable).
+     - TPR (`0x080`): Fijado en 0 para permitir todas las prioridades de interrupción.
+     - LINT0 (`0x350`): Enmascarado (`0x10000`).
+     - LINT1 (`0x360`): Configurado para NMI (`0x400`).
+     - Activación de interrupciones por hardware en el procesador con `sti`.
+  4. **Generación Elegante de 256 Trampas en Ensamblador (`trampas.s`):**
+     - En lugar de declarar 256 funciones manuales, se utilizaron macros de NASM (`%assign i 32`, `%rep 224`, `TRAMPA_SIN_ERROR i`) y se compiló la tabla de punteros `.rodata` `tabla_trampas[256]`.
+  5. **Despachador Unificado en Anillo 0 (`idt.c`):**
+     - `despachador_interrupciones()`: Si el vector es `< 32`, activa la autopsia forense de **El Huevo de la Estabilidad** (`huevo_quebrar()`). Si es `>= 32`, ejecuta el manejador registrado, contabiliza la telemetría y envía la confirmación de fin de interrupción (`apic_enviar_eoi()`).
+  6. **Comandos de Terminal:**
+     - `apic`: Información completa de arquitectura (x2APIC/xAPIC), dirección base, LAPIC ID, versión de silicio y estado de MSI.
+     - `apic probar`: Autodiagnóstico riguroso de 4 pasos con disparo real de una interrupción Self-IPI al vector 80 por hardware.
+* **Archivos Creados / Modificados:**
+  * `nucleo/arquitectura/x86_64/apic.h / .c` [NUEVOS]
+  * `nucleo/arquitectura/x86_64/trampas.s`: Expandido a 256 vectores con `tabla_trampas`.
+  * `nucleo/arquitectura/x86_64/idt.h / .c`: Integración de 256 puertas y `despachador_interrupciones()`.
+  * `nucleo/principal.c`: Nueva etapa supervisada por El Huevo: *"Controlador de Interrupciones Local APIC / x2APIC (H16)"*.
+  * `nucleo/controladores/terminal.c`: Inclusión de `apic.h`, comandos `apic` y `apic probar`, y menú `ayuda`.
+  * `Makefile`: Inclusión de `apic.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpios con Clang 22 / LLD.
+  * En QEMU UEFI:
+    - Etapa supervisada por El Huevo: `[Modo: xAPIC MMIO | ID: 0 | PIC Legacy: Desactivado] [ OK ]`.
+    - Comando `apic`: Reportó xAPIC en `0xfffffe0001000000`, ID de núcleo 0, PIC desactivado y soporte MSI habilitado.
+    - Comando `apic probar`: 4 pasos aprobados con disparo Self-IPI inmediato y EOI confirmado.
+    - Apagado limpio por ACPI.
+
+---
+
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |
 | :--- | :--- | :--- |
+| **`file not found: ../../../compatibilidad/nv_os_interface.h` en clang** | El Makefile ya pasa `-I./nucleo` en `CFLAGS`, por lo que las rutas relativas redundantes con múltiples `../` se salen de la raíz de inclusión. | Se simplificó la ruta a `"compatibilidad/nv_os_interface.h"`, aprovechando el path raíz configurado en el compilador. |
+| **`rm: cannot remove build/taek-os.img: Permission denied` al hacer `make clean`** | Un proceso de QEMU mantenía abierto el descriptor del archivo en Windows. | Se actualizó el flujo de trabajo para invocar `make` directo: `mcopy -o` copia el binario ELF dentro de la imagen FAT32 in-situ sin necesidad de borrar ni recrear el archivo de imagen. |
+| **Anticipación del "Muro del Hito 18" (Firmware Loader GSP)** | El microcódigo GSP de NVIDIA (`gsp_*.bin`) mide 30-60 MB y está protegido por firmas criptográficas verificadas por el Boot ROM de la GPU (Falcon/RISC-V). Si el binario se corrompe o se alteran los encabezados ELF, el silicio se bloquea por violación de seguridad. | Se planifica el diseño de un desempaquetador ELF de microcódigo con mapeo físico alineado a 4 KiB que conserve íntegras las secciones de firma y firmas de autenticación requeridas por el hardware. |
 | **Audio de duelo sonaba en bucle corto de 11s en vez de la canción completa** | 1) `Makefile` tenía `-t 11` forzando el corte en ffmpeg. 2) La lista de descriptores BDL de AC97 sólo tiene 32 entradas fijas (~11.8s de audio), y el driver original no tenía refresco circular dinámico, reiniciando desde el byte 0. | Se quitó el flag `-t 11` convirtiendo los 2m 42s completos (28 MB), y se rediseñó el controlador AC97 con un motor de streaming circular continuo (`audio_ac97_actualizar`) que rellena dinámicamente los descriptores reproducidos y solo reinicia el cursor tras agotar los 2m 42s. |
 | **`instruction expected, found ' ['` en NASM** | `Set-Content -Encoding utf8` en PowerShell escribe una marca de orden de bytes (BOM `\xef\xbb\xbf`) al inicio del archivo. | Se creó una rutina con `sed -i '1s/^\xef\xbb\xbf//'` para eliminar el BOM de todos los archivos fuente. |
 | **`qemu: could not load PC BIOS`** | En QEMU moderno para x86_64, el firmware UEFI OVMF es una imagen pflash, no una BIOS legacy. | Se cambió el parámetro a `-drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd`. |

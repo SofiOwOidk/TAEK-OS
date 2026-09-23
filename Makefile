@@ -23,6 +23,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/arquitectura/x86_64/serial.c \
             nucleo/arquitectura/x86_64/gdt.c \
             nucleo/arquitectura/x86_64/idt.c \
+            nucleo/arquitectura/x86_64/apic.c \
             nucleo/arquitectura/x86_64/pci.c \
             nucleo/arquitectura/x86_64/vmx.c \
             nucleo/base/huevo.c \

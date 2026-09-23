@@ -7,6 +7,7 @@
 #include "arquitectura/x86_64/serial.h"
 #include "arquitectura/x86_64/gdt.h"
 #include "arquitectura/x86_64/idt.h"
+#include "arquitectura/x86_64/apic.h"
 #include "arquitectura/x86_64/pci.h"
 #include "arquitectura/x86_64/vmx.h"
 #include "base/huevo.h"
@@ -70,7 +71,7 @@ void principal(void) {
     gdt_iniciar();
     huevo_etapa_ok();
 
-    huevo_etapa("Trampas de Excepción de CPU en IDT (32 Vectores)");
+    huevo_etapa("IDT de 256 Vectores (Excepciones e Interrupciones)");
     idt_iniciar();
     huevo_etapa_ok();
 
@@ -84,6 +85,16 @@ void principal(void) {
 
     huevo_etapa("Tablas de Paginación x86_64 (PML4 / VMM)");
     paginacion_iniciar();
+    huevo_etapa_ok();
+
+    huevo_etapa("Controlador de Interrupciones Local APIC / x2APIC (H16)");
+    apic_iniciar();
+    const struct estado_apic *eapic = apic_obtener_estado();
+    serial_imprimir("[Modo: ");
+    serial_imprimir(eapic->es_x2apic ? "x2APIC MSR (i9-14900HX Nativo)" : "xAPIC MMIO");
+    serial_imprimir(" | ID: ");
+    serial_imprimir_dec((uint64_t)eapic->id);
+    serial_imprimir(" | PIC Legacy: Desactivado] ");
     huevo_etapa_ok();
 
     huevo_etapa("Enumeración del Bus PCI / PCIe y Dispositivos de Video");
