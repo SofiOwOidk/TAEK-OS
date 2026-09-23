@@ -23,6 +23,12 @@ typedef struct {
     int      canarios_intactos;
 } memoria_estadisticas_t;
 
+// Primitivas de manipulación de memoria freestanding
+void *memset(void *dest, int c, size_t n);
+void *memcpy(void *dest, const void *src, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
+int   memcmp(const void *s1, const void *s2, size_t n);
+
 // --- API NATIVA EN ESPAÑOL (ANILLO 0) ---
 
 // Inicializa el PMM y el Kernel Heap a partir del mapa de Limine
@@ -43,6 +49,11 @@ void  liberar_memoria(void *ptr);
 int  memoria_verificar_integridad(void);
 void memoria_obtener_estadisticas(memoria_estadisticas_t *est);
 uint64_t memoria_obtener_hhdm_offset(void);
+
+// Primitivas de Asignación Físicamente Contigua (DMA Real / GPU / GSP)
+uint64_t memoria_obtener_dma_arena(uint64_t *tamano_out);
+uint64_t pmm_asignar_bloque_contiguo(uint32_t num_paginas, uint64_t alineacion);
+void     pmm_liberar_bloque_contiguo(uint64_t dir_fisica, uint32_t num_paginas);
 
 // --- SHIMS DE COMPATIBILIDAD CON LINUX (DRIVERS / SUBSISTEMAS) ---
 

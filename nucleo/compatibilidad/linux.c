@@ -1,5 +1,6 @@
 #include "linux.h"
 #include "../base/memoria.h"
+#include "../base/dma.h"
 #include "../base/paginacion.h"
 #include "../base/tiempo.h"
 #include "../base/huevo.h"
@@ -88,37 +89,39 @@ void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *dma_handle, unsigne
     (void)dev;
     if (size == 0 || !dma_handle) return NULL;
 
-    size_t num_paginas = (size + 4095) / 4096;
-    uint64_t phys_primera = pmm_asignar_pagina_fisica();
-    if (phys_primera == 0) return NULL;
+    uint64_t phys = 0;
+    void *virt = dma_asignar_bufer_contiguo(size, 4096, &phys);
 
-    for (size_t i = 1; i < num_paginas; i++) {
-        uint64_t phys_sig = pmm_asignar_pagina_fisica();
-        (void)phys_sig;
+    if (!virt) {
+        // Fallback al PMM si la arena DMA no está disponible o está colmada
+        size_t num_paginas = (size + 4095) / 4096;
+        phys = pmm_asignar_pagina_fisica();
+        if (phys == 0) return NULL;
+        for (size_t i = 1; i < num_paginas; i++) {
+            pmm_asignar_pagina_fisica();
+        }
+        uint64_t hhdm = memoria_obtener_hhdm_offset();
+        virt = (void *)(hhdm + phys);
     }
 
-    *dma_handle = phys_primera;
-    uint64_t hhdm = memoria_obtener_hhdm_offset();
-    void *virt = (void *)(hhdm + phys_primera);
+    *dma_handle = (dma_addr_t)phys;
 
     if (flag & __GFP_ZERO) {
-        uint8_t *b = (uint8_t *)virt;
-        for (size_t i = 0; i < size; i++) b[i] = 0;
+        memset(virt, 0, size);
     }
 
+    size_t num_paginas = (size + 4095) / 4096;
     g_mem_dma_asignada += num_paginas * 4096;
     return virt;
 }
 
 void dma_free_coherent(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle) {
     (void)dev;
-    (void)cpu_addr;
     if (size == 0) return;
 
+    dma_liberar_bufer_contiguo(cpu_addr, (uint64_t)dma_handle, size);
+
     size_t num_paginas = (size + 4095) / 4096;
-    for (size_t i = 0; i < num_paginas; i++) {
-        pmm_liberar_pagina_fisica(dma_handle + (i * 4096));
-    }
     if (g_mem_dma_asignada >= num_paginas * 4096) {
         g_mem_dma_asignada -= num_paginas * 4096;
     }

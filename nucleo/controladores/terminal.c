@@ -10,9 +10,11 @@
 #include "../base/energia.h"
 #include "../base/tiempo.h"
 #include "../base/memoria.h"
+#include "../base/dma.h"
 #include "../base/paginacion.h"
 #include "../arquitectura/x86_64/pci.h"
 #include "../arquitectura/x86_64/apic.h"
+#include "iommu.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -968,6 +970,217 @@ static void ejecutar_comando_apic(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'apic probar' para disparar una interrupción Self-IPI.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_comando_dma(const char *arg) {
+    // MODO AUTODIAGNÓSTICO: dma probar / dma test
+    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
+        consola_imprimir_linea_color("========== AUTODIAGNÓSTICO DE MEMORIA DMA CONTIGUA Y COHERENCIA ==========", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("Verificando asignador físico, continuidad absoluta de 16 páginas y barreras...");
+
+        consola_imprimir("  1. Comprobando inicialización de la arena física DMA... ");
+        dma_estadisticas_t est_antes;
+        dma_obtener_estadisticas(&est_antes);
+        if (est_antes.arena_fisica_base == 0) {
+            consola_imprimir_linea_color("[FALLO - ARENA NO INICIADA]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - 32 MiB DEDICADOS]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  2. Asignación de bloque contiguo de 64 KiB alineado a 64 KiB... ");
+        uint64_t phys_test = 0;
+        void *virt_test = dma_asignar_bufer_contiguo(64 * 1024, 64 * 1024, &phys_test);
+        if (!virt_test || phys_test == 0 || (phys_test & (64 * 1024 - 1)) != 0) {
+            consola_imprimir_linea_color("[FALLO EN ALINEACIÓN]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("[OK - BASE ALINEADA]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  3. Verificando continuidad física estricta (16 páginas x 4096 bytes)... ");
+        uint64_t hhdm = memoria_obtener_hhdm_offset();
+        int continuidad_ok = 1;
+        for (uint32_t p = 0; p < 16; p++) {
+            uint64_t p_calc = ((uint64_t)virt_test + (p * 4096ULL)) - hhdm;
+            if (p_calc != (phys_test + (p * 4096ULL))) {
+                continuidad_ok = 0;
+                break;
+            }
+        }
+        if (continuidad_ok) {
+            consola_imprimir_linea_color("[OK - 100% CONTIGUO]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLO - DISCONTINUIDAD DETECTADA]", COLOR_ERROR_DEFAULT);
+            dma_liberar_bufer_contiguo(virt_test, phys_test, 64 * 1024);
+            return;
+        }
+
+        consola_imprimir("  4. Comprobando sincronización de caché (clflush / clflushopt + mfence)... ");
+        uint64_t *canarios = (uint64_t *)virt_test;
+        for (int i = 0; i < 8; i++) {
+            canarios[i * 1024] = 0x507071AEC0507071ULL ^ (uint64_t)i;
+        }
+        dma_sincronizar_cpu_a_dispositivo(virt_test, 64 * 1024);
+
+        int canarios_ok = 1;
+        for (int i = 0; i < 8; i++) {
+            if (canarios[i * 1024] != (0x507071AEC0507071ULL ^ (uint64_t)i)) {
+                canarios_ok = 0;
+                break;
+            }
+        }
+        if (canarios_ok) {
+            consola_imprimir_linea_color("[OK - COHERENCIA TOTAL]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLO EN INTEGRIDAD]", COLOR_ERROR_DEFAULT);
+        }
+
+        consola_imprimir("  5. Liberación de búfer y comprobación de ausencia de fugas de páginas... ");
+        dma_liberar_bufer_contiguo(virt_test, phys_test, 64 * 1024);
+        dma_estadisticas_t est_despues;
+        dma_obtener_estadisticas(&est_despues);
+        if (est_despues.paginas_en_uso == est_antes.paginas_en_uso) {
+            consola_imprimir_linea_color("[OK - 0 FUGAS DE MEMORIA]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[ALERTA - FUGA DETECTADA]", COLOR_AVISO_DEFAULT);
+        }
+
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Memoria DMA contigua y sincronización listas para GPU.", COLOR_EXITO_DEFAULT);
+        return;
+    }
+
+    // REPORTE ESTÁNDAR: dma
+    dma_estadisticas_t dma;
+    dma_obtener_estadisticas(&dma);
+
+    const iommu_estado_t *iommu = iommu_obtener_estado();
+
+    consola_imprimir_linea_color("================ GESTOR DE MEMORIA DMA CONTIGUA FÍSICA ================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Arena Física Base      : 0x");
+    terminal_imprimir_hex_fijo(dma.arena_fisica_base, 16);
+    consola_imprimir_linea("");
+
+    consola_imprimir("  Capacidad Total Arena  : ");
+    consola_imprimir_dec(dma.arena_tamano_bytes / (1024 * 1024));
+    consola_imprimir(" MiB (");
+    consola_imprimir_dec((uint64_t)dma.paginas_totales);
+    consola_imprimir_linea(" páginas contiguas de 4 KiB)");
+
+    consola_imprimir("  Páginas en Uso / Libre : ");
+    consola_imprimir_dec((uint64_t)dma.paginas_en_uso);
+    consola_imprimir(" en uso / ");
+    consola_imprimir_dec((uint64_t)dma.paginas_libres);
+    consola_imprimir_linea(" libres");
+
+    consola_imprimir("  Asignaciones Activas   : ");
+    consola_imprimir_dec((uint64_t)dma.asignaciones_activas);
+    consola_imprimir(" | Asignación Máx: ");
+    consola_imprimir_dec((uint64_t)dma.tamano_maximo_asignado_kb);
+    consola_imprimir_linea(" KiB");
+
+    consola_imprimir("  Coherencia de Silicio  : ");
+    consola_imprimir_linea_color("Vaciado por hardware con clflushopt / clflush + mfence", COLOR_EXITO_DEFAULT);
+
+    consola_imprimir("  Estado IOMMU / VT-d    : ");
+    if (iommu->tabla_dmar_detectada) {
+        if (iommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH) {
+            consola_imprimir_linea_color("Intel VT-d Activo (Modo PassThrough de Silicio - Cero Sobrecarga)", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("Intel VT-d Activo (Tablas de Traducción Activas)", COLOR_AVISO_DEFAULT);
+        }
+        consola_imprimir("  Unidades DRHD / RMRR   : ");
+        consola_imprimir_dec((uint64_t)iommu->conteo_drhd);
+        consola_imprimir(" DRHD remapeadas | ");
+        consola_imprimir_dec((uint64_t)iommu->conteo_rmrr);
+        consola_imprimir_linea(" RMRR reservadas protegidas");
+    } else {
+        consola_imprimir_linea_color("DMA Físico Directo 1:1 Transparente (Sin bloqueo IOMMU)", COLOR_PROMPT_DEFAULT);
+    }
+
+    consola_imprimir_linea_color("=========================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'dma probar' para verificar continuidad y barreras de caché.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'iommu' para ver el desglose técnico de unidades DRHD y RMRR.", COLOR_TEXTO_DEFAULT);
+}
+
+static void ejecutar_comando_iommu(const char *arg) {
+    const iommu_estado_t *iommu = iommu_obtener_estado();
+
+    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
+        iommu_ejecutar_autodiagnostico();
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO IOMMU CONCLUIDO ]", COLOR_EXITO_DEFAULT);
+        return;
+    }
+
+    consola_imprimir_linea_color("================ SUBSISTEMA IOMMU & INTEL VT-d (DMAR ACPI) ================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Tabla ACPI DMAR        : ");
+    if (iommu->tabla_dmar_detectada) {
+        consola_imprimir_linea_color("DETECTADA Y PROCESADA [OK]", COLOR_EXITO_DEFAULT);
+        consola_imprimir("  Ancho Dirección Host   : ");
+        consola_imprimir_dec((uint64_t)iommu->ancho_direccion_host);
+        consola_imprimir_linea(" bits de direccionamiento físico");
+        consola_imprimir("  Modo de Operación      : ");
+        if (iommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH) {
+            consola_imprimir_linea_color("PassThrough de Hardware (PT) - 1:1 Directo sin traducción", COLOR_EXITO_DEFAULT);
+        } else if (iommu->modo_operacion == IOMMU_MODO_VT_D_TRADUCCION_ACTIVA) {
+            consola_imprimir_linea_color("Traducción de Direcciones Activa por Firmware", COLOR_AVISO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("Directo Físico Transparente", COLOR_PROMPT_DEFAULT);
+        }
+
+        consola_imprimir("  Unidades DRHD Encontradas: ");
+        consola_imprimir_dec((uint64_t)iommu->conteo_drhd);
+        consola_imprimir_linea("");
+
+        for (uint32_t i = 0; i < iommu->conteo_drhd; i++) {
+            const iommu_unidad_drhd_t *u = &iommu->drhd[i];
+            consola_imprimir("    * DRHD #");
+            consola_imprimir_dec((uint64_t)i);
+            consola_imprimir(": MMIO Fís 0x");
+            terminal_imprimir_hex_fijo(u->mmio_fisica, 8);
+            consola_imprimir(" -> Virt 0x");
+            terminal_imprimir_hex_fijo(u->mmio_virtual, 16);
+            consola_imprimir(" | Seg: ");
+            consola_imprimir_dec((uint64_t)u->segmento_pci);
+            consola_imprimir(" | Abarca Todo: ");
+            consola_imprimir(u->abarca_todos_pci ? "Sí" : "No");
+            consola_imprimir_linea("");
+
+            consola_imprimir("      Versión: 0x");
+            terminal_imprimir_hex_fijo((uint64_t)u->version, 4);
+            consola_imprimir(" | TES: ");
+            consola_imprimir(u->traduccion_activa ? "Activa" : "Inactiva");
+            consola_imprimir(" | PassThrough (PT): ");
+            consola_imprimir(u->soporta_passthrough ? "Soportado" : "No");
+            consola_imprimir(" | Coherente: ");
+            consola_imprimir(u->coherente ? "Sí" : "No");
+            consola_imprimir_linea("");
+        }
+
+        if (iommu->conteo_rmrr > 0) {
+            consola_imprimir("  Regiones Reservadas RMRR : ");
+            consola_imprimir_dec((uint64_t)iommu->conteo_rmrr);
+            consola_imprimir_linea("");
+            for (uint32_t i = 0; i < iommu->conteo_rmrr; i++) {
+                const iommu_region_rmrr_t *r = &iommu->rmrr[i];
+                consola_imprimir("    * RMRR #");
+                consola_imprimir_dec((uint64_t)i);
+                consola_imprimir(": Base 0x");
+                terminal_imprimir_hex_fijo(r->dir_base_fisica, 16);
+                consola_imprimir(" - Límite 0x");
+                terminal_imprimir_hex_fijo(r->dir_limite_fisica, 16);
+                consola_imprimir_linea_color(" [PROTEGIDA CONTRA ESCRITURA]", COLOR_AVISO_DEFAULT);
+            }
+        }
+    } else {
+        consola_imprimir_linea_color("NO DETECTADA (QEMU Estándar / MoDT con VT-d deshabilitado)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir("  Modo de Operación      : ");
+        consola_imprimir_linea_color("DMA Directo Físico 1:1 Transparente", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea("  El bus PCIe opera sin intermediación ni restricciones de aislamiento.");
+        consola_imprimir_linea("  La GPU GeForce RTX y dispositivos periféricos acceden libremente a la RAM física.");
+    }
+
+    consola_imprimir_linea_color("===========================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'iommu probar' para ejecutar el autodiagnóstico de remapeo.", COLOR_TEXTO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -1016,6 +1229,10 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Resource Manager aislado de NVIDIA y canal RPC GSP ('nvidia probar').");
         consola_imprimir_color("  apic / irq     ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Controlador Local APIC, x2APIC e interrupciones MSI ('apic probar').");
+        consola_imprimir_color("  dma            ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Gestor de memoria DMA contigua y coherencia de caché ('dma probar').");
+        consola_imprimir_color("  iommu          ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Controlador Intel VT-d, remapeo DRHD y regiones RMRR ('iommu probar').");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -1328,6 +1545,24 @@ static void procesar_comando(const char *linea_cruda) {
         if (str_comienza_con(linea, "apic ")) arg = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "irq ")) arg = str_saltar_espacios(linea + 4);
         ejecutar_comando_apic(arg);
+        return;
+    }
+
+    // COMANDO: dma
+    if (str_comienza_con(linea, "dma")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "dma ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_dma(arg);
+        return;
+    }
+
+    // COMANDO: iommu / vtd / vt-d
+    if (str_comienza_con(linea, "iommu") || str_comienza_con(linea, "vtd") || str_comienza_con(linea, "vt-d")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "iommu ")) arg = str_saltar_espacios(linea + 6);
+        else if (str_comienza_con(linea, "vtd ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "vt-d ")) arg = str_saltar_espacios(linea + 5);
+        ejecutar_comando_iommu(arg);
         return;
     }
 

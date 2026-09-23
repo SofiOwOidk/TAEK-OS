@@ -31,6 +31,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/base/utf8.c \
             nucleo/base/tiempo.c \
             nucleo/base/memoria.c \
+            nucleo/base/dma.c \
             nucleo/base/paginacion.c \
             nucleo/controladores/pantalla.c \
             nucleo/controladores/audio_ac97.c \
@@ -38,6 +39,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/teclado.c \
             nucleo/controladores/consola.c \
             nucleo/controladores/gpu.c \
+            nucleo/controladores/iommu.c \
             nucleo/compatibilidad/linux.c \
             nucleo/compatibilidad/nv_os_interface.c \
             nucleo/controladores/video/nvidia/core/nvidia_core.c \

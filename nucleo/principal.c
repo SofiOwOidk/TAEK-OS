@@ -20,6 +20,8 @@
 #include "controladores/audio_ac97.h"
 #include "controladores/animacion_cangrejo.h"
 #include "controladores/gpu.h"
+#include "base/dma.h"
+#include "controladores/iommu.h"
 #include "compatibilidad/linux.h"
 #include "controladores/video/nvidia/core/nvidia_core.h"
 #include "controladores/terminal.h"
@@ -123,6 +125,31 @@ void principal(void) {
         serial_imprimir("[Sin acelerador GPU dedicado - Operando en modo GOP] ");
         huevo_etapa_ok();
     }
+
+    huevo_etapa("Gestor de Memoria DMA Contigua Física (H17)");
+    dma_iniciar();
+    dma_estadisticas_t edma;
+    dma_obtener_estadisticas(&edma);
+    serial_imprimir("[Arena DMA: ");
+    serial_imprimir_dec(edma.arena_tamano_bytes / (1024 * 1024));
+    serial_imprimir(" MiB | Páginas: ");
+    serial_imprimir_dec((uint64_t)edma.paginas_totales);
+    serial_imprimir("] ");
+    huevo_etapa_ok();
+
+    huevo_etapa("Controlador de IOMMU / Intel VT-d (DMAR ACPI) (H17)");
+    iommu_iniciar();
+    const iommu_estado_t *eiommu = iommu_obtener_estado();
+    if (eiommu->tabla_dmar_detectada) {
+        serial_imprimir("[Intel VT-d Activo | DRHD: ");
+        serial_imprimir_dec((uint64_t)eiommu->conteo_drhd);
+        serial_imprimir(" | Modo: ");
+        serial_imprimir(eiommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH ? "PassThrough" : "Traducción");
+        serial_imprimir("] ");
+    } else {
+        serial_imprimir("[Modo DMA Directo 1:1 Transparente (Sin DMAR)] ");
+    }
+    huevo_etapa_ok();
 
     huevo_etapa("Capa de Compatibilidad Linux Kernel Shim (Ring 0)");
     linux_shim_iniciar();

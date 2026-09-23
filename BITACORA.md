@@ -434,12 +434,51 @@
     - Comando `apic probar`: 4 pasos aprobados con disparo Self-IPI inmediato y EOI confirmado.
     - Apagado limpio por ACPI.
 
+
+### [2026-09-22 19:50 - 20:00] — Hito 17: Gestor de Memoria DMA Real Contigua y Controlador de IOMMU / Intel VT-d (DMAR ACPI) (Comandos `dma` y `dma probar`, `iommu` e `iommu probar`)
+* **Objetivo:** Establecer la infraestructura de acceso directo a memoria (DMA) físicamente contigua y descubrimiento de unidades de remapeo Intel VT-d (IOMMU) requeridas para la comunicación con la GPU GeForce RTX 5070 Ti (Blackwell) y la futura carga de firmware GSP (Hito 18).
+* **Diseño Arquitectónico:**
+  1. **Arena Física DMA Dedicada y Aislada (32 MiB):**
+     - En el arranque (`memoria.c`), se reserva un bloque físico de 32 MiB (8,192 páginas de 4 KiB) alineado a 2 MiB directamente desde `LIMINE_MEMMAP_USABLE`.
+     - Estas páginas se excluyen de la pila común del PMM, garantizando cero fragmentación.
+     - Se implementó un mapa de bits (*bitmap*) de 128 palabras de 64 bits (1 KiB en total) que gestiona asignaciones contiguas con alineaciones arbitrarias (4 KiB, 64 KiB, 2 MiB).
+  2. **Barreras de Coherencia de Silicio (Cache Flushing):**
+     - Primitivas de bajo nivel `dma_sincronizar_cpu_a_dispositivo()` que recorren las líneas de caché de 64 bytes emitiendo `clflush` / `clflushopt` seguido de una barrera completa de memoria `mfence` para garantizar que las escrituras del CPU lleguen a la RAM física antes de que la GPU las lea por DMA.
+  3. **Conexión con Shims de Compatibilidad:**
+     - `dma_alloc_coherent()` y `dma_free_coherent()` en `linux.c` y `nv_os_alloc_pages()` en `nv_os_interface.c` ahora usan directamente este gestor de DMA contiguo garantizado.
+  4. **Analizador ACPI y Controlador Intel VT-d (IOMMU):**
+     - Petición Limine de RSDP (`g_peticion_rsdp`).
+     - Localización e inspección de tablas ACPI XSDT (64 bits) y RSDT (32 bits) buscando la firma `"DMAR"` (0x52414D44).
+     - Decodificación de unidades DRHD (DMA Remapping Hardware Unit Definition) y mapeo MMIO sin caché (`0xFFFFFE0002000000 + idx * 0x100000`).
+     - Lectura directa de registros de silicio VT-d: `VERSION`, `CAP_REG` (SAGAW, páginas gigantes de 2MB), `ECAP_REG` (coherencia de páginas, Pass-Through `PT`), y `GSTS_REG` (estado de traducción `TES`).
+     - Registro y protección de regiones RMRR (Reserved Memory Region Reporting).
+     - Soporte dual: transparente en QEMU estándar (DMA físico 1:1) y verificado con emulación completa de hardware Intel VT-d (`-device intel-iommu`).
+  5. **Comandos de Terminal:**
+     - `dma`: Diagnóstico completo de la arena contigua (base física, capacidad, páginas en uso/libres, asignaciones activas) y estado IOMMU.
+     - `dma probar`: Autodiagnóstico de 5 pasos que asigna 64 KiB alineados a 64 KiB, verifica continuidad física estricta en las 16 páginas (`phys_page[p] == base + p*4096`), prueba canarios con barreras de sincronización de caché (`clflush/mfence`) y libera el búfer certificando 0 fugas de memoria.
+     - `iommu`: Desglose técnico de la tabla ACPI DMAR, unidades DRHD, estado `TES`, soporte `PassThrough (PT)` y regiones reservadas RMRR.
+     - `iommu probar`: Autodiagnóstico del pipeline de aislamiento DMA.
+* **Archivos Creados / Modificados:**
+  * `nucleo/base/dma.h / .c` [NUEVOS]
+  * `nucleo/controladores/iommu.h / .c` [NUEVOS]
+  * `nucleo/base/memoria.h / .c`: Reserva de arena física DMA de 32 MiB, exclusión del PMM y funciones `pmm_asignar_bloque_contiguo()` y `pmm_liberar_bloque_contiguo()`.
+  * `nucleo/compatibilidad/linux.c`: `dma_alloc_coherent()` y `dma_free_coherent()` enlazadas con el nuevo DMA contiguo.
+  * `nucleo/principal.c`: Dos nuevas etapas supervisadas por El Huevo: *"Gestor de Memoria DMA Contigua Física (H17)"* y *"Controlador de IOMMU / Intel VT-d (DMAR ACPI) (H17)"*.
+  * `nucleo/controladores/terminal.c`: Inclusión de cabeceras, comandos `dma`, `dma probar`, `iommu`, `iommu probar`, y menú de ayuda.
+  * `Makefile`: Inclusión de `dma.c` e `iommu.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpios en WSL con Clang / LLD.
+  * En QEMU Estándar (Modo 1:1 Transparente): Ambas etapas de El Huevo en `[ OK ]`, `dma probar` superó los 5 pasos con 100% de éxito, `linux probar` y `nvidia probar` operando con el nuevo DMA subyacente.
+  * En QEMU con `-device intel-iommu` (Intel VT-d Activo): Tabla ACPI DMAR descubierta (48 bits de dirección de host), unidad DRHD #0 mapeada en MMIO `0xFED90000`, detección exitosa de modo `PassThrough de Silicio (PT)`.
+
 ---
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |
 | :--- | :--- | :--- |
+| **`Fallo de Pagina (#PF)` en `iommu_iniciar` al leer puntero RSDP en `0xFFFF80001F77E014`** | El protocolo Limine sólo mapea RAM utilizable (`LIMINE_MEMMAP_USABLE`) en el mapa directo de la mitad superior (HHDM). Las tablas de configuración ACPI de UEFI (RSDP, XSDT, DMAR) residen en memoria `LIMINE_MEMMAP_ACPI_RECLAIMABLE` o NVS de firmware fuera del espacio usable, por lo que sumar `g_hhdm_offset` generaba una dirección virtual no presente en las tablas de paginación del kernel. | Se implementó el mapeador dinámico `acpi_mapear_memoria_fisica()` que verifica si la dirección física ya cuenta con traducción válida en el VMM; de no ser así, mapea explícitamente las páginas correspondientes en una ventana virtual soberana (`0xFFFFFE0003000000`) con `paginacion_mapear()` y atributos `PAGINA_ATRIBUTOS_KERNEL`. |
+| **`call to undeclared function 'memset'` en `dma.c`** | Las primitivas de memoria `memset`, `memcpy`, `memmove` y `memcmp` estaban implementadas en `memoria.c` pero no expuestas en `memoria.h`. | Se agregaron las declaraciones formales de manipulación de memoria freestanding en `nucleo/base/memoria.h`. |
 | **`file not found: ../../../compatibilidad/nv_os_interface.h` en clang** | El Makefile ya pasa `-I./nucleo` en `CFLAGS`, por lo que las rutas relativas redundantes con múltiples `../` se salen de la raíz de inclusión. | Se simplificó la ruta a `"compatibilidad/nv_os_interface.h"`, aprovechando el path raíz configurado en el compilador. |
 | **`rm: cannot remove build/taek-os.img: Permission denied` al hacer `make clean`** | Un proceso de QEMU mantenía abierto el descriptor del archivo en Windows. | Se actualizó el flujo de trabajo para invocar `make` directo: `mcopy -o` copia el binario ELF dentro de la imagen FAT32 in-situ sin necesidad de borrar ni recrear el archivo de imagen. |
 | **Anticipación del "Muro del Hito 18" (Firmware Loader GSP)** | El microcódigo GSP de NVIDIA (`gsp_*.bin`) mide 30-60 MB y está protegido por firmas criptográficas verificadas por el Boot ROM de la GPU (Falcon/RISC-V). Si el binario se corrompe o se alteran los encabezados ELF, el silicio se bloquea por violación de seguridad. | Se planifica el diseño de un desempaquetador ELF de microcódigo con mapeo físico alineado a 4 KiB que conserve íntegras las secciones de firma y firmas de autenticación requeridas por el hardware. |
@@ -453,3 +492,4 @@
 | **`No se puede llamar a un método en una expresión con valor NULL ($wslDir)`** | WSL escapa las contrabarras de Windows (`\U`, `\P`), haciendo fallar a `wslpath`, o `$PSScriptRoot` es nulo al invocar comandos interactivamente. | Se implementó resolución con respaldo a `(Get-Location).Path`, reemplazo de barras a POSIX (`/`) y conversión directa a `/mnt/<unidad>/`. |
 | **`Instruccion / Opcode Invalido (#UD)` al tirar del gatillo** | La CPU virtual por defecto de QEMU no tiene la instrucción de silicio `rdrand` activada, provocando que la CPU lance la excepción `#UD`. | Se reemplazó por un generador pseudoaleatorio Xorshift32 alimentado directamente por el Time Stamp Counter (`rdtsc`), 100% universal y sin riesgo de `#UD`. |
 | **Bloqueo / Congelamiento en 4174 bytes al redirigir salida de QEMU en PowerShell** | Deadlock clásico del búfer de pipe anónimo en Windows (4096 bytes). Si el hijo escribe más de 4 KB y el padre duerme sin drenar el pipe, `WriteFile` bloquea el UART en el kernel. | Se implementó lectura con streaming continuo asíncrono en Python (`subprocess.Popen` con hilo lector en tiempo real) y drenaje constante. |
+

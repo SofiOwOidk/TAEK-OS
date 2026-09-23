@@ -1,4 +1,5 @@
 #include "memoria.h"
+#include "dma.h"
 #include "huevo.h"
 #include "../arquitectura/x86_64/serial.h"
 
@@ -51,6 +52,11 @@ static int            g_memoria_inicializada = 0;
 
 // Tamaño inicial asignado al Heap del kernel (8 MiB)
 #define TAMANO_ARENA_INICIAL (8ULL * 1024ULL * 1024ULL)
+
+// Tamaño reservado para la arena contigua de DMA físico (32 MiB alineados a 2 MiB)
+#define TAMANO_ARENA_DMA     (32ULL * 1024ULL * 1024ULL)
+static uint64_t g_arena_dma_fisica = 0;
+static uint64_t g_arena_dma_tamano = 0;
 
 // --- FUNCIONES BÁSICAS DE COPIA Y RELLENO (FREESTANDING) ---
 
@@ -437,6 +443,29 @@ void memoria_iniciar(void) {
         }
     }
 
+    // Encontrar región utilizable para la arena contigua de DMA físico (32 MiB alineados a 2 MiB)
+    uint64_t arena_dma_tamano = TAMANO_ARENA_DMA;
+    for (uint64_t i = 0; i < cantidad_entradas; i++) {
+        struct limine_memmap_entry *e = mapa->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE) continue;
+
+        uint64_t base_candidata = (e->base + 0x1FFFFFULL) & ~0x1FFFFFULL;
+        if (base_candidata < 0x200000) base_candidata = 0x200000;
+
+        // Si solapa con la arena del heap, buscar inmediatamente después
+        if (arena_heap_fisica != 0 &&
+            base_candidata >= arena_heap_fisica &&
+            base_candidata < (arena_heap_fisica + arena_heap_tamano)) {
+            base_candidata = ((arena_heap_fisica + arena_heap_tamano) + 0x1FFFFFULL) & ~0x1FFFFFULL;
+        }
+
+        if (base_candidata >= e->base && (base_candidata + arena_dma_tamano) <= (e->base + e->length)) {
+            g_arena_dma_fisica = base_candidata;
+            g_arena_dma_tamano = arena_dma_tamano;
+            break;
+        }
+    }
+
     // Inicializar la pila intrusiva del PMM con todas las páginas libres
     for (uint64_t i = 0; i < cantidad_entradas; i++) {
         struct limine_memmap_entry *e = mapa->entries[i];
@@ -454,6 +483,11 @@ void memoria_iniciar(void) {
 
                 // Si esta página pertenece a la arena reservada para el Heap, omitirla del PMM
                 if (arena_heap_fisica != 0 && p >= arena_heap_fisica && p < (arena_heap_fisica + arena_heap_tamano)) {
+                    continue;
+                }
+
+                // Si esta página pertenece a la arena reservada para DMA contiguo, omitirla del PMM
+                if (g_arena_dma_fisica != 0 && p >= g_arena_dma_fisica && p < (g_arena_dma_fisica + g_arena_dma_tamano)) {
                     continue;
                 }
 
@@ -492,4 +526,23 @@ void memoria_iniciar(void) {
     serial_imprimir("] [Heap Inicial: ");
     serial_imprimir_dec(g_heap_capacidad_total / 1024);
     serial_imprimir_linea(" KiB]");
+}
+
+uint64_t memoria_obtener_dma_arena(uint64_t *tamano_out) {
+    if (tamano_out) *tamano_out = g_arena_dma_tamano;
+    return g_arena_dma_fisica;
+}
+
+uint64_t pmm_asignar_bloque_contiguo(uint32_t num_paginas, uint64_t alineacion) {
+    if (num_paginas == 0) return 0;
+    uint64_t phys = 0;
+    void *v = dma_asignar_bufer_contiguo((uint64_t)num_paginas * TAMANO_PAGINA, alineacion, &phys);
+    (void)v;
+    return phys;
+}
+
+void pmm_liberar_bloque_contiguo(uint64_t dir_fisica, uint32_t num_paginas) {
+    if (dir_fisica == 0 || num_paginas == 0) return;
+    void *v = (void *)FISICA_A_VIRTUAL(dir_fisica);
+    dma_liberar_bufer_contiguo(v, dir_fisica, (uint64_t)num_paginas * TAMANO_PAGINA);
 }
