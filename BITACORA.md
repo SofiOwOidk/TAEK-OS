@@ -305,7 +305,32 @@
     - `lspci`: Listó el Puente Host Q35 (`8086:29c0`), VGA (`1234:1111`), Ethernet (`8086:10d3`), Audio AC97 (`8086:2415`), Puente ISA (`8086:2918`), SATA AHCI (`8086:2922`) y SMBus (`8086:2930`).
     - `pci gpu`: Detectó la GPU en BDF `00:01.0`, reportó BAR0 de VRAM de 16 MiB en `0x80000000` con `[VRAM APERTURE - WRITE-COMBINING]` y BAR2 MMIO de 4 KiB en `0x81085000`.
     - `lspci -v`: Desglosó todos los BARs con precisión matemática.
-    - Apagado limpio por ACPI.
+### [2026-09-22 19:15 - 19:25] — Hito 14: Subsistema de GPU, Mapeo MMIO sin Caché (PCD/PWT), Lectura de Silicio y Comandos `gpu` / `gpu probar`
+* **Objetivo:** Cumplir el Paso 2 de la ruta hacia el soporte de GPUs dedicadas (NVIDIA RTX 5070 Ti Laptop / Blackwell y emuladas): implementar el subsistema de GPU de TAEK OS, mapear las regiones de registros MMIO en memoria virtual sin caché a través del VMM de 4 niveles (`PAGINA_ATRIBUTOS_MMIO`), activar el Bus Mastering en el bus PCIe, leer los registros de silicio del hardware y proveer herramientas interactivas de diagnóstico con medición de latencia.
+* **Diseño Arquitectónico:**
+  1. **Asignación Canónica de Memoria Virtual para GPU:**
+     - Dirección base virtual definida en `GPU_MMIO_VIRTUAL_BASE` (`0xFFFFFE0000000000ULL`), situada en la mitad superior del espacio de 64 bits pero aislada del kernel base y del heap.
+  2. **Mapeo sin Caché (PCD y PWT) con el VMM:**
+     - Uso de `paginacion_mapear()` con los flags `PAGINA_PRESENTE | PAGINA_ESCRITURA | PAGINA_SIN_CACHE | PAGINA_ESCRITURA_DIR` (Page Cache Disable y Page Write-Through).
+     - Esta configuración es obligatoria en x86_64 para evitar que las lecturas y escrituras de registros de la GPU queden atrapadas en la memoria caché L1/L2/L3 de la CPU y garantiza que los ciclos de bus viajen eléctricamente por PCIe.
+  3. **Activación de Bus Master y Lectura del Silicio:**
+     - Invocación de `pci_activar_bus_master()` para permitir que la GPU opere como maestra del bus y acceda a DMA si lo requiere.
+     - Primitivas inline y funciones seguras de acceso: `gpu_leer_mmio_32()` y `gpu_escribir_mmio_32()`.
+     - Lectura del registro maestro de arranque (en NVIDIA, offset `+0x00000000` = `NV_PMC_BOOT_0`). Decodificación de arquitecturas NVIDIA: Blackwell (RTX 5000 / GB20x), Ada Lovelace (RTX 4000 / AD10x), Ampere (RTX 3000 / GA10x), Turing, Volta, Pascal, Maxwell, Kepler.
+  4. **Comandos de Terminal:**
+     - `gpu`: Resumen integral con BDF PCIe, fabricante, arquitectura detectada, firma de silicio, regiones físicas y virtuales de MMIO, capacidad de VRAM y estado de la capa de driver.
+     - `gpu probar`: Autodiagnóstico riguroso de 5 pasos (detección PCIe, BAR MMIO, mapeo VMM sin caché, lectura de silicio y medición de latencia por TSC mediante `rdtsc`).
+* **Archivos Creados / Modificados:**
+  * `nucleo/controladores/gpu.h / .c`: Estructura `struct estado_gpu`, decodificación de arquitecturas, mapeo VMM, lectura/escritura MMIO y autodiagnóstico.
+  * `nucleo/principal.c`: Etapa de arranque supervisada por El Huevo: *"Mapeo MMIO sin Caché y Comunicación con Silicio GPU"*.
+  * `nucleo/controladores/terminal.c`: Inclusión de `gpu.h`, implementación de `ejecutar_comando_gpu()`, comandos `gpu` y `gpu probar`, y actualización del menú `ayuda`.
+  * `Makefile`: Inclusión de `nucleo/controladores/gpu.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpios con Clang 22 / LLD.
+  * En QEMU UEFI:
+    - El Huevo validó la etapa de GPU sin agrietarse: `[Silicio: Bochs / QEMU Extended VGA | MMIO Virt: 0x0xFFFFFE0000000000] [ OK ]`.
+    - Comando `gpu`: Mostró el dispositivo `00:01.0 [1234:1111]`, MMIO Físico `0x81085000` (4 KiB), MMIO Virtual `0xfffffe0000000000 [ACTIVO - SIN CACHÉ / PCD]` y VRAM `0x80000000` (16 MiB).
+    - Comando `gpu probar`: Superó los 5 pasos con éxito total (`==> [ AUTODIAGNÓSTICO EXITOSO ] Pipeline de comunicación MMIO con GPU operativo.`) registrando ~35,000 ciclos de latencia de bus.
 
 ---
 

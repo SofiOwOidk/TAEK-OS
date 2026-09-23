@@ -18,6 +18,7 @@
 #include "controladores/pantalla.h"
 #include "controladores/audio_ac97.h"
 #include "controladores/animacion_cangrejo.h"
+#include "controladores/gpu.h"
 #include "controladores/terminal.h"
 
 // Revision 3 del protocolo Limine
@@ -95,6 +96,20 @@ void principal(void) {
         serial_imprimir("] ");
     }
     huevo_etapa_ok();
+
+    huevo_etapa("Mapeo MMIO sin Caché y Comunicación con Silicio GPU");
+    if (gpu_iniciar() == 0) {
+        const struct estado_gpu *egpu = gpu_obtener_estado();
+        serial_imprimir("[Silicio: ");
+        serial_imprimir(egpu->arquitectura_nombre);
+        serial_imprimir(" | MMIO Virt: 0x");
+        serial_imprimir_hex(egpu->dir_virtual_mmio);
+        serial_imprimir("] ");
+        huevo_etapa_ok();
+    } else {
+        serial_imprimir("[Sin acelerador GPU dedicado - Operando en modo GOP] ");
+        huevo_etapa_ok();
+    }
 
     huevo_etapa("Inicialización de Pantalla GOP UEFI");
     if (g_peticion_framebuffer.response == NULL || g_peticion_framebuffer.response->framebuffer_count < 1) {

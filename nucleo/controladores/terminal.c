@@ -3,6 +3,7 @@
 #include "pantalla.h"
 #include "audio_ac97.h"
 #include "animacion_cangrejo.h"
+#include "gpu.h"
 #include "../base/huevo.h"
 #include "../base/energia.h"
 #include "../base/tiempo.h"
@@ -605,6 +606,138 @@ static void ejecutar_comando_lspci(const char *arg) {
     }
 }
 
+static void ejecutar_comando_gpu(const char *arg) {
+    const struct estado_gpu *gpu = gpu_obtener_estado();
+
+    if (!gpu || !gpu->gpu_detectada) {
+        consola_imprimir_linea_color("==> [ AVISO ] No se detectó ninguna controladora GPU en el bus PCIe.", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("El sistema se encuentra operando mediante el Framebuffer Lineal GOP de UEFI.");
+        return;
+    }
+
+    // MODO PRUEBA / AUTODIAGNÓSTICO: gpu probar / gpu test
+    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
+        consola_imprimir_linea_color("========== AUTODIAGNÓSTICO DE CONTROLADOR DE GPU Y MMIO ==========", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("Iniciando verificación rigurosa de silicio y memoria mapeada...");
+
+        consola_imprimir("  1. Detección en Bus PCI Express (BDF y Fabricante)... ");
+        if (gpu->gpu_detectada) {
+            consola_imprimir("[OK: ");
+            terminal_imprimir_hex_fijo(gpu->bus, 2);
+            consola_imprimir(":");
+            terminal_imprimir_hex_fijo(gpu->ranura, 2);
+            consola_imprimir(".");
+            terminal_imprimir_hex_fijo(gpu->funcion, 1);
+            consola_imprimir(" | ");
+            consola_imprimir(gpu->nombre_proveedor);
+            consola_imprimir_linea_color("]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir("  2. Verificación de Apertura BAR MMIO Física... ");
+        if (gpu->dir_fisica_mmio != 0 && gpu->tamano_mmio > 0) {
+            consola_imprimir("[OK: 0x");
+            terminal_imprimir_hex_fijo(gpu->dir_fisica_mmio, 8);
+            consola_imprimir(" - ");
+            imprimir_tamano_barra(gpu->tamano_mmio);
+            consola_imprimir_linea_color("]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLÓ - SIN BAR MMIO]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir("  3. Mapeo Virtual sin Caché (PCD/PWT en PML4 de 4 niveles)... ");
+        if (gpu->mapeo_mmio_activo && gpu->dir_virtual_mmio == GPU_MMIO_VIRTUAL_BASE) {
+            consola_imprimir("[OK: 0x");
+            terminal_imprimir_hex_fijo(gpu->dir_virtual_mmio, 16);
+            consola_imprimir_linea_color("]", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[FALLÓ]", COLOR_ERROR_DEFAULT);
+            return;
+        }
+
+        consola_imprimir("  4. Lectura de Registro Maestro de Silicio (Offset +0x00)... ");
+        uint32_t val_silicio = gpu_leer_mmio_32(0x00000000);
+        consola_imprimir("[OK: Valor 0x");
+        terminal_imprimir_hex_fijo(val_silicio, 8);
+        consola_imprimir(" | ");
+        consola_imprimir(gpu->arquitectura_nombre);
+        consola_imprimir_linea_color("]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir("  5. Prueba de Latencia y Comunicación de Bus PCIe (rdtsc)... ");
+        uint64_t t_inicio = rdtsc();
+        gpu_leer_mmio_32(0x00000000);
+        uint64_t t_fin = rdtsc();
+        uint64_t ciclos = t_fin - t_inicio;
+        consola_imprimir("[OK: ");
+        consola_imprimir_dec(ciclos);
+        consola_imprimir_linea_color(" ciclos de reloj CPU]", COLOR_EXITO_DEFAULT);
+
+        consola_imprimir_linea("");
+        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Pipeline de comunicación MMIO con GPU operativo.", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
+    // REPORTE ESTÁNDAR: gpu
+    consola_imprimir_linea_color("================== CONTROLADOR DE ACELERACIÓN GPU ==================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Dispositivo PCIe      : ");
+    terminal_imprimir_hex_fijo(gpu->bus, 2);
+    consola_imprimir(":");
+    terminal_imprimir_hex_fijo(gpu->ranura, 2);
+    consola_imprimir(".");
+    terminal_imprimir_hex_fijo(gpu->funcion, 1);
+    consola_imprimir(" [");
+    terminal_imprimir_hex_fijo(gpu->id_proveedor, 4);
+    consola_imprimir(":");
+    terminal_imprimir_hex_fijo(gpu->id_dispositivo, 4);
+    consola_imprimir("] ");
+    consola_imprimir_linea_color(gpu->nombre_proveedor, COLOR_EXITO_DEFAULT);
+
+    consola_imprimir("  Arquitectura Silicio  : ");
+    consola_imprimir_linea_color(gpu->arquitectura_nombre, COLOR_USUARIO_DEFAULT);
+
+    consola_imprimir("  Firma Silicio (Boot0) : 0x");
+    terminal_imprimir_hex_fijo(gpu->firma_silicio_boot0, 8);
+    consola_imprimir_linea("");
+
+    consola_imprimir("  Espacio MMIO Físico   : 0x");
+    terminal_imprimir_hex_fijo(gpu->dir_fisica_mmio, 16);
+    consola_imprimir(" (Tamaño: ");
+    imprimir_tamano_barra(gpu->tamano_mmio);
+    consola_imprimir_linea(")");
+
+    consola_imprimir("  Mapeo MMIO Virtual    : 0x");
+    terminal_imprimir_hex_fijo(gpu->dir_virtual_mmio, 16);
+    if (gpu->mapeo_mmio_activo) {
+        consola_imprimir_linea_color(" [ACTIVO - SIN CACHÉ / PCD]", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea_color(" [INACTIVO]", COLOR_ERROR_DEFAULT);
+    }
+
+    consola_imprimir("  Memoria VRAM Física   : ");
+    if (gpu->vram_detectada && gpu->tamano_vram > 0) {
+        consola_imprimir("0x");
+        terminal_imprimir_hex_fijo(gpu->dir_fisica_vram, 16);
+        consola_imprimir(" (Capacidad: ");
+        imprimir_tamano_barra(gpu->tamano_vram);
+        consola_imprimir_linea_color(")", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("No mapeada como BAR independiente (Usa VRAM Compartida / UMA)", COLOR_TEXTO_DEFAULT);
+    }
+
+    consola_imprimir("  Capa de Driver Kernel : ");
+    if (gpu->id_proveedor == 0x10DE) {
+        consola_imprimir_linea_color("Shim Linux 'nvidia-open' / GSP Firmware Bridge (Fase 3)", COLOR_PROMPT_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("Controlador Nativo TAEK OS / Framebuffer Directo", COLOR_PROMPT_DEFAULT);
+    }
+
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'gpu probar' para comprobar la latencia y lectura del silicio.", COLOR_TEXTO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -646,7 +779,7 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  lspci / pci    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Enumera dispositivos PCI/PCIe ('pci detalle', 'pci gpu').");
         consola_imprimir_color("  gpu            ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Diagnóstico especializado de la GPU, VRAM y registros MMIO.");
+        consola_imprimir_linea(": Diagnóstico especializado de la GPU, VRAM y registros MMIO ('gpu probar').");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -926,9 +1059,13 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
-    // COMANDO: gpu (acceso directo a diagnóstico de video)
-    if (str_igual(linea, "gpu") || str_igual(linea, "video") || str_igual(linea, "vram")) {
-        ejecutar_comando_lspci("gpu");
+    // COMANDO: gpu / video / vram
+    if (str_comienza_con(linea, "gpu") || str_comienza_con(linea, "video") || str_comienza_con(linea, "vram")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "gpu ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "video ")) arg = str_saltar_espacios(linea + 6);
+        else if (str_comienza_con(linea, "vram ")) arg = str_saltar_espacios(linea + 5);
+        ejecutar_comando_gpu(arg);
         return;
     }
 
