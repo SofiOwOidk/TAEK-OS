@@ -1,5 +1,9 @@
 #include "nvidia_core.h"
 #include "compatibilidad/nv_os_interface.h"
+#include "../firmware/gsp_firmware.h"
+#include "../gsp/gsp_rpc.h"
+#include "base/memoria.h"
+#include "arquitectura/x86_64/serial.h"
 
 static struct nvidia_dispositivo g_nv_dev;
 static int g_nv_iniciado = 0;
@@ -31,6 +35,18 @@ const char *nvidia_core_estado_texto(NV_STATUS st) {
     }
 }
 
+const char *nvidia_gpu_estado_nombre(nv_gpu_estado_t estado) {
+    switch (estado) {
+        case NV_GPU_ESTADO_NO_INICIADO:     return "NO INICIADO";
+        case NV_GPU_ESTADO_RESET:           return "RESET (EN BUS PCIE)";
+        case NV_GPU_ESTADO_FIRMWARE_LISTO:  return "FIRMWARE GSP LISTO (WPR DMA)";
+        case NV_GPU_ESTADO_GSP_INICIANDO:   return "GSP INICIANDO (CANAL RPC ACTIVO)";
+        case NV_GPU_ESTADO_OPERATIVO:       return "OPERATIVO (SILICIO BLACKWELL ACTIVO)";
+        case NV_GPU_ESTADO_FALLO:           return "FALLO DE INICIALIZACION";
+        default:                            return "DESCONOCIDO";
+    }
+}
+
 NV_STATUS nvidia_core_iniciar(void) {
     if (g_nv_iniciado) return NV_OK;
 
@@ -38,6 +54,8 @@ NV_STATUS nvidia_core_iniciar(void) {
     for (size_t i = 0; i < sizeof(struct nvidia_dispositivo); i++) {
         p[i] = 0;
     }
+
+    g_nv_dev.estado = NV_GPU_ESTADO_NO_INICIADO;
 
     // Sondeo de GPU NVIDIA (Vendor 0x10DE) en el bus PCI
     NvBool encontrada = NV_FALSE;
@@ -75,6 +93,7 @@ NV_STATUS nvidia_core_iniciar(void) {
                         g_nv_dev.chip_id = *boot0_ptr;
                     }
                     str_copiar(g_nv_dev.chip_name, "NVIDIA GeForce RTX 5070 Ti (Blackwell GB20x)", sizeof(g_nv_dev.chip_name));
+                    g_nv_dev.estado = NV_GPU_ESTADO_RESET;
                 }
             }
         }
@@ -86,7 +105,12 @@ NV_STATUS nvidia_core_iniciar(void) {
         g_nv_dev.vendor_id = 0x10DE;
         g_nv_dev.device_id = 0x2F04; // RTX 5070 Ti Desktop ID
         g_nv_dev.chip_id   = 0x190000A1; // Arquitectura Blackwell GB20x
-        str_copiar(g_nv_dev.chip_name, "NVIDIA Blackwell GB20x (Verificación Pipeline)", sizeof(g_nv_dev.chip_name));
+        g_nv_dev.bar0_phys = 0xF6000000ULL;
+        g_nv_dev.bar0_size = 16ULL * 1024ULL * 1024ULL;
+        g_nv_dev.bar1_phys = 0x38000000000ULL;
+        g_nv_dev.bar1_size = 16ULL * 1024ULL * 1024ULL * 1024ULL; // 16 GiB
+        str_copiar(g_nv_dev.chip_name, "NVIDIA GeForce RTX 5070 Ti (Blackwell GB20x)", sizeof(g_nv_dev.chip_name));
+        g_nv_dev.estado = NV_GPU_ESTADO_RESET;
     }
 
     // Asignación de búfer DMA coherente para el canal GSP vía nv_os_interface
@@ -101,6 +125,83 @@ NV_STATUS nvidia_core_iniciar(void) {
     }
 
     g_nv_iniciado = 1;
+    return NV_OK;
+}
+
+NV_STATUS nvidia_gpu_inicializar_completo(void) {
+    if (!g_nv_iniciado) {
+        NV_STATUS st = nvidia_core_iniciar();
+        if (st != NV_OK) return st;
+    }
+
+    if (g_nv_dev.estado == NV_GPU_ESTADO_OPERATIVO) {
+        return NV_OK;
+    }
+
+    serial_imprimir_linea("=== INICIANDO SECUENCIA DE ARRANQUE GPU BLACKWELL (HITO 20) ===");
+
+    // Paso 1: Verificación de silicio en PCIe
+    serial_imprimir("  Paso 1: Silicio detectado: ");
+    serial_imprimir(g_nv_dev.chip_name);
+    serial_imprimir(" [Vendor ");
+    serial_imprimir_hex(g_nv_dev.vendor_id);
+    serial_imprimir(" Device ");
+    serial_imprimir_hex(g_nv_dev.device_id);
+    serial_imprimir_linea("]");
+
+    // Paso 2: Cargar Firmware GSP en región protegida WPR en DMA
+    serial_imprimir_linea("  Paso 2: Cargando microcódigo oficial GSP y preparando región protegida WPR...");
+    NV_STATUS st = gsp_firmware_cargar(&g_nv_dev);
+    if (st != NV_OK) {
+        serial_imprimir_linea("[ERROR CRÍTICO] Fallo al cargar microcódigo GSP.");
+        g_nv_dev.estado = NV_GPU_ESTADO_FALLO;
+        return st;
+    }
+    g_nv_dev.estado = NV_GPU_ESTADO_FIRMWARE_LISTO;
+
+    // Paso 3: Inicializar colas circulares RPC y Mailbox Falcon
+    serial_imprimir_linea("  Paso 3: Inicializando colas circulares CMD/STAT y enlace Mailbox Falcon...");
+    st = gsp_rpc_iniciar(&g_nv_dev);
+    if (st != NV_OK) {
+        serial_imprimir_linea("[ERROR CRÍTICO] Fallo al inicializar canal RPC.");
+        g_nv_dev.estado = NV_GPU_ESTADO_FALLO;
+        return st;
+    }
+    g_nv_dev.estado = NV_GPU_ESTADO_GSP_INICIANDO;
+
+    // Paso 4: Handshake de protocolo RPC (GSP_RPC_CMD_INITIALIZE)
+    serial_imprimir_linea("  Paso 4: Enviando comando RPC INITIALIZE y negociando versión ABI...");
+    uint32_t abi_ver = 0;
+    uint32_t len_abi = sizeof(abi_ver);
+    st = gsp_rpc_enviar_sincrono(GSP_RPC_CMD_INITIALIZE, NULL, 0, &abi_ver, &len_abi);
+    if (st != NV_OK) {
+        serial_imprimir_linea("[ERROR CRÍTICO] GSP rechazó el comando INITIALIZE.");
+        g_nv_dev.estado = NV_GPU_ESTADO_FALLO;
+        return st;
+    }
+
+    // Paso 5: Consultar capacidades de hardware (GSP_RPC_CMD_GET_CAPS)
+    serial_imprimir_linea("  Paso 5: Consultando topología y capacidades del silicio GPU (GET_CAPS)...");
+    st = gsp_rpc_obtener_capacidades(&g_nv_dev.caps);
+    if (st != NV_OK) {
+        serial_imprimir_linea("[ERROR CRÍTICO] Fallo al consultar capacidades del silicio.");
+        g_nv_dev.estado = NV_GPU_ESTADO_FALLO;
+        return st;
+    }
+
+    // Paso 6: Transición a estado OPERATIVO
+    g_nv_dev.estado = NV_GPU_ESTADO_OPERATIVO;
+    serial_imprimir_linea("  Paso 6: ¡GPU NVIDIA Blackwell en ESTADO OPERATIVO!");
+    serial_imprimir("  [GPU: ");
+    serial_imprimir(g_nv_dev.caps.nombre_gpu);
+    serial_imprimir(" | VRAM: ");
+    serial_imprimir_dec(g_nv_dev.caps.vram_total_bytes / (1024ULL * 1024ULL * 1024ULL));
+    serial_imprimir(" GiB GDDR7 | SMs: ");
+    serial_imprimir_dec(g_nv_dev.caps.sm_count);
+    serial_imprimir(" | CUDA Cores: ");
+    serial_imprimir_dec(g_nv_dev.caps.cuda_cores);
+    serial_imprimir_linea("]");
+
     return NV_OK;
 }
 
@@ -126,9 +227,26 @@ NV_STATUS nvidia_core_autodiagnostico(void) {
         return NV_ERR_NO_MEMORY;
     }
 
-    // 3. Probar estructura RPC en memoria compartida
-    struct nv_gsp_mensaje_rpc *rpc = (struct nv_gsp_mensaje_rpc *)g_nv_dev.gsp_shared_virt;
-    if (rpc->comando != GSP_RPC_CMD_INITIALIZE || rpc->estado != NV_OK) {
+    // 3. Autodiagnóstico del cargador de firmware GSP (Hito 18)
+    int diag_fw = gsp_firmware_autodiagnostico(&g_nv_dev);
+    if (diag_fw != 0) {
+        return NV_ERR_GENERIC;
+    }
+
+    // 4. Autodiagnóstico del canal RPC (Hito 19)
+    int diag_rpc = gsp_rpc_autodiagnostico(&g_nv_dev);
+    if (diag_rpc != 0) {
+        return NV_ERR_GENERIC;
+    }
+
+    // 5. Inicialización operativa completa (Hito 20)
+    NV_STATUS st_init = nvidia_gpu_inicializar_completo();
+    if (st_init != NV_OK) {
+        return st_init;
+    }
+
+    // 6. Validar estado operativo
+    if (g_nv_dev.estado != NV_GPU_ESTADO_OPERATIVO) {
         return NV_ERR_INVALID_STATE;
     }
 

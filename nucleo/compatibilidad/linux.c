@@ -89,8 +89,13 @@ void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *dma_handle, unsigne
     (void)dev;
     if (size == 0 || !dma_handle) return NULL;
 
+    uint64_t alineacion = 4096;
+    if (size >= 65536) {
+        alineacion = 65536; // Alineación estricta de 64 KiB requerida por hardware GPU/GSP/WPR
+    }
+
     uint64_t phys = 0;
-    void *virt = dma_asignar_bufer_contiguo(size, 4096, &phys);
+    void *virt = dma_asignar_bufer_contiguo(size, alineacion, &phys);
 
     if (!virt) {
         // Fallback al PMM si la arena DMA no está disponible o está colmada

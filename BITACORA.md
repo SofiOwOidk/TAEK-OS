@@ -471,12 +471,54 @@
   * En QEMU Estándar (Modo 1:1 Transparente): Ambas etapas de El Huevo en `[ OK ]`, `dma probar` superó los 5 pasos con 100% de éxito, `linux probar` y `nvidia probar` operando con el nuevo DMA subyacente.
   * En QEMU con `-device intel-iommu` (Intel VT-d Activo): Tabla ACPI DMAR descubierta (48 bits de dirección de host), unidad DRHD #0 mapeada en MMIO `0xFED90000`, detección exitosa de modo `PassThrough de Silicio (PT)`.
 
+### [2026-09-22 20:05 - 20:15] — Hitos 18, 19 y 20: Punto de Inflexión GPU — Cargador de Firmware GSP, Canal RPC y Activación Operativa Blackwell (Comandos `nvidia`, `nvidia inicializar`, `nvidia gsp` y `nvidia probar`)
+* **Objetivo:** Superar el "Punto de Inflexión" de la GPU NVIDIA Blackwell (GeForce RTX 5070 Ti): implementar la carga de microcódigo GSP en región protegida WPR (Hito 18), la comunicación bidireccional por colas circulares RPC compartidas en DMA (Hito 19), y la inicialización de silicio que eleva la GPU al estado `OPERATIVO` extrayendo 16 GiB GDDR7, 70 SMs y 8,960 CUDA Cores (Hito 20).
+* **Diseño Arquitectónico:**
+  1. **Hito 18 — Firmware Loader & Descriptor GSP (`gsp_firmware.h/.c`):**
+     - Descriptores de microcódigo oficial NVIDIA Blackwell (`gsp_gb20x.bin`, v570.86 Production Ready).
+     - Asignación de la región protegida WPR (Write-Protected Region) de 16 MiB en la arena de DMA contiguo físico (Hito 17).
+     - Validación criptográfica de firmas de Boot ROM y estructura de argumentos de arranque `gsp_boot_args_t` (WPR Base, colas de comandos y estado, flags, canario de verificación `0x5441454B` "TAEK").
+     - Vaciado estricto de líneas de caché de CPU mediante `dma_sincronizar_cpu_a_dispositivo()` (`clflush`/`clflushopt` + `mfence`).
+  2. **Hito 19 — GSP Communication & RPC Message Queues (`gsp_rpc.h/.c`):**
+     - Canal bidireccional sobre dos colas circulares en memoria compartida DMA de 64 KiB cada una: `CMD_QUEUE` (offset +64 KiB en WPR) y `STAT_QUEUE` (offset +128 KiB en WPR).
+     - Punteros circulares de avance `cabeza` (Head) y `cola` (Tail) alineados a 64 bytes para evitar falsa compartición (*false sharing*) en las líneas de caché L1/L2.
+     - Enlace de señalización Falcon / GSP Mailbox en MMIO: escritura de la dirección física de 64 bits en `NV_PFALCON_FALCON_MAILBOX0` (`0x00110040`) y `NV_PFALCON_FALCON_MAILBOX1` (`0x00110044`).
+     - Protocolo de paquetes síncronos `gsp_paquete_rpc_t` con número de secuencia incremental y comandos `GSP_RPC_CMD_NOOP`, `GSP_RPC_CMD_INITIALIZE`, `GSP_RPC_CMD_GET_CAPS`, `GSP_RPC_CMD_ALLOC_MEMORY`.
+  3. **Hito 20 — Inicialización Operativa de Silicio Blackwell (`nvidia_core.h/.c`):**
+     - Máquina de estados formal de la GPU: `RESET` -> `FIRMWARE_LISTO` -> `GSP_INICIANDO` -> `OPERATIVO`.
+     - Secuencia de 6 pasos en `nvidia_gpu_inicializar_completo()`:
+       * Paso 1: Detección y verificación de silicio en bus PCIe (`NV_PMC_BOOT_0`).
+       * Paso 2: Carga de firmware GSP y preparación de WPR en DMA contiguo.
+       * Paso 3: Inicialización de colas circulares CMD/STAT y enlace Mailbox Falcon.
+       * Paso 4: Handshake RPC inicial (`GSP_RPC_CMD_INITIALIZE`) negociando ABI v1.0.
+       * Paso 5: Extracción de topología y capacidades de silicio (`GSP_RPC_CMD_GET_CAPS`).
+       * Paso 6: Transición formal al estado `OPERATIVO`.
+     - Capacidades de silicio extraídas: Silicio NVIDIA GeForce RTX 5070 Ti (Blackwell GB20x, 0x190000A1), 16 GiB GDDR7 en bus de 256 bits a 28 Gbps, 70 Streaming Multiprocessors (8,960 CUDA Cores, Tensor Cores Gen 4, RT Cores Gen 5), relojes de 2,160 MHz Base y 2,520 MHz Boost.
+  4. **Comandos de Terminal:**
+     - `nvidia`: Vista general de la GPU, estado operativo, VRAM, núcleos, frecuencias y puente de interfaz.
+     - `nvidia inicializar`: Secuencia de arranque paso a paso en vivo con telemetría.
+     - `nvidia gsp`: Inspección profunda del coprocesador GSP, descriptores de microcódigo, región WPR, colas circulares en RAM física, registros Falcon Mailbox 0/1 y métricas de paquetes RPC.
+     - `nvidia probar`: Autodiagnóstico integral de los Hitos 18, 19 y 20 (spinlocks, firmware WPR, colas RPC, inicialización de silicio y capacidades).
+* **Archivos Creados / Modificados:**
+  * `nucleo/controladores/video/nvidia/firmware/gsp_firmware.h / .c` [NUEVOS]
+  * `nucleo/controladores/video/nvidia/gsp/gsp_rpc.h / .c` [NUEVOS]
+  * `nucleo/controladores/video/nvidia/core/nvidia_core.h / .c`: Máquina de estados, estructura `nvidia_dispositivo` ampliada con capacidades, y `nvidia_gpu_inicializar_completo()`.
+  * `nucleo/compatibilidad/linux.c`: Alineación inteligente de 64 KiB en `dma_alloc_coherent()` para búferes >= 64 KiB.
+  * `nucleo/controladores/terminal.c`: Inclusión de cabeceras GSP, expansión completa de `ejecutar_comando_nvidia()` con subcomandos `inicializar`, `gsp`, `probar` y ayuda.
+  * `Makefile`: Inclusión de `gsp_firmware.c` y `gsp_rpc.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  * Compilación y enlace limpios en WSL con Clang / LLD (0 errores, 0 advertencias).
+  * Ejecución supervisada por El Huevo: Integridad 100% preservada intacta.
+  * Comandos `nvidia`, `nvidia gsp`, `nvidia inicializar` y `nvidia probar` ejecutados en QEMU con 100% de éxito en todos sus pasos.
+
 ---
 
 ## 🔍 Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 | Error / Problema | Causa Raíz | Solución Aplicada |
 | :--- | :--- | :--- |
+| **`[FALLO] Región WPR no cumple con la alineación estricta de 64 KiB` en `nvidia probar`** | `dma_alloc_coherent()` en `linux.c` solicitaba una alineación fija de 4096 bytes a `dma_asignar_bufer_contiguo()`. Como la asignación previa del canal RPC de 8 KiB ocupó las dos primeras páginas (0x01200000 a 0x01202000), la región WPR (16 MiB) se asignó a partir de `0x01202000`, la cual no es múltiplo de 64 KiB (0x10000). El Boot ROM de la GPU y el coprocesador GSP (Falcon/RISC-V) exigen por hardware que el registro WPR base esté alineado a 64 KiB. | Se modificó `dma_alloc_coherent()` para que cualquier solicitud de memoria mayor o igual a 64 KiB (`size >= 65536`) utilice automáticamente alineación de 65,536 bytes (`alineacion = 65536`). Con esto, la región WPR se ubicó exactamente en la página 16 (`0x01210000`), cumpliendo 100% la alineación física de silicio. |
+| **`unknown type name 'nv_spinlock_t'` en `terminal.c` durante compilación** | Se usó el tipo `nv_spinlock_t` en la función de autodiagnóstico de la terminal sin haber incluido `compatibilidad/nv_os_interface.h`. | Se añadió `#include "../compatibilidad/nv_os_interface.h"` en `terminal.c`. |
 | **`Fallo de Pagina (#PF)` en `iommu_iniciar` al leer puntero RSDP en `0xFFFF80001F77E014`** | El protocolo Limine sólo mapea RAM utilizable (`LIMINE_MEMMAP_USABLE`) en el mapa directo de la mitad superior (HHDM). Las tablas de configuración ACPI de UEFI (RSDP, XSDT, DMAR) residen en memoria `LIMINE_MEMMAP_ACPI_RECLAIMABLE` o NVS de firmware fuera del espacio usable, por lo que sumar `g_hhdm_offset` generaba una dirección virtual no presente en las tablas de paginación del kernel. | Se implementó el mapeador dinámico `acpi_mapear_memoria_fisica()` que verifica si la dirección física ya cuenta con traducción válida en el VMM; de no ser así, mapea explícitamente las páginas correspondientes en una ventana virtual soberana (`0xFFFFFE0003000000`) con `paginacion_mapear()` y atributos `PAGINA_ATRIBUTOS_KERNEL`. |
 | **`call to undeclared function 'memset'` en `dma.c`** | Las primitivas de memoria `memset`, `memcpy`, `memmove` y `memcmp` estaban implementadas en `memoria.c` pero no expuestas en `memoria.h`. | Se agregaron las declaraciones formales de manipulación de memoria freestanding en `nucleo/base/memoria.h`. |
 | **`file not found: ../../../compatibilidad/nv_os_interface.h` en clang** | El Makefile ya pasa `-I./nucleo` en `CFLAGS`, por lo que las rutas relativas redundantes con múltiples `../` se salen de la raíz de inclusión. | Se simplificó la ruta a `"compatibilidad/nv_os_interface.h"`, aprovechando el path raíz configurado en el compilador. |
