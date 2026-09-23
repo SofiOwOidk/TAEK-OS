@@ -815,6 +815,36 @@ static void ejecutar_comando_linux(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'linux probar' para verificar el puente y llamadas DMA.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_comando_dmesg(void) {
+    uint32_t tamano = 0, cursor = 0;
+    const char *buf = serial_obtener_log_buffer(&tamano, &cursor);
+
+    consola_imprimir_linea_color("================ BUFFER DE REGISTRO DEL KERNEL (DMESG / COM1) ================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Estado UART COM1 Físico   : ");
+    if (serial_esta_activo()) {
+        consola_imprimir_linea_color("ACTIVO (0x3F8 @ 115200 8N1 - Transmitiendo a hardware externo)", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("MODO SÓLO RAM (Puerto 0x3F8 ausente o desactivado en BIOS)", COLOR_AVISO_DEFAULT);
+    }
+    consola_imprimir("  Memoria de Log en Anillo  : ");
+    consola_imprimir_dec((uint64_t)tamano);
+    consola_imprimir(" bytes registrados (Capacidad: 64 KiB)\n");
+
+    if (buf && tamano > 0) {
+        uint32_t inicio = 0;
+        if (tamano > 1500) {
+            inicio = tamano - 1500;
+            consola_imprimir_linea_color("[... mostrando los últimos 1500 bytes del registro del kernel ...]", COLOR_PROMPT_DEFAULT);
+        }
+        for (uint32_t i = inicio; i < tamano; i++) {
+            consola_escribir_caracter(buf[i]);
+        }
+    }
+    consola_imprimir_linea("");
+    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Puedes capturar este log en vivo conectando un cable USB-Serial a 115200 baudios.", COLOR_TEXTO_DEFAULT);
+}
+
 static void ejecutar_comando_guia(const char *arg) {
     (void)arg;
     consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
@@ -1492,6 +1522,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Gestor de memoria DMA contigua y coherencia de caché ('dma probar').");
         consola_imprimir_color("  iommu          ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Controlador Intel VT-d, remapeo DRHD y regiones RMRR ('iommu probar').");
+        consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
@@ -1747,6 +1779,12 @@ static void procesar_comando(const char *linea_cruda) {
         if (str_comienza_con(linea, "guia ")) arg = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "tutorial ")) arg = str_saltar_espacios(linea + 9);
         ejecutar_comando_guia(arg);
+        return;
+    }
+
+    // COMANDO: dmesg / log / registros
+    if (str_igual(linea, "dmesg") || str_igual(linea, "log") || str_igual(linea, "registros")) {
+        ejecutar_comando_dmesg();
         return;
     }
 

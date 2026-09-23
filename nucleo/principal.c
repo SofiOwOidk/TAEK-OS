@@ -58,15 +58,29 @@ extern const uint8_t _binary_audio_arranque_bin_start[];
 extern const uint8_t _binary_audio_arranque_bin_end[];
 
 void principal(void) {
-    if (LIMINE_BASE_REVISION_SUPPORTED == 0) {
-        detener_cpu();
+    // 1. Inicializar Serial de inmediato para capturar cualquier mensaje de arranque
+    serial_iniciar();
+    serial_imprimir_linea("\n==============================================================");
+    serial_imprimir_linea("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Marcha    ");
+    serial_imprimir_linea("==============================================================");
+    serial_imprimir("[BOOT] Puerto Serial COM1 (0x3F8): ");
+    if (serial_esta_activo()) {
+        serial_imprimir_linea("Activo a 115200 8N1 [OK]");
+    } else {
+        serial_imprimir_linea("Modo RAM/dmesg (Sin UART físico o desactivado en BIOS)");
     }
 
-    serial_iniciar();
+    // 2. Validar protocolo Limine
+    if (LIMINE_BASE_REVISION_SUPPORTED == 0) {
+        serial_imprimir_linea("[ERROR CRÍTICO] La revisión base de Limine no está soportada por el bootloader.");
+        detener_cpu();
+    }
+    serial_imprimir_linea("[BOOT] Protocolo Limine Base Revision verificado [OK]");
+
     huevo_iniciar();
 
-    huevo_etapa("Telemetría por Puerto Serial COM1");
-    serial_imprimir("[115200 baudios, Puerto 0x3F8] ");
+    huevo_etapa("Telemetría por Puerto Serial COM1 y Registro dmesg");
+    serial_imprimir("[115200 baudios, Puerto 0x3F8 / Búfer RAM 64 KiB] ");
     huevo_etapa_ok();
 
     huevo_etapa("Recarga de Tabla GDT en 64 bits (Modo Largo)");
