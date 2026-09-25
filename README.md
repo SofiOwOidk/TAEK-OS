@@ -5,7 +5,7 @@
 [![Licencia: MIT](https://img.shields.io/badge/Licencia-MIT-yellow.svg)](LICENSE)
 [![Arquitectura](https://img.shields.io/badge/Arquitectura-x86__64%20UEFI-blue.svg)]()
 [![Lenguaje](https://img.shields.io/badge/Lenguaje-C%20%7C%20NASM-brightgreen.svg)]()
-[![Hardware](https://img.shields.io/badge/Silicio%20Real-Laptop%20i7--8650U%20%7C%20MoDT%20i9-orange.svg)]()
+[![Hardware](https://img.shields.io/badge/Silicio%20Real-Intel%208%C2%AA%20a%2014%C2%AA%20Gen-orange.svg)]()
 
 ---
 
@@ -21,6 +21,9 @@
 **TAEK OS** es un sistema operativo experimental moderno diseñado específicamente para la arquitectura **x86_64** sobre firmware **UEFI nativo** (sin depender del BIOS heredado de 16 bits). El núcleo opera completamente en modo privilegiado Anillo 0 (*Ring 0*), maximizando el control directo sobre el silicio y los buses de comunicación del procesador.
 
 El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel (USB 3.x xHCI, controladores de audio por DMA, telemetría de hardware) con una identidad satírica de cultura de internet y humor negro, manteniendo los estándares de seguridad de memoria mediante su guardián residente: **El Huevo de la Estabilidad**.
+
+> [!NOTE]
+> **Compatibilidad en Hardware Real:** Testeado y verificado en bare metal en procesadores Intel desde la **8ª Generación (Core i7-8650U)** hasta la **14ª Generación (Core i9-14900HX)**. En generaciones o arquitecturas más allá de la 14ª Generación se desconoce si funcionará.
 
 ---
 
