@@ -137,7 +137,7 @@ NV_STATUS nvidia_gpu_inicializar_completo(void) {
         serial_imprimir_linea("=== INICIALIZACIÓN GPU CANCELADA ===");
         serial_imprimir_linea("  [AVISO] Silicio NVIDIA ausente en bus PCIe.");
         serial_imprimir_linea("          Para arrancar la GPU física, grabe build/taek-os.iso en un pendrive");
-        serial_imprimir_linea("          y bootee en su equipo MoDT con Intel Core i9-14900HX + RTX 5070 Ti.");
+        serial_imprimir_linea("          y bootee en su equipo físico con GPU PCIe dedicada.");
         return NV_ERR_CARD_NOT_PRESENT;
     }
 

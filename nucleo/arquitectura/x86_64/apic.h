@@ -7,7 +7,7 @@
 
 // ============================================================================
 // TAEK OS - CONTROLADOR LOCAL APIC & ENRUTADOR DE INTERRUPCIONES (H16)
-// Soporte xAPIC (MMIO) y x2APIC (MSRs de alta velocidad para i9-14900HX)
+// Soporte xAPIC (MMIO) y x2APIC (MSRs de alta velocidad)
 // ============================================================================
 
 #define APIC_MMIO_VIRTUAL_BASE   0xFFFFFE0001000000ULL

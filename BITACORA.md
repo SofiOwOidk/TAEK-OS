@@ -1,7 +1,7 @@
 # Bitácora de Desarrollo e Historial de Cambios: TAEK OS
 > **Proyecto:** TAEK OS (TelAvivEpsteinKirkOS)  
 > **Arquitectura:** x86_64 UEFI Freestanding (Ring 0)  
-> **Procesador Objetivo:** Intel Core i9-14900HX Compatible (Usando en test el Intel Core i7-8650U) 
+> **Plataformas de Prueba:** Laptop x86_64 (Intel Core i7-8650U) y Desktop MoDT (Intel Core i9-14900HX Compatible) 
 > **Regla del Proyecto:** Toda modificación técnica debe quedar registrada con fecha, hora, archivos modificados, decisiones de diseño, errores encontrados y su solución para trazabilidad total.
 
 ---

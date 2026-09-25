@@ -881,14 +881,14 @@ static void ejecutar_comando_dmesg(void) {
 static void ejecutar_comando_guia(const char *arg) {
     (void)arg;
     consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("   GUÍA OFICIAL DE TESTEO DE GPU NVIDIA BLACKWELL EN HARDWARE REAL (MoDT)       ", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("   Objetivo: Intel Core i9-14900HX + NVIDIA GeForce RTX 5070 Ti (PCIe Gen 5)    ", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("   GUÍA OFICIAL DE TESTEO DE GPU DEDICADA EN HARDWARE REAL                      ", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("   Objetivo: Plataforma x86_64 + GPU PCIe Dedicada (Directo CPU)                 ", COLOR_PROMPT_DEFAULT);
     consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
     consola_imprimir_linea("");
 
     consola_imprimir_linea_color("[ PASO 1: VERIFICAR DETECCIÓN FÍSICA EN EL BUS PCIE ]", COLOR_EXITO_DEFAULT);
     consola_imprimir_linea_color("  Comando a ejecutar: lspci  o  pci gpu", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * En tu placa MoDT física con la RTX 5070 Ti debes ver:");
+    consola_imprimir_linea("  * En tu placa física con la GPU dedicada debes ver:");
     consola_imprimir_linea("    - Vendor ID: 0x10DE (NVIDIA Corporation)");
     consola_imprimir_linea("    - Device ID: 0x2F04 (GeForce RTX 5070 Ti Desktop)");
     consola_imprimir_linea("    - Clase    : 0x0300 (VGA Compatible Controller)");
@@ -948,7 +948,7 @@ static void ejecutar_comando_nvidia(const char *arg) {
             consola_imprimir_linea_color("  [AVISO] Silicio NVIDIA no detectado en bus PCIe.", COLOR_AVISO_DEFAULT);
             consola_imprimir_linea("  Estás ejecutando en un entorno virtual sin GPU física NVIDIA (ej. QEMU).");
             consola_imprimir_linea("  Para inicializar el silicio real, graba 'build/taek-os.iso' en un pendrive");
-            consola_imprimir_linea("  y bootea en tu equipo MoDT físico con Intel Core i9-14900HX + RTX 5070 Ti.");
+            consola_imprimir_linea("  y bootea en un equipo x86_64 físico con GPU PCIe dedicada.");
             return;
         }
 
@@ -1179,7 +1179,7 @@ static void ejecutar_comando_nvidia(const char *arg) {
 
     consola_imprimir("  Modo de Operación         : ");
     if (ndev->presente) {
-        consola_imprimir_linea_color("Hardware Real MoDT (PCIe Directo x16 a CPU i9-14900HX)", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color("Hardware Real (PCIe Directo x16 a CPU)", COLOR_EXITO_DEFAULT);
     } else {
         consola_imprimir_linea_color("Emulación QEMU (Silicio NVIDIA ausente en bus PCI)", COLOR_AVISO_DEFAULT);
     }
@@ -1244,7 +1244,7 @@ static void ejecutar_comando_apic(const char *arg) {
 
         consola_imprimir("  2. Modo de Operación del Controlador Local APIC... ");
         if (apic->es_x2apic) {
-            consola_imprimir_linea_color("[OK - x2APIC MSR NATIVO (i9-14900HX)]", COLOR_EXITO_DEFAULT);
+            consola_imprimir_linea_color("[OK - x2APIC MSR NATIVO]", COLOR_EXITO_DEFAULT);
         } else {
             consola_imprimir_linea_color("[OK - xAPIC MMIO SIN CACHÉ / PCD]", COLOR_EXITO_DEFAULT);
         }
@@ -1273,7 +1273,7 @@ static void ejecutar_comando_apic(const char *arg) {
     consola_imprimir_linea_color("================ CONTROLADOR LOCAL APIC & ENRUTADOR IRQ ================", COLOR_AVISO_DEFAULT);
     consola_imprimir("  Arquitectura Activa    : ");
     if (apic->es_x2apic) {
-        consola_imprimir_linea_color("x2APIC (Acceso Ultrarrápido MSR - Intel Core i9-14900HX)", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color("x2APIC (Acceso Ultrarrápido MSR)", COLOR_EXITO_DEFAULT);
     } else {
         consola_imprimir_linea_color("xAPIC Tradicional (Mapeo MMIO sin caché / PCD)", COLOR_USUARIO_DEFAULT);
     }
@@ -2246,7 +2246,7 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir("  Sistema Operativo : ");
         consola_imprimir_linea_color("TAEK OS v0.1 (TelAvivEpsteinKirkOS)", COLOR_USUARIO_DEFAULT);
         consola_imprimir("  Arquitectura      : ");
-        consola_imprimir_linea("x86_64 Long Mode (Intel Core i9-14900HX Ready)");
+        consola_imprimir_linea("x86_64 Long Mode (Intel Core / AMD64 Compatible)");
         consola_imprimir("  Hipervisor VMX    : ");
         if (vmx_esta_activo()) {
             consola_imprimir_linea_color("ACTIVO en Ring -1 (VMX Root Operation)", COLOR_EXITO_DEFAULT);

@@ -5,7 +5,7 @@
 [![Licencia: MIT](https://img.shields.io/badge/Licencia-MIT-yellow.svg)](LICENSE)
 [![Arquitectura](https://img.shields.io/badge/Arquitectura-x86__64%20UEFI-blue.svg)]()
 [![Lenguaje](https://img.shields.io/badge/Lenguaje-C%20%7C%20NASM-brightgreen.svg)]()
-[![Hardware](https://img.shields.io/badge/Silicio%20Real-Intel%20Core%20i9--14900HX-orange.svg)]()
+[![Hardware](https://img.shields.io/badge/Silicio%20Real-Laptop%20i7--8650U%20%7C%20MoDT%20i9-orange.svg)]()
 
 ---
 
@@ -29,7 +29,7 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 * Implementación completa del estándar **eXtensible Host Controller Interface (xHCI)** para puertos USB 2.0 y USB 3.x.
 * Inicialización de estructuras de datos físicas: *Device Context Base Address Array (DCBAA)*, *Command Ring*, *Event Ring* con *Interrupter* configurado.
 * Asignación dinámica de ranuras (*Slots*), configuración de puntos de enlace (*Endpoints*) de interrupción para dispositivos HID.
-* **Soporte Concurrente Multi-Teclado:** Capacidad de conectar y escribir simultáneamente con varios teclados en puertos distintos en tiempo real sobre hardware físico (probado en placas base MoDT con procesadores Intel Core de 14ª Generación).
+* **Soporte Concurrente Multi-Teclado:** Capacidad de conectar y escribir simultáneamente con varios teclados en puertos distintos en tiempo real sobre hardware físico (validado en laptop con Intel Core i7-8650U y probado también en plataformas de escritorio MoDT con procesador Intel Core i9-14900HX).
 
 ### 🔊 Subsistema de Audio Dual (Intel HDA & AC97)
 * Driver nativo para **Intel High Definition Audio (HDA)** con descubrimiento de codecs y enlace DMA cíclico (*Buffer Descriptor List*).

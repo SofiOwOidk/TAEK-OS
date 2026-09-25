@@ -172,7 +172,7 @@ void principal(void) {
     apic_iniciar();
     const struct estado_apic *eapic = apic_obtener_estado();
     serial_imprimir("[Modo: ");
-    serial_imprimir(eapic->es_x2apic ? "x2APIC MSR (i9-14900HX Nativo)" : "xAPIC MMIO");
+    serial_imprimir(eapic->es_x2apic ? "x2APIC MSR Nativo" : "xAPIC MMIO");
     serial_imprimir(" | ID: ");
     serial_imprimir_dec((uint64_t)eapic->id);
     serial_imprimir(" | PIC Legacy: Desactivado] ");
@@ -368,7 +368,7 @@ void principal(void) {
     serial_imprimir_linea("");
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Español   ");
-    serial_imprimir_linea("  Procesador: x86_64 (Listo para Intel Core i9-14900HX)       ");
+    serial_imprimir_linea("  Procesador: x86_64 (Intel Core / AMD64 Compatible)          ");
     serial_imprimir_linea("  ¡Hipervisor VMX y Guardián Don Cangrejo Armados!            ");
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("  [ OK ] Todas las etapas verificadas por El Huevo.           ");
