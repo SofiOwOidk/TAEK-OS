@@ -1611,5 +1611,64 @@
     - Lectura física de LBA 0 ejecutada por DMA a través de la terminal: Volcado hexadecimal exitoso y confirmación de firma `0x55AA`.
     - Teclado físico USB operativo simultáneamente.
 
+---
 
-
+### [2026-09-25 17:45] — Hito 49: Controlador de Sistema de Archivos FAT32 en Anillo 0 y Visualizador Jerárquico 'tree'
+* **Objetivo:** Implementar un controlador de sistema de archivos FAT32 completo en Ring 0 sobre el controlador USB Mass Storage (SCSI BOT) para recorrer jerárquicamente directorios y archivos de pendrives y discos externos con un comando visual estilo `tree` de Linux (`tree` / `arbol`), listador `ls` y visor de texto plano `cat`.
+* **Diseño Arquitectónico del Controlador FAT32:**
+  1. **Detección Automática de Volúmenes y Particiones (`fat32.c`):**
+     - Lectura de LBA 0 para verificar firma de arranque `0x55AA`.
+     - Soporte para formato Superfloppy (VBR en LBA 0 con cadena `"FAT32   "` en offset 82).
+     - Parser de tabla de particiones MBR: escaneo de las 4 entradas MBR y localización de particiones tipo `0x0B` / `0x0C` (FAT32) o primera partición válida.
+     - Extracción e interpretación del BIOS Parameter Block (BPB FAT32): `bytes_por_sector`, `sectores_por_cluster`, `sectores_reservados`, `num_fats`, `sectores_por_fat_32` y `cluster_raiz`.
+     - Cálculo de geometrías de datos: `lba_fat = lba_particion + sectores_reservados`, `lba_datos = lba_fat + (num_fats * sectores_por_fat)`.
+  2. **Navegación de Cadenas de Clusters en la Tabla FAT:**
+     - Función `fat32_siguiente_cluster()`: mapea cluster a sector de la tabla FAT, lee 512 bytes y extrae la entrada de 28 bits, detectando fin de cadena (EOC `>= 0x0FFFFFF8`) y clusters defectuosos.
+     - Función `fat32_cluster_a_lba()`: traduce cluster a LBA físico de datos.
+  3. **Decodificación de Nombres Largos (LFN):**
+     - Parser de entradas LFN (`0x0F`): acumulación de fragmentos UCS-2 de 13 caracteres por entrada LFN para reconstruir nombres largos completos en minúsculas y mayúsculas (hasta 255 caracteres).
+     - Fallback para nombres cortos clásicos 8.3 (`nombre.ext`).
+     - Descarte automático de entradas eliminadas (`0xE5`), vacías (`0x00`) y pseudodirectorios `.` y `..` para evitar bucles.
+  4. **Visualizador de Árbol Estilo `tree` (`fat32_ejecutar_tree`):**
+     - Recorrido en profundidad (DFS) de hasta 5 niveles con búferes estáticos en BSS sin riesgo de desbordamiento de pila.
+     - Renderizado de conectores de árbol: `├── `, `└── `, `│   `, `    `.
+     - Coloreado semántico:
+       * Directorios en azul/cian brillante `[DIR]`.
+       * Binarios ejecutables (`.efi`, `.bin`) en verde brillante.
+       * Archivos de texto y configuración (`.txt`, `.cfg`) en amarillo/blanco con su tamaño formateado (`B`, `KB`, `MB`).
+     - Conteo global de directorios, archivos y cálculo de bytes totales.
+  5. **Comandos de Terminal Adicionales:**
+     - `tree` / `arbol` / `disco tree` / `usb tree`: Genera el árbol jerárquico completo del pendrive.
+     - `ls` / `dir` / `disco ls`: Lista los contenidos del directorio raíz en formato tabla.
+     - `cat <archivo>` / `leer <archivo>`: Lee el archivo especificado del pendrive navegando sus clusters e imprime su contenido de texto plano en pantalla.
+     - Autoprueba en el arranque: Si hay un pendrive conectado al encender el sistema o iniciar QEMU, se monta automáticamente la partición FAT32 y se despliega el árbol de archivos.
+* **Archivos Creados y Modificados:**
+  * `nucleo/controladores/fat32.h` [NUEVO]: Definición del BPB FAT32, entradas de directorio 8.3, entradas LFN y API pública.
+  * `nucleo/controladores/fat32.c` [NUEVO]: Montaje, navegación FAT, parser LFN, visualizador `tree`, listador `ls` y lector `cat`.
+  * `nucleo/controladores/terminal.c`: Comandos `tree`, `arbol`, `ls`, `dir`, `cat` y autoprueba de arranque.
+  * `Makefile`: Inclusión de `fat32.o` en la regla de compilación del núcleo.
+  * `run.ps1`: Generación de disco USB virtual de prueba formateado en FAT32 con árbol de carpetas poblado (`/boot/efi/bootx64.efi`, `/documentos/notas.txt`, `/leeme.txt`, etc.).
+* **Pruebas y Verificación:**
+  * Compilación en WSL: `make` exitoso (**0 errores, 0 advertencias**).
+  * Ejecución en QEMU con USB virtual FAT32:
+    - Volumen `'TAEK_USB'` montado en Cluster Raíz 2.
+    - Árbol renderizado en pantalla con 4 directorios y 5 archivos:
+      ```text
+      .
+      ├── boot/
+      │   ├── efi/
+      │   │   └── bootx64.efi  (23 B)
+      │   └── limine.cfg  (33 B)
+      ├── documentos/
+      │   ├── notas.txt  (37 B)
+      │   └── clave_nuclear.txt  (38 B)
+      ├── musica/
+      └── leeme.txt  (96 B)
+      ----------------------------------------------------------------------
+      Resumen: 4 directorios, 5 archivos (Total: 227 B)
+      ```
+* **Artefactos y Compilación:**
+  * Compilación en WSL: `make build/taek-os.iso` exitoso (**0 errores, 0 advertencias**).
+  * Imagen canónica: `build/taek-os.iso` (56,815,616 bytes).
+  * Imagen fechada: `build/taek-os-2026-09-25_18-24-57.iso` (56,815,616 bytes).
+  * Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).

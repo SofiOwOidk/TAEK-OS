@@ -49,13 +49,8 @@ $argsQemu = @(
 if ($UsbDisk) {
     $usbImg = "$directorioActual\build\disco_usb_prueba.img"
     if (-not (Test-Path $usbImg)) {
-        Write-Host "  [+] Creando disco USB virtual de prueba (64 MB con firma MBR 0x55AA)..." -ForegroundColor Cyan
-        $fs = [System.IO.File]::Create($usbImg)
-        $fs.SetLength(64 * 1024 * 1024)
-        $fs.Seek(510, [System.IO.SeekOrigin]::Begin) | Out-Null
-        $fs.WriteByte(0x55)
-        $fs.WriteByte(0xAA)
-        $fs.Close()
+        Write-Host "  [+] Creando disco USB virtual FAT32 con árbol de carpetas de prueba..." -ForegroundColor Cyan
+        wsl bash -c "dd if=/dev/zero of=build/disco_usb_prueba.img bs=1M count=64 status=none && mformat -i build/disco_usb_prueba.img -F -v 'TAEK_USB' :: && mmd -i build/disco_usb_prueba.img ::/boot && mmd -i build/disco_usb_prueba.img ::/boot/efi && mmd -i build/disco_usb_prueba.img ::/documentos && mmd -i build/disco_usb_prueba.img ::/musica && echo 'Hola desde TAEK OS! Archivo leido de un pendrive USB en FAT32.' > build/leeme.txt && echo 'Super secreto: El Huevo es inmortal.' > build/notas.txt && mcopy -i build/disco_usb_prueba.img build/leeme.txt ::/leeme.txt && mcopy -i build/disco_usb_prueba.img build/notas.txt ::/documentos/notas.txt"
     }
     $argsQemu += @(
         "-drive", "if=none,id=usbstick,format=raw,file=$usbImg",

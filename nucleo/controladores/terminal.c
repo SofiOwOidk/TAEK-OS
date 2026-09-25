@@ -21,6 +21,7 @@
 #include "iommu.h"
 #include "xhci.h"
 #include "usb_msc.h"
+#include "fat32.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -1937,9 +1938,46 @@ static void ejecutar_lectura_usb_msc(uint8_t unidad, uint32_t lba) {
 static void ejecutar_comando_disco(const char *arg) {
     if (arg) arg = str_saltar_espacios(arg);
 
+    if (arg && (str_igual(arg, "tree") || str_igual(arg, "arbol") || str_comienza_con(arg, "tree ") || str_comienza_con(arg, "arbol "))) {
+        const char *sub = NULL;
+        if (str_comienza_con(arg, "tree ")) sub = str_saltar_espacios(arg + 5);
+        else if (str_comienza_con(arg, "arbol ")) sub = str_saltar_espacios(arg + 6);
+        fat32_ejecutar_tree(sub);
+        return;
+    }
+
+    if (arg && (str_igual(arg, "ls") || str_igual(arg, "dir") || str_comienza_con(arg, "ls ") || str_comienza_con(arg, "dir "))) {
+        const char *sub = NULL;
+        if (str_comienza_con(arg, "ls ")) sub = str_saltar_espacios(arg + 3);
+        else if (str_comienza_con(arg, "dir ")) sub = str_saltar_espacios(arg + 4);
+        fat32_listar_directorio(sub);
+        return;
+    }
+
+    if (arg && (str_comienza_con(arg, "cat ") || str_comienza_con(arg, "ver "))) {
+        const char *archivo = str_saltar_espacios(arg + (str_comienza_con(arg, "cat ") ? 4 : 4));
+        fat32_leer_archivo_texto(archivo);
+        return;
+    }
+
     if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
         const char *p_lba = arg + 4;
         p_lba = str_saltar_espacios(p_lba);
+
+        // Si es un nombre de archivo (letras no hex o contiene punto)
+        int es_archivo = 0;
+        for (int k = 0; p_lba[k]; k++) {
+            char c = p_lba[k];
+            if (c == '.' || (c >= 'g' && c <= 'z') || (c >= 'G' && c <= 'Z')) {
+                es_archivo = 1;
+                break;
+            }
+        }
+        if (es_archivo) {
+            fat32_leer_archivo_texto(p_lba);
+            return;
+        }
+
         uint32_t lba = 0;
         if (*p_lba != '\0') {
             if (p_lba[0] == '0' && (p_lba[1] == 'x' || p_lba[1] == 'X')) {
@@ -2054,6 +2092,24 @@ static void ejecutar_comando_usb(const char *arg) {
     // Subcomando: usb discos / usb storage / usb msc
     if (arg && (str_igual(arg, "disco") || str_igual(arg, "discos") || str_igual(arg, "storage") || str_igual(arg, "msc"))) {
         ejecutar_comando_disco(NULL);
+        return;
+    }
+
+    // Subcomando: usb tree / usb arbol
+    if (arg && (str_igual(arg, "tree") || str_igual(arg, "arbol") || str_comienza_con(arg, "tree ") || str_comienza_con(arg, "arbol "))) {
+        const char *sub = NULL;
+        if (str_comienza_con(arg, "tree ")) sub = str_saltar_espacios(arg + 5);
+        else if (str_comienza_con(arg, "arbol ")) sub = str_saltar_espacios(arg + 6);
+        fat32_ejecutar_tree(sub);
+        return;
+    }
+
+    // Subcomando: usb ls / usb dir
+    if (arg && (str_igual(arg, "ls") || str_igual(arg, "dir") || str_comienza_con(arg, "ls ") || str_comienza_con(arg, "dir "))) {
+        const char *sub = NULL;
+        if (str_comienza_con(arg, "ls ")) sub = str_saltar_espacios(arg + 3);
+        else if (str_comienza_con(arg, "dir ")) sub = str_saltar_espacios(arg + 4);
+        fat32_listar_directorio(sub);
         return;
     }
 
@@ -2303,6 +2359,12 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea_color(": Inspección USB y lectura física ('usb leer <lba>', 'usb monitor', 'usb reset <p>').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  disco          ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Almacenamiento USB Mass Storage y lectura SCSI ('disco leer <lba>').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  tree / arbol   ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Despliega el árbol visual de directorios y archivos FAT32 del pendrive.", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  ls / dir       ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Lista los archivos y carpetas del sistema de archivos FAT32.");
+        consola_imprimir_color("  cat <archivo>  ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Imprime el contenido de un archivo de texto del pendrive.");
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
@@ -2728,6 +2790,34 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: tree / arbol
+    if (str_comienza_con(linea, "tree") || str_comienza_con(linea, "arbol")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "tree ")) arg = str_saltar_espacios(linea + 5);
+        else if (str_comienza_con(linea, "arbol ")) arg = str_saltar_espacios(linea + 6);
+        fat32_ejecutar_tree(arg);
+        return;
+    }
+
+    // COMANDO: ls / dir
+    if (str_comienza_con(linea, "ls") || str_comienza_con(linea, "dir")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "ls ")) arg = str_saltar_espacios(linea + 3);
+        else if (str_comienza_con(linea, "dir ")) arg = str_saltar_espacios(linea + 4);
+        fat32_listar_directorio(arg);
+        return;
+    }
+
+    // COMANDO: cat <archivo> / leer <archivo>
+    if (str_comienza_con(linea, "cat ") || str_comienza_con(linea, "leer ") || str_comienza_con(linea, "ver ")) {
+        const char *archivo = NULL;
+        if (str_comienza_con(linea, "cat ")) archivo = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "leer ")) archivo = str_saltar_espacios(linea + 5);
+        else if (str_comienza_con(linea, "ver ")) archivo = str_saltar_espacios(linea + 4);
+        fat32_leer_archivo_texto(archivo);
+        return;
+    }
+
     // COMANDO: apagar
     if (str_igual(linea, "apagar") || str_igual(linea, "poweroff") || str_igual(linea, "shutdown")) {
         consola_imprimir_linea_color("==> Apagando equipo vía ACPI...", COLOR_AVISO_DEFAULT);
@@ -2772,11 +2862,15 @@ void terminal_ejecutar(void) {
     ejecutar_autodiagnostico_teclado();
     consola_imprimir_linea("");
 
-    // 3. Si hay almacenamiento USB detectado, autoprueba de lectura de Sector 0 (MBR)
+    // 3. Si hay almacenamiento USB detectado, autoprueba de lectura de Sector 0 (MBR) y árbol FAT32
     if (usb_msc_obtener_cantidad() > 0) {
         consola_imprimir_linea_color("==> [ ALMACENAMIENTO USB DETECTADO ] Verificando Sector 0 (MBR)...", COLOR_EXITO_DEFAULT);
         ejecutar_lectura_usb_msc(0, 0);
         consola_imprimir_linea("");
+        if (fat32_montar(0) == 0) {
+            fat32_ejecutar_tree(NULL);
+            consola_imprimir_linea("");
+        }
     }
 
     char buffer[256];

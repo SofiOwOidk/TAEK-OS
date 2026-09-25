@@ -51,6 +51,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/video/nvidia/gsp/gsp_rpc.c \
             nucleo/controladores/xhci.c \
             nucleo/controladores/usb_msc.c \
+            nucleo/controladores/fat32.c \
             nucleo/controladores/terminal.c
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
