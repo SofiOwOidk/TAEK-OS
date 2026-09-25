@@ -22,6 +22,9 @@
 #include "xhci.h"
 #include "usb_msc.h"
 #include "fat32.h"
+#include "exfat.h"
+#include "ntfs.h"
+#include "vfs.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -171,6 +174,7 @@ static void imprimir_prompt(void) {
 void terminal_iniciar(void) {
     teclado_iniciar();
     consola_iniciar();
+    vfs_iniciar();
     consola_limpiar();
     imprimir_banner();
 }
@@ -1942,7 +1946,7 @@ static void ejecutar_comando_disco(const char *arg) {
         const char *sub = NULL;
         if (str_comienza_con(arg, "tree ")) sub = str_saltar_espacios(arg + 5);
         else if (str_comienza_con(arg, "arbol ")) sub = str_saltar_espacios(arg + 6);
-        fat32_ejecutar_tree(sub);
+        vfs_ejecutar_tree(sub);
         return;
     }
 
@@ -1950,13 +1954,13 @@ static void ejecutar_comando_disco(const char *arg) {
         const char *sub = NULL;
         if (str_comienza_con(arg, "ls ")) sub = str_saltar_espacios(arg + 3);
         else if (str_comienza_con(arg, "dir ")) sub = str_saltar_espacios(arg + 4);
-        fat32_listar_directorio(sub);
+        vfs_listar_directorio(sub);
         return;
     }
 
     if (arg && (str_comienza_con(arg, "cat ") || str_comienza_con(arg, "ver "))) {
         const char *archivo = str_saltar_espacios(arg + (str_comienza_con(arg, "cat ") ? 4 : 4));
-        fat32_leer_archivo_texto(archivo);
+        vfs_leer_archivo_texto(archivo);
         return;
     }
 
@@ -1974,7 +1978,7 @@ static void ejecutar_comando_disco(const char *arg) {
             }
         }
         if (es_archivo) {
-            fat32_leer_archivo_texto(p_lba);
+            vfs_leer_archivo_texto(p_lba);
             return;
         }
 
@@ -2100,7 +2104,7 @@ static void ejecutar_comando_usb(const char *arg) {
         const char *sub = NULL;
         if (str_comienza_con(arg, "tree ")) sub = str_saltar_espacios(arg + 5);
         else if (str_comienza_con(arg, "arbol ")) sub = str_saltar_espacios(arg + 6);
-        fat32_ejecutar_tree(sub);
+        vfs_ejecutar_tree(sub);
         return;
     }
 
@@ -2109,7 +2113,7 @@ static void ejecutar_comando_usb(const char *arg) {
         const char *sub = NULL;
         if (str_comienza_con(arg, "ls ")) sub = str_saltar_espacios(arg + 3);
         else if (str_comienza_con(arg, "dir ")) sub = str_saltar_espacios(arg + 4);
-        fat32_listar_directorio(sub);
+        vfs_listar_directorio(sub);
         return;
     }
 
@@ -2360,9 +2364,9 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  disco          ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Almacenamiento USB Mass Storage y lectura SCSI ('disco leer <lba>').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  tree / arbol   ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Despliega el árbol visual de directorios y archivos FAT32 del pendrive.", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Despliega el árbol visual de directorios y archivos (FAT32, exFAT, NTFS).", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  ls / dir       ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Lista los archivos y carpetas del sistema de archivos FAT32.");
+        consola_imprimir_linea(": Lista los archivos y carpetas del sistema de archivos detectado.");
         consola_imprimir_color("  cat <archivo>  ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Imprime el contenido de un archivo de texto del pendrive.");
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
@@ -2795,7 +2799,7 @@ static void procesar_comando(const char *linea_cruda) {
         const char *arg = NULL;
         if (str_comienza_con(linea, "tree ")) arg = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "arbol ")) arg = str_saltar_espacios(linea + 6);
-        fat32_ejecutar_tree(arg);
+        vfs_ejecutar_tree(arg);
         return;
     }
 
@@ -2804,7 +2808,7 @@ static void procesar_comando(const char *linea_cruda) {
         const char *arg = NULL;
         if (str_comienza_con(linea, "ls ")) arg = str_saltar_espacios(linea + 3);
         else if (str_comienza_con(linea, "dir ")) arg = str_saltar_espacios(linea + 4);
-        fat32_listar_directorio(arg);
+        vfs_listar_directorio(arg);
         return;
     }
 
@@ -2814,7 +2818,7 @@ static void procesar_comando(const char *linea_cruda) {
         if (str_comienza_con(linea, "cat ")) archivo = str_saltar_espacios(linea + 4);
         else if (str_comienza_con(linea, "leer ")) archivo = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "ver ")) archivo = str_saltar_espacios(linea + 4);
-        fat32_leer_archivo_texto(archivo);
+        vfs_leer_archivo_texto(archivo);
         return;
     }
 
@@ -2862,13 +2866,17 @@ void terminal_ejecutar(void) {
     ejecutar_autodiagnostico_teclado();
     consola_imprimir_linea("");
 
-    // 3. Si hay almacenamiento USB detectado, autoprueba de lectura de Sector 0 (MBR) y árbol FAT32
+    // 3. Si hay almacenamiento USB detectado, autoprueba de lectura de Sector 0 (MBR) y árbol VFS (FAT32/exFAT/NTFS)
     if (usb_msc_obtener_cantidad() > 0) {
         consola_imprimir_linea_color("==> [ ALMACENAMIENTO USB DETECTADO ] Verificando Sector 0 (MBR)...", COLOR_EXITO_DEFAULT);
         ejecutar_lectura_usb_msc(0, 0);
         consola_imprimir_linea("");
-        if (fat32_montar(0) == 0) {
-            fat32_ejecutar_tree(NULL);
+        if (vfs_montar(0) == 0) {
+            consola_imprimir_color("==> [ VFS ] Sistema de archivos detectado y montado: ", COLOR_EXITO_DEFAULT);
+            consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+            vfs_ejecutar_tree(NULL);
+            consola_imprimir_linea("");
+            vfs_leer_archivo_texto("leeme.txt");
             consola_imprimir_linea("");
         }
     }

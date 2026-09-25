@@ -1,5 +1,6 @@
 param(
     [switch]$UsbDisk = $true,
+    [ValidateSet("ntfs", "fat32", "exfat")][string]$Fs = "ntfs",
     [switch]$TraceXhci = $false
 )
 
@@ -47,10 +48,24 @@ $argsQemu = @(
 )
 
 if ($UsbDisk) {
-    $usbImg = "$directorioActual\build\disco_usb_prueba.img"
-    if (-not (Test-Path $usbImg)) {
-        Write-Host "  [+] Creando disco USB virtual FAT32 con árbol de carpetas de prueba..." -ForegroundColor Cyan
-        wsl bash -c "dd if=/dev/zero of=build/disco_usb_prueba.img bs=1M count=64 status=none && mformat -i build/disco_usb_prueba.img -F -v 'TAEK_USB' :: && mmd -i build/disco_usb_prueba.img ::/boot && mmd -i build/disco_usb_prueba.img ::/boot/efi && mmd -i build/disco_usb_prueba.img ::/documentos && mmd -i build/disco_usb_prueba.img ::/musica && echo 'Hola desde TAEK OS! Archivo leido de un pendrive USB en FAT32.' > build/leeme.txt && echo 'Super secreto: El Huevo es inmortal.' > build/notas.txt && mcopy -i build/disco_usb_prueba.img build/leeme.txt ::/leeme.txt && mcopy -i build/disco_usb_prueba.img build/notas.txt ::/documentos/notas.txt"
+    if ($Fs -eq "ntfs") {
+        $usbImg = "$directorioActual\build\disco_usb_ntfs.img"
+        if (-not (Test-Path $usbImg)) {
+            Write-Host "  [+] Creando disco USB virtual NTFS con archivos de prueba..." -ForegroundColor Cyan
+            wsl bash -c "dd if=/dev/zero of=build/disco_usb_ntfs.img bs=1M count=64 status=none && mkfs.ntfs -F -L 'TAEK_NTFS' -q build/disco_usb_ntfs.img && echo 'Hola desde un pendrive NTFS en Anillo 0 de TAEK OS!' > build/leeme_ntfs.txt && echo 'Super secreto: El Huevo es inmortal en NTFS.' > build/notas_ntfs.txt && ntfscp -f build/disco_usb_ntfs.img build/leeme_ntfs.txt leeme.txt && ntfscp -f build/disco_usb_ntfs.img build/notas_ntfs.txt notas.txt"
+        }
+    } elseif ($Fs -eq "exfat") {
+        $usbImg = "$directorioActual\build\disco_usb_exfat.img"
+        if (-not (Test-Path $usbImg)) {
+            Write-Host "  [+] Creando disco USB virtual exFAT..." -ForegroundColor Cyan
+            wsl bash -c "dd if=/dev/zero of=build/disco_usb_exfat.img bs=1M count=64 status=none && mkfs.exfat -L 'TAEK_EXFAT' build/disco_usb_exfat.img"
+        }
+    } else {
+        $usbImg = "$directorioActual\build\disco_usb_prueba.img"
+        if (-not (Test-Path $usbImg)) {
+            Write-Host "  [+] Creando disco USB virtual FAT32 con árbol de carpetas de prueba..." -ForegroundColor Cyan
+            wsl bash -c "dd if=/dev/zero of=build/disco_usb_prueba.img bs=1M count=64 status=none && mformat -i build/disco_usb_prueba.img -F -v 'TAEK_USB' :: && mmd -i build/disco_usb_prueba.img ::/boot && mmd -i build/disco_usb_prueba.img ::/boot/efi && mmd -i build/disco_usb_prueba.img ::/documentos && mmd -i build/disco_usb_prueba.img ::/musica && echo 'Hola desde TAEK OS! Archivo leido de un pendrive USB en FAT32.' > build/leeme.txt && echo 'Super secreto: El Huevo es inmortal.' > build/notas.txt && mcopy -i build/disco_usb_prueba.img build/leeme.txt ::/leeme.txt && mcopy -i build/disco_usb_prueba.img build/notas.txt ::/documentos/notas.txt"
+        }
     }
     $argsQemu += @(
         "-drive", "if=none,id=usbstick,format=raw,file=$usbImg",

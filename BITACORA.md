@@ -1672,3 +1672,55 @@
   * Imagen canónica: `build/taek-os.iso` (56,815,616 bytes).
   * Imagen fechada: `build/taek-os-2026-09-25_18-24-57.iso` (56,815,616 bytes).
   * Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
+
+---
+
+### [2026-09-25 18:51] — Hito 50: Soporte Multiformato de Almacenamiento (NTFS, exFAT y FAT32) y Capa VFS Unificada en Anillo 0
+* **Objetivo:** Dotar a TAEK OS de lectura nativa de solo lectura para pendrives y discos externos formateados en NTFS (propietario de Microsoft) y exFAT, integrándolos junto con FAT32 bajo una capa de abstracción de sistema de archivos virtual (VFS) que detecte automáticamente el formato y permita explorar estructuras con `tree`, listar con `ls` y leer archivos con `cat` sin importar el formato del pendrive.
+* **Diseño Arquitectónico del Subsistema VFS y Controladores:**
+  1. **Controlador NTFS de Solo Lectura (`ntfs.h` y `ntfs.c`):**
+     - Parser del VBR NTFS: Validación de la firma OEM `"NTFS    "`, cálculo de sectores por cluster, total de sectores del volumen, LCN de inicio de `$MFT` y tamaño de registro MFT (1024 bytes).
+     - Lectura y Fixups de MFT: Carga de registros de 1024 bytes por DMA y aplicación del arreglo de actualización (USA - *Update Sequence Array*) para verificación de integridad de sectores de 512 bytes.
+     - Decodificación de Atributos MFT:
+       * `$FILE_NAME` (`0x30`): Identificación del registro padre (5 para raíz `/`), atributos de archivo/directorio y conversión de cadenas UTF-16LE a ASCII.
+       * `$DATA` (`0x80`): Soporte dual para datos residentes (contenidos dentro del registro MFT para archivos ligeros) y datos no residentes con descompresión de Data Runs (cadenas de clusters variables en disco).
+       * Filtro automático de metadatos del sistema NTFS (`$MFT`, `$LogFile`, `$Volume`, etc.).
+  2. **Controlador exFAT de Solo Lectura (`exfat.h` y `exfat.c`):**
+     - Parser del VBR exFAT: Verificación de `"EXFAT   "`, cálculo de potencias de 2 ($2^{\text{shift}}$) para tamaños de sector y cluster, desplazamiento de la tabla FAT, heap de clusters y cluster raíz.
+     - Parser de Entradas de Directorio de 32 bytes:
+       * Entrada de archivo (`0x85`): Atributos y tipo de elemento.
+       * Entrada de flujo (`0xC0`): Bandera `NoFatChain` (clusters contiguos de alto rendimiento) vs cadenas FAT clásicas, tamaño real en bytes y cluster de inicio.
+       * Entradas de nombre (`0xC1`): Fragmentos de 15 caracteres UTF-16LE concatenados para reconstruir nombres largos de hasta 255 caracteres.
+  3. **Capa VFS (Virtual File System) (`vfs.h` y `vfs.c`):**
+     - Detección en silicio: Analiza el sector de arranque VBR del medio USB físico (formato Superfloppy o particiones MBR tipo `0x07`, `0x0B`, `0x0C`).
+     - Despachador polimórfico: Enruta llamadas de `vfs_montar()`, `vfs_ejecutar_tree()`, `vfs_listar_directorio()` y `vfs_leer_archivo_texto()` hacia el controlador correspondiente (`ntfs_*`, `exfat_*` o `fat32_*`).
+  4. **Integración en Terminal de Anillo 0 (`terminal.c`):**
+     - Comandos `tree`, `arbol`, `ls`, `dir`, `cat`, `leer` enlazados al VFS.
+     - Autoprueba en el arranque de la terminal: Detecta y monta dinámicamente pendrives NTFS, exFAT o FAT32, desplegando el árbol jerárquico y verificando lectura de texto por DMA.
+  5. **Soporte en Entorno de Pruebas (`run.ps1`):**
+     - Parámetro `-Fs <ntfs|fat32|exfat>` para crear automáticamente discos USB virtuales formateados con `mkfs.ntfs`, `mkfs.exfat` o `mformat` con árboles y archivos de prueba.
+* **Archivos Creados y Modificados:**
+  * `nucleo/controladores/exfat.h` [NUEVO]: Cabecera y estructuras VBR y entradas de directorio exFAT.
+  * `nucleo/controladores/exfat.c` [NUEVO]: Montaje, navegación FAT, recorrido de árbol y lectura de archivos exFAT.
+  * `nucleo/controladores/ntfs.h` [NUEVO]: Cabecera y estructuras VBR, registros MFT y atributos `$FILE_NAME`/`$DATA`.
+  * `nucleo/controladores/ntfs.c` [NUEVO]: Montaje, fixups USA, escaneo de catálogo MFT, visualizador `tree` y lector `cat` NTFS.
+  * `nucleo/controladores/vfs.h` [NUEVO]: Interfaz de abstracción de sistema de archivos virtual.
+  * `nucleo/controladores/vfs.c` [NUEVO]: Selector dinámico de controladores multiformato.
+  * `nucleo/controladores/terminal.c`: Enrutamiento de comandos hacia el VFS y autodiagnóstico multiformato en arranque.
+  * `Makefile`: Inclusión de `exfat.o`, `ntfs.o` y `vfs.o` en la regla de enlazado del núcleo.
+  * `run.ps1`: Soporte para parametrizar el sistema de archivos de prueba (`-Fs ntfs`, `-Fs fat32`, `-Fs exfat`).
+* **Pruebas y Verificación:**
+  * Compilación en WSL: `make` exitoso (**0 errores, 0 advertencias**).
+  * Prueba QEMU con Disco USB Virtual NTFS (64 MB):
+    - Detección automática exitosa: `==> [ VFS ] Sistema de archivos detectado y montado: NTFS`.
+    - Lectura de LCN $MFT 4 e indexación de archivos.
+    - Árbol jerárquico desplegado: `leeme.txt` (52 B) y `notas.txt` (56 B).
+    - Lectura de archivo por DMA con `cat`: Contenido verificado intacto: `"Hola desde un pendrive NTFS en Anillo 0 de TAEK OS!"`.
+  * Prueba QEMU con Disco USB Virtual FAT32 (64 MB):
+    - Detección automática exitosa: `==> [ VFS ] Sistema de archivos detectado y montado: FAT32`.
+    - Árbol jerárquico desplegado con 4 directorios y 5 archivos.
+    - Lectura de archivo por DMA con `cat`: Contenido verificado intacto.
+* **Artefactos y Compilación:**
+  * Imagen principal: `build/taek-os.iso` (56,977,408 bytes).
+  * Imagen fechada: `build/taek-os-2026-09-25_18-51-00.iso` (56,977,408 bytes).
+  * Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
