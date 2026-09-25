@@ -1571,4 +1571,45 @@
   * Imagen fechada: `build/taek-os-2026-09-25_13-57-12.iso` (56,717,312 bytes).
   * Disco UEFI particionado: `build/taek-os.img` (134,217,728 bytes).
 
+---
+
+### [2026-09-25 16:50] — Hito 48: Controlador USB Mass Storage (MSC) en Anillo 0 — Bulk-Only Transport (BOT) y Comandos SCSI (INQUIRY, CAPACITY, READ 10)
+* **Objetivo:** Dotar a TAEK OS de la capacidad nativa en Anillo 0 para detectar memorias USB (pendrives y discos externos) conectados al bus USB xHCI, consultar su telemetría SCSI e inspeccionar sectores físicos LBA (MBR/GPT) directamente desde la terminal interactiva.
+* **Diseño Arquitectónico y Protocolo Bulk-Only Transport (BOT):**
+  1. **Detección y Clasificación USB (`xhci.c`):**
+     - El parser de descriptores reconoce interfaces con Clase `0x08` (Mass Storage), Subclase `0x06` (SCSI Transparent Command Set) y Protocolo `0x50` (Bulk-Only Transport).
+     - Identifica y extrae endpoints Bulk IN (dirección bit 7 activo) y Bulk OUT (dirección bit 7 inactivo).
+     - En el comando xHCI `Configure Endpoint`, habilita los endpoints con Endpoint Type 2 (Bulk OUT) y Endpoint Type 6 (Bulk IN), `Interval = 0` y `Max ESIT Payload = 0`.
+  2. **Motor de Transacciones SCSI BOT (`usb_msc.c`):**
+     - Máquina de estados de 3 fases conforme al estándar USB Mass Storage Class Bulk-Only Transport (USB-IF):
+       * **Fase 1 (CBW):** Envío de estructura de 31 bytes (`struct usb_msc_cbw`) con firma `"USBC"` (`0x43425355`), etiqueta incremental única, longitud de datos esperada, dirección (`0x80` IN / `0x00` OUT) y bloque de comando SCSI (CDB de hasta 16 bytes) vía Bulk OUT.
+       * **Fase 2 (Data):** Transferencia bidireccional a través de un búfer DMA físico contiguo de 64 KiB (`dma_asignar_bufer_contiguo`) con alineación de 64 bytes.
+       * **Fase 3 (CSW):** Recepción de estructura de 13 bytes (`struct usb_msc_csw`) vía Bulk IN con firma `"USBS"` (`0x53425355`), comprobación de coincidencia de etiqueta y verificación del código de estado (0 = Éxito, 1 = Fallo, 2 = Error de fase).
+  3. **Comandos SCSI Implementados:**
+     - `TEST_UNIT_READY` (`0x00`): Verifica que el medio de almacenamiento esté listo para operaciones de lectura/escritura (con hasta 10 reintentos de estabilización).
+     - `INQUIRY` (`0x12`): Lectura de 36 bytes de telemetría de silicio; decodificación limpia de Fabricante (8 chars), Producto/Modelo (16 chars) y Revisión de firmware (4 chars).
+     - `READ_CAPACITY_10` (`0x25`): Obtención de la cantidad total de bloques LBA y tamaño de sector físico (usualmente 512 bytes), calculando la capacidad total en MB y GB.
+     - `READ_10` (`0x28`): Lectura arbitraria de sectores físicos LBA por DMA hacia la memoria del kernel.
+  4. **Comandos Interactivos de Terminal (`terminal.c`):**
+     - `usb` y `disco`: Reporte integral de puertos USB xHCI, controladores conectados y tabla de unidades de almacenamiento (Fabricante, Modelo, Capacidad en GB/MB, Geometría LBA y ranura xHCI asignada).
+     - `usb leer <lba>` / `disco leer <lba>`: Lee el sector físico indicado y renderiza un volcado hexadecimal y ASCII completo de 512 bytes (16 bytes por fila).
+     - Detección automática en LBA 0 de la firma de arranque MBR `0x55AA` en offset 510-511 y decodificación de la tabla de particiones MBR (tipos FAT32, NTFS/exFAT, Linux Native, Protective GPT).
+  5. **Concurrencia con Teclados USB:**
+     - La transferencia de paquetes Bulk y los ciclos de timbre xHCI operan de manera totalmente independiente a los endpoints de interrupción del teclado, permitiendo escribir en la terminal mientras se leen sectores del disco.
+* **Archivos Creados y Modificados:**
+  * `nucleo/controladores/usb_msc.h` [NUEVO]: Constantes oficiales BOT/SCSI, estructuras CBW/CSW empacadas y API pública.
+  * `nucleo/controladores/usb_msc.c` [NUEVO]: Transacciones BOT de 3 fases, inicialización SCSI y lectura LBA por DMA.
+  * `nucleo/controladores/xhci.h`: Declaración de `xhci_transferencia_bulk()`.
+  * `nucleo/controladores/xhci.c`: Registro de endpoints Bulk IN/OUT, despacho de transferencias normales con timbre, y enlace con `usb_msc_registrar_dispositivo()`.
+  * `nucleo/controladores/terminal.c`: Comandos `disco` y `usb leer <lba>`, volcado hexadecimal de sectores e inspección MBR.
+  * `Makefile`: Inclusión de `usb_msc.o` en la regla de compilación del kernel.
+  * `run.ps1`: Parámetro `-UsbDisk` que genera un disco USB virtual de 64 MB con firma MBR y lo conecta a QEMU vía `usb-storage`.
+* **Pruebas y Verificación:**
+  * Compilación limpia con Clang 19 y LLD en WSL (`make`) con **cero advertencias y cero errores**.
+  * Ejecución en QEMU UEFI con xHCI + teclado USB + disco USB virtual de 64 MB:
+    - Inicialización de SCSI BOT confirmada: Fabricante `'QEMU'`, Modelo `'QEMU HARDDISK'`, Capacidad `64 MB (131072 sectores)`.
+    - Lectura física de LBA 0 ejecutada por DMA a través de la terminal: Volcado hexadecimal exitoso y confirmación de firma `0x55AA`.
+    - Teclado físico USB operativo simultáneamente.
+
+
 

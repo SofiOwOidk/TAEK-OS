@@ -106,6 +106,9 @@ int  xhci_escanear_cambios_puertos(int verbose);
 // Fuerza un ciclo de reset oficial en un puerto específico y reconfigura
 int  xhci_forzar_reset_puerto(uint8_t puerto);
 
+// Ejecuta una transferencia Bulk síncrona en un endpoint de datos (IN o OUT)
+int  xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms);
+
 // Despliega un volcado de diagnóstico forense de los registros y anillos xHCI
 void xhci_imprimir_diagnostico_completo(void);
 

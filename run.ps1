@@ -1,4 +1,5 @@
 param(
+    [switch]$UsbDisk = $true,
     [switch]$TraceXhci = $false
 )
 
@@ -27,7 +28,7 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "==> Lanzando TAEK OS en QEMU UEFI con xHCI, Teclado USB Virtual y Audio AC97..." -ForegroundColor Green
+Write-Host "==> Lanzando TAEK OS en QEMU UEFI con xHCI, Teclado USB, Disco USB Mass Storage y Audio AC97..." -ForegroundColor Green
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $ovmf = "C:\Program Files\qemu\share\edk2-x86_64-code.fd"
 $img  = "$directorioActual\build\taek-os.img"
@@ -44,6 +45,23 @@ $argsQemu = @(
     "-device", "usb-kbd,bus=xhci.0,id=kbd2",
     "-serial", "stdio"
 )
+
+if ($UsbDisk) {
+    $usbImg = "$directorioActual\build\disco_usb_prueba.img"
+    if (-not (Test-Path $usbImg)) {
+        Write-Host "  [+] Creando disco USB virtual de prueba (64 MB con firma MBR 0x55AA)..." -ForegroundColor Cyan
+        $fs = [System.IO.File]::Create($usbImg)
+        $fs.SetLength(64 * 1024 * 1024)
+        $fs.Seek(510, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $fs.WriteByte(0x55)
+        $fs.WriteByte(0xAA)
+        $fs.Close()
+    }
+    $argsQemu += @(
+        "-drive", "if=none,id=usbstick,format=raw,file=$usbImg",
+        "-device", "usb-storage,bus=xhci.0,id=stick1,drive=usbstick"
+    )
+}
 
 if ($TraceXhci) {
     Write-Host "  [+] Habilitando trazas de depuración de xHCI: usb_xhci_*" -ForegroundColor Yellow

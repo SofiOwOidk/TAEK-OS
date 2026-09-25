@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include "usb_msc.h"
 #include "consola.h"
 #include "../arquitectura/x86_64/puertos.h"
 #include "../arquitectura/x86_64/serial.h"
@@ -210,6 +211,23 @@ struct xhci_ep_teclado {
 };
 
 static struct xhci_ep_teclado g_teclado_eps[XHCI_MAX_TECLADO_EPS];
+
+// Estructura para gestión de Endpoints Bulk de almacenamiento masivo (USB MSC)
+#define XHCI_MAX_BULK_EPS 8
+struct xhci_ep_bulk {
+    uint8_t  slot_id;
+    uint8_t  ep_dci;
+    uint16_t ep_max_pkt;
+    int      es_in;
+    int      activo;
+
+    volatile struct trb_xhci *ring;
+    uint64_t                  ring_fisica;
+    uint32_t                  idx;
+    uint8_t                   cycle;
+};
+
+static struct xhci_ep_bulk g_bulk_eps[XHCI_MAX_BULK_EPS];
 static uint8_t g_puerto_estado_ccs[XHCI_MAX_PUERTOS + 1];
 
 // Mapeo bidireccional y Device Contexts de ranuras y puertos
@@ -1500,6 +1518,100 @@ static int xhci_transferencia_control(uint8_t slot_id, uint8_t tipo_peticion, ui
     return -1;
 }
 
+// Ejecuta una transferencia síncrona en un endpoint Bulk IN o Bulk OUT
+int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms) {
+    if (!g_estado.inicializado || slot_id == 0 || ep_dci == 0) return -1;
+
+    struct xhci_ep_bulk *bep = NULL;
+    for (int i = 0; i < XHCI_MAX_BULK_EPS; i++) {
+        if (g_bulk_eps[i].activo && g_bulk_eps[i].slot_id == slot_id && g_bulk_eps[i].ep_dci == ep_dci) {
+            bep = &g_bulk_eps[i];
+            break;
+        }
+    }
+    if (!bep || !bep->ring) {
+        serial_imprimir("  [xHCI BULK ERROR] Endpoint no encontrado: Slot=");
+        serial_imprimir_dec(slot_id);
+        serial_imprimir(" DCI=");
+        serial_imprimir_dec(ep_dci);
+        serial_imprimir_linea("");
+        return -2;
+    }
+
+    if (!es_in && buffer && longitud > 0) {
+        dma_sincronizar_cpu_a_dispositivo(buffer, longitud);
+    }
+
+    volatile struct trb_xhci *trb = &bep->ring[bep->idx];
+    trb->parametro = buffer_fisica;
+    trb->estado    = longitud; // Transfer Length
+    uint32_t ctrl  = (TRB_TIPO_NORMAL << 10) | (1U << 5) /* IOC */ | (bep->cycle ? 1 : 0);
+    if (es_in) ctrl |= (1U << 2); // ISP: Interrupt on Short Packet
+    trb->control   = ctrl;
+
+    bep->idx++;
+    if (bep->idx >= XHCI_TAM_ANILLO - 1) {
+        volatile struct trb_xhci *link = &bep->ring[XHCI_TAM_ANILLO - 1];
+        link->parametro = bep->ring_fisica;
+        link->estado    = 0;
+        link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ | (bep->cycle ? 1 : 0);
+        dma_sincronizar_cpu_a_dispositivo((const void *)link, sizeof(*link));
+        bep->idx = 0;
+        bep->cycle = !bep->cycle;
+    }
+
+    dma_sincronizar_cpu_a_dispositivo((const void *)bep->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
+    __asm__ volatile ("mfence" ::: "memory");
+
+    // Tocar el timbre del endpoint correspondiente (Target = ep_dci)
+    xhci_tocar_timbre(slot_id, ep_dci);
+
+    // Esperar evento en el Event Ring
+    int timeout = (timeout_ms > 0) ? timeout_ms : 2000;
+    while (timeout > 0) {
+        xhci_sincronizar_evento_actual();
+        volatile struct trb_xhci *evt = &g_event_ring[g_event_idx];
+        uint8_t ciclo_evt = evt->control & 1;
+
+        if (ciclo_evt == g_event_cycle) {
+            uint8_t tipo     = (evt->control >> 10) & 0x3F;
+            uint8_t codigo   = (evt->estado >> 24) & 0xFF;
+            uint8_t evt_slot = (evt->control >> 24) & 0xFF;
+            uint8_t evt_ep   = (evt->control >> 16) & 0x1F;
+
+            // Avanzar dequeue en el Event Ring
+            g_event_idx++;
+            if (g_event_idx >= XHCI_TAM_ANILLO) {
+                g_event_idx = 0;
+                g_event_cycle = !g_event_cycle;
+                g_evt_ring_wraparounds++;
+            }
+            uint64_t erdp = g_event_ring_fisica + (g_event_idx * sizeof(struct trb_xhci));
+            mmio_escribir64(g_rts_base + 0x20 + 0x18, erdp | (1U << 3));
+            mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03);
+
+            if (tipo == TRB_TIPO_TRANSFER_EVT && evt_slot == slot_id && evt_ep == ep_dci) {
+                if (codigo == 1 || codigo == 13) { // 1 = Success, 13 = Short Packet
+                    if (es_in && buffer && longitud > 0) {
+                        dma_sincronizar_dispositivo_a_cpu(buffer, longitud);
+                    }
+                    return 0; // ¡Éxito!
+                }
+                serial_imprimir("  [xHCI] Transferencia Bulk fallo con codigo: ");
+                serial_imprimir_dec(codigo);
+                serial_imprimir_linea("");
+                return -(int)codigo;
+            }
+            continue;
+        }
+        esperar_milisegundos(1);
+        timeout--;
+    }
+
+    serial_imprimir_linea("  [xHCI AVISO] Timeout en transferencia Bulk");
+    return -99;
+}
+
 // Libera un Device Slot de hardware limpiando la entrada DCBAA y liberando búferes DMA (xHCI 1.2 §4.3.4)
 static void xhci_liberar_slot(uint8_t slot_id,
                              uint8_t *in_ctx, uint64_t in_ctx_fisica,
@@ -1830,11 +1942,19 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     int iface_actual_num = -1;
     int iface_actual_es_hid = 0;
     int iface_actual_es_boot = 0;
+    int iface_actual_es_msc = 0;
 
     struct xhci_ep_teclado *eps_este_dispositivo[4] = {0};
     int num_eps_este_dispositivo = 0;
 
-    // Escanear todas las interfaces y registrar endpoints Interrupt IN
+    uint8_t  msc_ep_in_dci = 0;
+    uint16_t msc_ep_in_max_pkt = 0;
+
+    uint8_t  msc_ep_out_dci = 0;
+    uint16_t msc_ep_out_max_pkt = 0;
+    int      es_dispositivo_msc = 0;
+
+    // Escanear todas las interfaces y registrar endpoints
     while (offset < total_cfg_len) {
         uint8_t len = desc_buf[offset];
         if (len == 0 || offset + len > total_cfg_len) break;
@@ -1855,22 +1975,28 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
             serial_imprimir(" Protocolo=");
             serial_imprimir_dec(if_protocol);
 
-            // Aceptamos interfaces HID de teclado (Clase 3, Protocolo 1=Boot Keyboard o 0=Compuesto/NKRO)
-            // Descartamos explícitamente ratones (Protocolo 2=Mouse) para que no secuestren el controlador de teclado
+            // Aceptamos interfaces HID de teclado (Clase 3) o Mass Storage (Clase 8)
             if (if_class == 3 && if_protocol != 2) {
                 iface_actual_es_hid = 1;
                 iface_actual_es_boot = (if_subclass == 1 && if_protocol == 1);
+                iface_actual_es_msc = 0;
                 serial_imprimir_linea(" [HID Teclado Aceptada]");
+            } else if (if_class == 8) { // Mass Storage Class (MSC)
+                iface_actual_es_hid = 0;
+                iface_actual_es_boot = 0;
+                iface_actual_es_msc = 1;
+                serial_imprimir_linea(" [USB Mass Storage (MSC) Aceptada]");
             } else {
                 iface_actual_es_hid = 0;
                 iface_actual_es_boot = 0;
+                iface_actual_es_msc = 0;
                 if (if_class == 3 && if_protocol == 2) {
                     serial_imprimir_linea(" [HID Ratón Omitido]");
                 } else {
                     serial_imprimir_linea(" [Ignorada]");
                 }
             }
-        } else if (dtype == 5 && len >= 7 && iface_actual_es_hid) { // Endpoint Descriptor
+        } else if (dtype == 5 && len >= 7 && iface_actual_es_hid) { // Endpoint Descriptor HID
             uint8_t ep_addr = desc_buf[offset + 2];
             uint8_t ep_attr = desc_buf[offset + 3];
             uint16_t ep_max_pkt = desc_buf[offset + 4] | (desc_buf[offset + 5] << 8);
@@ -1932,14 +2058,47 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
                     }
                 }
             }
+        } else if (dtype == 5 && len >= 7 && iface_actual_es_msc) { // Endpoint Descriptor Bulk MSC
+            uint8_t ep_addr = desc_buf[offset + 2];
+            uint8_t ep_attr = desc_buf[offset + 3];
+            uint16_t ep_max_pkt = desc_buf[offset + 4] | (desc_buf[offset + 5] << 8);
+
+            // Bulk Endpoint (ep_attr & 0x03 == 0x02)
+            if ((ep_attr & 0x03) == 0x02) {
+                uint8_t ep_num = ep_addr & 0x0F;
+                if (ep_addr & 0x80) { // Bulk IN
+                    msc_ep_in_dci = ep_num * 2 + 1;
+                    msc_ep_in_max_pkt = (ep_max_pkt > 0) ? ep_max_pkt : 512;
+                    serial_imprimir("    -> Endpoint Bulk IN: Addr=");
+                    serial_imprimir_hex(ep_addr);
+                    serial_imprimir(" (DCI=");
+                    serial_imprimir_dec(msc_ep_in_dci);
+                    serial_imprimir(") MaxPkt=");
+                    serial_imprimir_dec(msc_ep_in_max_pkt);
+                    serial_imprimir_linea("");
+                } else { // Bulk OUT
+                    msc_ep_out_dci = ep_num * 2;
+                    msc_ep_out_max_pkt = (ep_max_pkt > 0) ? ep_max_pkt : 512;
+                    serial_imprimir("    -> Endpoint Bulk OUT: Addr=");
+                    serial_imprimir_hex(ep_addr);
+                    serial_imprimir(" (DCI=");
+                    serial_imprimir_dec(msc_ep_out_dci);
+                    serial_imprimir(") MaxPkt=");
+                    serial_imprimir_dec(msc_ep_out_max_pkt);
+                    serial_imprimir_linea("");
+                }
+                if (msc_ep_in_dci > 0 && msc_ep_out_dci > 0) {
+                    es_dispositivo_msc = 1;
+                }
+            }
         }
 
         offset += len;
     }
 
-    if (num_eps_este_dispositivo == 0) {
-        consola_imprimir_linea_color("    -> No es teclado HID (liberando slot)", COLOR_PROMPT_DEFAULT);
-        serial_imprimir_linea("  [xHCI] No se encontraron endpoints de teclado HID compatibles. Omitiendo.");
+    if (num_eps_este_dispositivo == 0 && !es_dispositivo_msc) {
+        consola_imprimir_linea_color("    -> No es teclado HID ni memoria USB (liberando slot)", COLOR_PROMPT_DEFAULT);
+        serial_imprimir_linea("  [xHCI] No se encontraron endpoints de teclado HID ni MSC compatibles. Omitiendo.");
         xhci_liberar_slot(slot_id, in_ctx, in_ctx_fisica, dev_ctx, dev_ctx_fisica, desc_buf, desc_buf_fisica);
         return;
     }
@@ -1972,6 +2131,42 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         uint8_t ep_dci = eps_este_dispositivo[e]->ep_dci;
         if (ep_dci > max_dci) max_dci = ep_dci;
         ctrl_ctx[1] |= (1U << ep_dci); // Add Endpoint Context bit
+    }
+
+    struct xhci_ep_bulk *bep_in = NULL;
+    struct xhci_ep_bulk *bep_out = NULL;
+    if (es_dispositivo_msc) {
+        for (int b = 0; b < XHCI_MAX_BULK_EPS; b++) {
+            if (!g_bulk_eps[b].activo || g_bulk_eps[b].slot_id == slot_id) {
+                if (!bep_out) {
+                    bep_out = &g_bulk_eps[b];
+                } else if (!bep_in && bep_out != &g_bulk_eps[b]) {
+                    bep_in = &g_bulk_eps[b];
+                    break;
+                }
+            }
+        }
+        if (bep_in && bep_out) {
+            bep_out->slot_id = slot_id;
+            bep_out->ep_dci = msc_ep_out_dci;
+            bep_out->ep_max_pkt = msc_ep_out_max_pkt;
+            bep_out->es_in = 0;
+            bep_out->activo = 1;
+            bep_out->idx = 0;
+            bep_out->cycle = 1;
+
+            bep_in->slot_id = slot_id;
+            bep_in->ep_dci = msc_ep_in_dci;
+            bep_in->ep_max_pkt = msc_ep_in_max_pkt;
+            bep_in->es_in = 1;
+            bep_in->activo = 1;
+            bep_in->idx = 0;
+            bep_in->cycle = 1;
+
+            ctrl_ctx[1] |= (1U << msc_ep_out_dci) | (1U << msc_ep_in_dci);
+            if (msc_ep_out_dci > max_dci) max_dci = msc_ep_out_dci;
+            if (msc_ep_in_dci > max_dci) max_dci = msc_ep_in_dci;
+        }
     }
 
     // Input Slot Context (offset g_tamano_contexto):
@@ -2062,8 +2257,6 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         ep_ctx[2] = (uint32_t)(ep->ring_fisica | 1); // Dequeue pointer + DCS=1
         ep_ctx[3] = (uint32_t)(ep->ring_fisica >> 32);
         // DW4: Average TRB Length (bits 15:0) Y Max ESIT Payload Low (bits 31:16)!
-        // Obligatorio por xHCI 1.2 §6.2.3.8 para endpoints periódicos; si Max ESIT Payload
-        // es 0, los controladores Intel Raptor Lake congelan el microcódigo del scheduler.
         ep_ctx[4] = (uint32_t)ep->ep_max_pkt | ((uint32_t)ep->ep_max_pkt << 16);
 
         serial_imprimir("  [xHCI CFG] EP");
@@ -2076,6 +2269,48 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         serial_imprimir_hex(ep_ctx[2]);
         serial_imprimir(" DW4=");
         serial_imprimir_hex(ep_ctx[4]);
+        serial_imprimir_linea("");
+    }
+
+    if (es_dispositivo_msc && bep_in && bep_out) {
+        // Bulk OUT
+        uint32_t *ep_ctx_out = (uint32_t *)(in_ctx + (msc_ep_out_dci + 1) * g_tamano_contexto);
+        for (int k = 0; k < XHCI_TAM_ANILLO; k++) {
+            bep_out->ring[k].parametro = 0;
+            bep_out->ring[k].estado = 0;
+            bep_out->ring[k].control = 0;
+        }
+        bep_out->idx = 0;
+        bep_out->cycle = 1;
+        dma_sincronizar_cpu_a_dispositivo((const void *)bep_out->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
+
+        ep_ctx_out[0] = 0; // Interval = 0
+        ep_ctx_out[1] = (2U << 3) | ((uint32_t)msc_ep_out_max_pkt << 16) | (3U << 1); // Bulk OUT = 2, CErr = 3
+        ep_ctx_out[2] = (uint32_t)(bep_out->ring_fisica | 1); // Dequeue pointer + DCS=1
+        ep_ctx_out[3] = (uint32_t)(bep_out->ring_fisica >> 32);
+        ep_ctx_out[4] = (uint32_t)msc_ep_out_max_pkt; // Average TRB Length
+
+        // Bulk IN
+        uint32_t *ep_ctx_in = (uint32_t *)(in_ctx + (msc_ep_in_dci + 1) * g_tamano_contexto);
+        for (int k = 0; k < XHCI_TAM_ANILLO; k++) {
+            bep_in->ring[k].parametro = 0;
+            bep_in->ring[k].estado = 0;
+            bep_in->ring[k].control = 0;
+        }
+        bep_in->idx = 0;
+        bep_in->cycle = 1;
+        dma_sincronizar_cpu_a_dispositivo((const void *)bep_in->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
+
+        ep_ctx_in[0] = 0; // Interval = 0
+        ep_ctx_in[1] = (6U << 3) | ((uint32_t)msc_ep_in_max_pkt << 16) | (3U << 1); // Bulk IN = 6, CErr = 3
+        ep_ctx_in[2] = (uint32_t)(bep_in->ring_fisica | 1); // Dequeue pointer + DCS=1
+        ep_ctx_in[3] = (uint32_t)(bep_in->ring_fisica >> 32);
+        ep_ctx_in[4] = (uint32_t)msc_ep_in_max_pkt; // Average TRB Length
+
+        serial_imprimir("  [xHCI CFG] Endpoints Bulk Configurados: OUT DCI=");
+        serial_imprimir_dec(msc_ep_out_dci);
+        serial_imprimir(" IN DCI=");
+        serial_imprimir_dec(msc_ep_in_dci);
         serial_imprimir_linea("");
     }
 
@@ -2113,85 +2348,126 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     consola_imprimir_linea_color("    -> SET_CONFIGURATION [OK]", COLOR_EXITO_DEFAULT);
     esperar_milisegundos(10);
 
-    // 10. Configurar protocolos e idle para cada interfaz detectada.
-    // SET_PROTOCOL solo es válido para HID Boot; enviarlo a interfaces NKRO
-    // propietarias puede provocar STALL y dejar el teclado en mal estado.
-    g_estado.etapa_enumeracion = 7;
-    for (int e = 0; e < num_eps_este_dispositivo; e++) {
-        uint8_t iface = eps_este_dispositivo[e]->iface_num;
-        int interfaz_ya_configurada = 0;
-        for (int previo = 0; previo < e; previo++) {
-            if (eps_este_dispositivo[previo]->iface_num == iface) {
-                interfaz_ya_configurada = 1;
-                break;
-            }
-        }
-        if (interfaz_ya_configurada) continue;
+    if (es_dispositivo_msc && bep_in && bep_out) {
+        consola_imprimir_linea_color("    ==> ¡Memoria USB (Mass Storage) Configurada [OK]!", COLOR_EXITO_DEFAULT);
+        usb_msc_registrar_dispositivo(slot_id, puerto_idx, msc_ep_in_dci, msc_ep_out_dci, msc_ep_in_max_pkt, msc_ep_out_max_pkt);
+    }
 
-        if (eps_este_dispositivo[e]->es_boot) {
-            // SET_PROTOCOL(Boot = 0)
-            int res_p = xhci_transferencia_control(slot_id, 0x21, 0x0B, 0x0000, (uint16_t)iface, 0, NULL, 0);
-            serial_imprimir("  [xHCI] SET_PROTOCOL(Boot=0) Iface=");
+    if (num_eps_este_dispositivo > 0) {
+        // 10. Configurar protocolos e idle para cada interfaz detectada.
+        // SET_PROTOCOL solo es válido para HID Boot; enviarlo a interfaces NKRO
+        // propietarias puede provocar STALL y dejar el teclado en mal estado.
+        g_estado.etapa_enumeracion = 7;
+        for (int e = 0; e < num_eps_este_dispositivo; e++) {
+            uint8_t iface = eps_este_dispositivo[e]->iface_num;
+            int interfaz_ya_configurada = 0;
+            for (int previo = 0; previo < e; previo++) {
+                if (eps_este_dispositivo[previo]->iface_num == iface) {
+                    interfaz_ya_configurada = 1;
+                    break;
+                }
+            }
+            if (interfaz_ya_configurada) continue;
+
+            if (eps_este_dispositivo[e]->es_boot) {
+                // SET_PROTOCOL(Boot = 0)
+                int res_p = xhci_transferencia_control(slot_id, 0x21, 0x0B, 0x0000, (uint16_t)iface, 0, NULL, 0);
+                serial_imprimir("  [xHCI] SET_PROTOCOL(Boot=0) Iface=");
+                serial_imprimir_dec(iface);
+                serial_imprimir(" Código=");
+                serial_imprimir_dec(res_p);
+                serial_imprimir_linea("");
+                if (res_p != 0) {
+                    // En caso de STALL o rechazo, limpiar la característica ENDPOINT_HALT en EP0
+                    xhci_transferencia_control(slot_id, 0x02, 0x01, 0x0000, 0x0000, 0, NULL, 0);
+                }
+            }
+            // SET_IDLE(0)
+            int res_i = xhci_transferencia_control(slot_id, 0x21, 0x0A, 0x0000, (uint16_t)iface, 0, NULL, 0);
+            serial_imprimir("  [xHCI] SET_IDLE(0) Iface=");
             serial_imprimir_dec(iface);
             serial_imprimir(" Código=");
-            serial_imprimir_dec(res_p);
+            serial_imprimir_dec(res_i);
             serial_imprimir_linea("");
-            if (res_p != 0) {
+            if (res_i != 0) {
                 // En caso de STALL o rechazo, limpiar la característica ENDPOINT_HALT en EP0
                 xhci_transferencia_control(slot_id, 0x02, 0x01, 0x0000, 0x0000, 0, NULL, 0);
             }
         }
-        // SET_IDLE(0)
-        int res_i = xhci_transferencia_control(slot_id, 0x21, 0x0A, 0x0000, (uint16_t)iface, 0, NULL, 0);
-        serial_imprimir("  [xHCI] SET_IDLE(0) Iface=");
-        serial_imprimir_dec(iface);
-        serial_imprimir(" Código=");
-        serial_imprimir_dec(res_i);
-        serial_imprimir_linea("");
-        if (res_i != 0) {
-            // En caso de STALL o rechazo, limpiar la característica ENDPOINT_HALT en EP0
-            xhci_transferencia_control(slot_id, 0x02, 0x01, 0x0000, 0x0000, 0, NULL, 0);
-        }
-    }
-    esperar_milisegundos(5);
+        esperar_milisegundos(5);
 
-    // 11. Armar y tocar el timbre de cada Endpoint descubierto con pipeline multi-TRB
-    for (int e = 0; e < num_eps_este_dispositivo; e++) {
-        struct xhci_ep_teclado *ep = eps_este_dispositivo[e];
+        // 11. Armar y tocar el timbre de cada Endpoint descubierto con pipeline multi-TRB
+        for (int e = 0; e < num_eps_este_dispositivo; e++) {
+            struct xhci_ep_teclado *ep = eps_este_dispositivo[e];
 
-        // Reiniciar anillo de transferencia
-        for (int k = 0; k < XHCI_TAM_ANILLO; k++) {
-            ep->ring[k].parametro = 0;
-            ep->ring[k].estado = 0;
-            ep->ring[k].control = 0;
-        }
+            // Reiniciar anillo de transferencia
+            for (int k = 0; k < XHCI_TAM_ANILLO; k++) {
+                ep->ring[k].parametro = 0;
+                ep->ring[k].estado = 0;
+                ep->ring[k].control = 0;
+            }
 
-        // Pre-inicializar el Link TRB en el último elemento (XHCI_TAM_ANILLO - 1)
-        volatile struct trb_xhci *link = &ep->ring[XHCI_TAM_ANILLO - 1];
-        link->parametro = ep->ring_fisica;
-        link->estado    = 0;
-        link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ | 1 /* Cycle inicial */;
+            // Pre-inicializar el Link TRB en el último elemento (XHCI_TAM_ANILLO - 1)
+            volatile struct trb_xhci *link = &ep->ring[XHCI_TAM_ANILLO - 1];
+            link->parametro = ep->ring_fisica;
+            link->estado    = 0;
+            link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ | 1 /* Cycle inicial */;
 
-        ep->idx = 0;
-        ep->cycle = 1;
+            ep->idx = 0;
+            ep->cycle = 1;
 
-        // Encolar ráfaga inicial de 4 TRBs Normales para mantener un pipeline continuo sin inanición
-        int trbs_iniciales = 4;
-        for (int t = 0; t < trbs_iniciales && t < XHCI_TAM_ANILLO - 1; t++) {
-            volatile struct trb_xhci *trb = &ep->ring[t];
-            trb->parametro = ep->bufer_fisica;
-            trb->estado    = ep->ep_max_pkt;
-            trb->control   = (TRB_TIPO_NORMAL << 10) | (1U << 2) /* ISP */ | (1U << 5) /* IOC */ | (ep->cycle ? 1 : 0);
-            ep->idx++;
+            // Encolar ráfaga inicial de 4 TRBs Normales para mantener un pipeline continuo sin inanición
+            int trbs_iniciales = 4;
+            for (int t = 0; t < trbs_iniciales && t < XHCI_TAM_ANILLO - 1; t++) {
+                volatile struct trb_xhci *trb = &ep->ring[t];
+                trb->parametro = ep->bufer_fisica;
+                trb->estado    = ep->ep_max_pkt;
+                trb->control   = (TRB_TIPO_NORMAL << 10) | (1U << 2) /* ISP */ | (1U << 5) /* IOC */ | (ep->cycle ? 1 : 0);
+                ep->idx++;
+            }
+
+            dma_sincronizar_cpu_a_dispositivo((const void *)ep->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
+            __asm__ volatile ("mfence" ::: "memory");
+
+            ep->activo = 1;
+
+            // Tocar timbre del Endpoint
+            xhci_tocar_timbre(slot_id, ep->ep_dci);
         }
 
-        dma_sincronizar_cpu_a_dispositivo((const void *)ep->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
-        __asm__ volatile ("mfence" ::: "memory");
+        g_estado.teclado_detectado = 1;
+        g_estado.teclado_slot_id = slot_id;
+        g_estado.teclado_ep_dci  = eps_este_dispositivo[0]->ep_dci;
+        g_estado.teclado_num_eps = (uint8_t)num_eps_este_dispositivo;
+        g_estado.teclado_puerto  = puerto_idx;
+        g_estado.teclado_id_proveedor = dev_desc->id_proveedor;
+        g_estado.teclado_id_producto  = dev_desc->id_producto;
+        g_estado.etapa_enumeracion = 8;
 
-        ep->activo = 1;
+        // Calcular cuántos dispositivos de teclado distintos están activos concurrentemente
+        int total_teclados = 0;
+        uint8_t slots_contados[XHCI_MAX_SLOTS + 1] = {0};
+        for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
+            if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id > 0) {
+                if (!slots_contados[g_teclado_eps[e].slot_id]) {
+                    slots_contados[g_teclado_eps[e].slot_id] = 1;
+                    total_teclados++;
+                }
+            }
+        }
+        g_estado.teclados_activos = total_teclados;
 
-        // Tocar timbre del Endpoint
-        xhci_tocar_timbre(slot_id, ep->ep_dci);
+        consola_imprimir("    ==> ¡Teclado USB Configurado y Operativo [OK]! (");
+        consola_imprimir_dec(num_eps_este_dispositivo);
+        consola_imprimir_linea_color(" Endpoints)", COLOR_EXITO_DEFAULT);
+
+        serial_imprimir("  [xHCI EXITOSO] ¡Teclado USB en Slot ");
+        serial_imprimir_dec(slot_id);
+        serial_imprimir(" (Puerto ");
+        serial_imprimir_dec(puerto_idx);
+        serial_imprimir(") configurado con ");
+        serial_imprimir_dec(num_eps_este_dispositivo);
+        serial_imprimir_linea(" Endpoint(s) armados para recepción!");
     }
 
     // 12. Registrar ranura, mapeos y actualizar estado global
@@ -2201,28 +2477,6 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     g_slot_pid[slot_id] = dev_desc->id_producto;
     g_slot_dev_ctx[slot_id] = dev_ctx;
     g_slot_dev_ctx_fisica[slot_id] = dev_ctx_fisica;
-
-    g_estado.teclado_detectado = 1;
-    g_estado.teclado_slot_id = slot_id;
-    g_estado.teclado_ep_dci  = eps_este_dispositivo[0]->ep_dci;
-    g_estado.teclado_num_eps = (uint8_t)num_eps_este_dispositivo;
-    g_estado.teclado_puerto  = puerto_idx;
-    g_estado.teclado_id_proveedor = dev_desc->id_proveedor;
-    g_estado.teclado_id_producto  = dev_desc->id_producto;
-    g_estado.etapa_enumeracion = 8;
-
-    // Calcular cuántos dispositivos de teclado distintos están activos concurrentemente
-    int total_teclados = 0;
-    uint8_t slots_contados[XHCI_MAX_SLOTS + 1] = {0};
-    for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
-        if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id > 0) {
-            if (!slots_contados[g_teclado_eps[e].slot_id]) {
-                slots_contados[g_teclado_eps[e].slot_id] = 1;
-                total_teclados++;
-            }
-        }
-    }
-    g_estado.teclados_activos = total_teclados;
 
     // Liberar búferes temporales DMA no requeridos por hardware post-enumeración
     if (desc_buf && desc_buf_fisica) {
@@ -2235,18 +2489,6 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     // Guardar contexto activo de dispositivo para posterior liberación al desconectar
     g_teclado_dev_ctx = dev_ctx;
     g_teclado_dev_ctx_fisica = dev_ctx_fisica;
-
-    consola_imprimir("    ==> ¡Teclado USB Configurado y Operativo [OK]! (");
-    consola_imprimir_dec(num_eps_este_dispositivo);
-    consola_imprimir_linea_color(" Endpoints)", COLOR_EXITO_DEFAULT);
-
-    serial_imprimir("  [xHCI EXITOSO] ¡Teclado USB en Slot ");
-    serial_imprimir_dec(slot_id);
-    serial_imprimir(" (Puerto ");
-    serial_imprimir_dec(puerto_idx);
-    serial_imprimir(") configurado con ");
-    serial_imprimir_dec(num_eps_este_dispositivo);
-    serial_imprimir_linea(" Endpoint(s) armados para recepción!");
 }
 
 // Ejecuta el ciclo oficial de Reset USB 2.0 / 3.x según la especificación Intel xHCI 1.2
@@ -2596,6 +2838,24 @@ int xhci_iniciar(void) {
         g_teclado_eps[e].puerto_idx = 0;
     }
 
+    for (int b = 0; b < XHCI_MAX_BULK_EPS; b++) {
+        g_bulk_eps[b].ring = (volatile struct trb_xhci *)dma_asignar_bufer_contiguo(XHCI_TAM_ANILLO * sizeof(struct trb_xhci), 64, &g_bulk_eps[b].ring_fisica);
+        if (!g_bulk_eps[b].ring) return -8;
+        for (int i = 0; i < XHCI_TAM_ANILLO; i++) {
+            g_bulk_eps[b].ring[i].parametro = 0;
+            g_bulk_eps[b].ring[i].estado = 0;
+            g_bulk_eps[b].ring[i].control = 0;
+        }
+        g_bulk_eps[b].idx = 0;
+        g_bulk_eps[b].cycle = 1;
+        dma_sincronizar_cpu_a_dispositivo((const void *)g_bulk_eps[b].ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
+        g_bulk_eps[b].activo = 0;
+        g_bulk_eps[b].slot_id = 0;
+        g_bulk_eps[b].ep_dci = 0;
+    }
+
+    usb_msc_iniciar();
+
     // 7. Arrancar el controlador xHCI
     mmio_escribir32(g_op_base + REG_OP_USBCMD, USBCMD_RS | USBCMD_INTE);
     timeout = 100;
@@ -2847,6 +3107,13 @@ int xhci_escanear_cambios_puertos(int verbose) {
                         g_teclado_eps[e].puerto_idx = 0;
                     }
                 }
+                for (int b = 0; b < XHCI_MAX_BULK_EPS; b++) {
+                    if (g_bulk_eps[b].slot_id == slot_id) {
+                        g_bulk_eps[b].activo = 0;
+                        g_bulk_eps[b].slot_id = 0;
+                    }
+                }
+                usb_msc_desregistrar_dispositivo(slot_id);
                 xhci_liberar_slot(slot_id, NULL, 0, g_slot_dev_ctx[slot_id], g_slot_dev_ctx_fisica[slot_id], NULL, 0);
                 g_slot_dev_ctx[slot_id] = NULL;
                 g_slot_dev_ctx_fisica[slot_id] = 0;
@@ -2910,6 +3177,13 @@ int xhci_forzar_reset_puerto(uint8_t puerto) {
                 g_teclado_eps[e].puerto_idx = 0;
             }
         }
+        for (int b = 0; b < XHCI_MAX_BULK_EPS; b++) {
+            if (g_bulk_eps[b].slot_id == slot_id) {
+                g_bulk_eps[b].activo = 0;
+                g_bulk_eps[b].slot_id = 0;
+            }
+        }
+        usb_msc_desregistrar_dispositivo(slot_id);
         xhci_liberar_slot(slot_id, NULL, 0, g_slot_dev_ctx[slot_id], g_slot_dev_ctx_fisica[slot_id], NULL, 0);
         g_slot_dev_ctx[slot_id] = NULL;
         g_slot_dev_ctx_fisica[slot_id] = 0;

@@ -20,6 +20,7 @@
 #include "../arquitectura/x86_64/apic.h"
 #include "iommu.h"
 #include "xhci.h"
+#include "usb_msc.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -1815,8 +1816,246 @@ static void ejecutar_comando_teclado(const char *arg) {
     ejecutar_autodiagnostico_teclado();
 }
 
+static void ejecutar_lectura_usb_msc(uint8_t unidad, uint32_t lba) {
+    int total_msc = usb_msc_obtener_cantidad();
+    if (total_msc == 0) {
+        consola_imprimir_linea_color("  [!] No hay unidades de almacenamiento USB (pendrives) detectadas.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea("      Conecta un pendrive USB y ejecuta 'usb monitor' o 'usb' para verificar.");
+        return;
+    }
+
+    const struct usb_msc_dispositivo *dev = usb_msc_obtener_dispositivo(unidad);
+    if (!dev || !dev->activo || !dev->listo) {
+        consola_imprimir_linea_color("  [!] La unidad USB seleccionada no está lista para operaciones de E/S.", COLOR_ERROR_DEFAULT);
+        return;
+    }
+
+    if (lba >= dev->sectores_totales && dev->sectores_totales > 0) {
+        consola_imprimir("  [AVISO] El LBA ");
+        consola_imprimir_dec(lba);
+        consola_imprimir(" supera los sectores totales de la unidad (");
+        consola_imprimir_dec(dev->sectores_totales);
+        consola_imprimir_linea(").");
+    }
+
+    static uint8_t sector_buf[512];
+    for (int i = 0; i < 512; i++) sector_buf[i] = 0;
+
+    consola_imprimir("==> [ USB SCSI BOT ] Leyendo LBA ");
+    consola_imprimir_dec(lba);
+    consola_imprimir(" (512 bytes) de '");
+    consola_imprimir(dev->fabricante);
+    consola_imprimir(" ");
+    consola_imprimir(dev->producto);
+    consola_imprimir_linea("'...");
+
+    int res = usb_msc_leer_sectores(unidad, lba, 1, sector_buf);
+    if (res != 0) {
+        consola_imprimir("  [ERROR] Falló la lectura SCSI READ(10). Código de error: ");
+        consola_imprimir_dec(res);
+        consola_imprimir_linea("");
+        return;
+    }
+
+    consola_imprimir_linea_color("================== VOLCADO HEXADECIMAL DE SECTOR ==================", COLOR_AVISO_DEFAULT);
+    for (int fila = 0; fila < 32; fila++) {
+        uint32_t offset = fila * 16;
+        consola_imprimir_color("  0x", COLOR_PROMPT_DEFAULT);
+        terminal_imprimir_hex_fijo(offset, 4);
+        consola_imprimir(":  ");
+
+        // Bytes en hex
+        for (int b = 0; b < 16; b++) {
+            terminal_imprimir_hex_fijo(sector_buf[offset + b], 2);
+            consola_imprimir(" ");
+            if (b == 7) consola_imprimir(" ");
+        }
+
+        consola_imprimir(" |");
+        // Caracteres ASCII
+        for (int b = 0; b < 16; b++) {
+            uint8_t ch = sector_buf[offset + b];
+            if (ch >= 32 && ch <= 126) {
+                consola_escribir_caracter((char)ch);
+            } else {
+                consola_escribir_caracter('.');
+            }
+        }
+        consola_imprimir_linea("|");
+    }
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+
+    // Inspección de firmas conocidas en LBA 0 (MBR) o LBA 1 (GPT Header)
+    if (lba == 0) {
+        uint16_t firma_mbr = ((uint16_t)sector_buf[511] << 8) | sector_buf[510];
+        if (firma_mbr == 0xAA55) {
+            consola_imprimir_linea_color("  [OK] Firma de arranque MBR detectada: 0x55AA en offset 510-511.", COLOR_EXITO_DEFAULT);
+            // Comprobar particiones en tabla MBR (offset 446 a 509)
+            int num_particiones = 0;
+            for (int p = 0; p < 4; p++) {
+                uint32_t p_off = 446 + (p * 16);
+                uint8_t tipo = sector_buf[p_off + 4];
+                if (tipo != 0) {
+                    num_particiones++;
+                    uint32_t inicio_lba = (uint32_t)sector_buf[p_off + 8] |
+                                         ((uint32_t)sector_buf[p_off + 9] << 8) |
+                                         ((uint32_t)sector_buf[p_off + 10] << 16) |
+                                         ((uint32_t)sector_buf[p_off + 11] << 24);
+                    uint32_t num_sec = (uint32_t)sector_buf[p_off + 12] |
+                                       ((uint32_t)sector_buf[p_off + 13] << 8) |
+                                       ((uint32_t)sector_buf[p_off + 14] << 16) |
+                                       ((uint32_t)sector_buf[p_off + 15] << 24);
+                    consola_imprimir("       Partición ");
+                    consola_imprimir_dec(p + 1);
+                    consola_imprimir(": Tipo 0x");
+                    terminal_imprimir_hex_fijo(tipo, 2);
+                    if (tipo == 0xEE) consola_imprimir(" (Protective MBR / GPT)");
+                    else if (tipo == 0x07) consola_imprimir(" (NTFS / exFAT)");
+                    else if (tipo == 0x0C || tipo == 0x0B) consola_imprimir(" (FAT32 LBA)");
+                    else if (tipo == 0x83) consola_imprimir(" (Linux Native)");
+                    consola_imprimir(" | LBA Inicio: ");
+                    consola_imprimir_dec(inicio_lba);
+                    consola_imprimir(" | Sectores: ");
+                    consola_imprimir_dec(num_sec);
+                    consola_imprimir_linea("");
+                }
+            }
+            if (num_particiones == 0) {
+                consola_imprimir_linea("       (Tabla MBR vacía o medio sin particionar)");
+            }
+        } else {
+            consola_imprimir_linea_color("  [AVISO] Sector 0 leído correctamente, pero sin firma MBR 0x55AA.", COLOR_AVISO_DEFAULT);
+        }
+    } else if (lba == 1) {
+        if (sector_buf[0] == 'E' && sector_buf[1] == 'F' && sector_buf[2] == 'I' && sector_buf[3] == ' ' &&
+            sector_buf[4] == 'P' && sector_buf[5] == 'A' && sector_buf[6] == 'R' && sector_buf[7] == 'T') {
+            consola_imprimir_linea_color("  [OK] Firma de cabecera GPT detectada: 'EFI PART' en LBA 1.", COLOR_EXITO_DEFAULT);
+        }
+    }
+}
+
+static void ejecutar_comando_disco(const char *arg) {
+    if (arg) arg = str_saltar_espacios(arg);
+
+    if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
+        const char *p_lba = arg + 4;
+        p_lba = str_saltar_espacios(p_lba);
+        uint32_t lba = 0;
+        if (*p_lba != '\0') {
+            if (p_lba[0] == '0' && (p_lba[1] == 'x' || p_lba[1] == 'X')) {
+                p_lba += 2;
+                while ((*p_lba >= '0' && *p_lba <= '9') || (*p_lba >= 'a' && *p_lba <= 'f') || (*p_lba >= 'A' && *p_lba <= 'F')) {
+                    char c = *p_lba++;
+                    int val = (c >= '0' && c <= '9') ? (c - '0') : ((c >= 'a' && c <= 'f') ? (c - 'a' + 10) : (c - 'A' + 10));
+                    lba = (lba << 4) | (uint32_t)val;
+                }
+            } else {
+                while (*p_lba >= '0' && *p_lba <= '9') {
+                    lba = lba * 10 + (*p_lba++ - '0');
+                }
+            }
+        }
+        ejecutar_lectura_usb_msc(0, lba);
+        return;
+    }
+
+    int total_msc = usb_msc_obtener_cantidad();
+    consola_imprimir_linea_color("================== SUBSISTEMA DE ALMACENAMIENTO USB ==================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("Unidades USB Mass Storage detectadas: ");
+    consola_imprimir_dec(total_msc);
+    consola_imprimir_linea("");
+
+    if (total_msc == 0) {
+        consola_imprimir_linea_color("  [!] No se encontraron memorias USB o discos externos conectados.", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("      Inserta un pendrive USB y ejecuta 'usb monitor' o 'disco' para detectarlo.");
+    } else {
+        for (int i = 0; i < USB_MSC_MAX_DISPOSITIVOS; i++) {
+            const struct usb_msc_dispositivo *msc = usb_msc_obtener_dispositivo(i);
+            if (msc && msc->activo) {
+                consola_imprimir_color("  * DISCO #", COLOR_PROMPT_DEFAULT);
+                consola_imprimir_dec(i);
+                consola_imprimir(": ");
+                consola_imprimir_color(msc->fabricante, COLOR_EXITO_DEFAULT);
+                consola_imprimir(" ");
+                consola_imprimir_color(msc->producto, COLOR_EXITO_DEFAULT);
+                consola_imprimir(" [Rev ");
+                consola_imprimir(msc->revision);
+                consola_imprimir_linea("]");
+
+                consola_imprimir("    Estado SCSI       : ");
+                if (msc->listo) {
+                    consola_imprimir_linea_color("LISTO / EN LÍNEA (BOT + SCSI-2 SPC/SBC)", COLOR_EXITO_DEFAULT);
+                } else {
+                    consola_imprimir_linea_color("INICIALIZANDO O MEDIO NO INSERTADO", COLOR_AVISO_DEFAULT);
+                }
+
+                uint64_t cap_mb = msc->capacidad_bytes / (1024ULL * 1024ULL);
+                uint64_t cap_gb = msc->capacidad_bytes / (1024ULL * 1024ULL * 1024ULL);
+                consola_imprimir("    Capacidad Total   : ");
+                if (cap_gb > 0) {
+                    consola_imprimir_dec(cap_gb);
+                    consola_imprimir(" GB (");
+                }
+                consola_imprimir_dec(cap_mb);
+                consola_imprimir(" MB");
+                if (cap_gb > 0) consola_imprimir(")");
+                consola_imprimir_linea("");
+
+                consola_imprimir("    Geometría LBA     : ");
+                consola_imprimir_dec(msc->sectores_totales);
+                consola_imprimir(" sectores físicos de ");
+                consola_imprimir_dec(msc->tamano_sector);
+                consola_imprimir_linea(" bytes");
+
+                consola_imprimir("    Conexión xHCI     : Slot ");
+                consola_imprimir_dec(msc->slot_id);
+                consola_imprimir(" en Puerto ");
+                consola_imprimir_dec(msc->puerto_idx);
+                consola_imprimir(" (EP Bulk IN: DCI ");
+                consola_imprimir_dec(msc->ep_in_dci);
+                consola_imprimir(", Bulk OUT: DCI ");
+                consola_imprimir_dec(msc->ep_out_dci);
+                consola_imprimir_linea(")");
+            }
+        }
+    }
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'disco leer 0' para inspeccionar el sector de arranque MBR.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'disco leer 1' para inspeccionar la cabecera GPT.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
+}
+
 static void ejecutar_comando_usb(const char *arg) {
     if (arg) arg = str_saltar_espacios(arg);
+
+    // Subcomando: usb leer <lba> / usb read <lba> / usb dump <lba>
+    if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
+        const char *p_lba = arg + 4;
+        p_lba = str_saltar_espacios(p_lba);
+        uint32_t lba = 0;
+        if (*p_lba != '\0') {
+            if (p_lba[0] == '0' && (p_lba[1] == 'x' || p_lba[1] == 'X')) {
+                p_lba += 2;
+                while ((*p_lba >= '0' && *p_lba <= '9') || (*p_lba >= 'a' && *p_lba <= 'f') || (*p_lba >= 'A' && *p_lba <= 'F')) {
+                    char c = *p_lba++;
+                    int val = (c >= '0' && c <= '9') ? (c - '0') : ((c >= 'a' && c <= 'f') ? (c - 'a' + 10) : (c - 'A' + 10));
+                    lba = (lba << 4) | (uint32_t)val;
+                }
+            } else {
+                while (*p_lba >= '0' && *p_lba <= '9') {
+                    lba = lba * 10 + (*p_lba++ - '0');
+                }
+            }
+        }
+        ejecutar_lectura_usb_msc(0, lba);
+        return;
+    }
+
+    // Subcomando: usb discos / usb storage / usb msc
+    if (arg && (str_igual(arg, "disco") || str_igual(arg, "discos") || str_igual(arg, "storage") || str_igual(arg, "msc"))) {
+        ejecutar_comando_disco(NULL);
+        return;
+    }
 
     // Subcomando: usb monitor / usb escucha
     if (arg && (str_igual(arg, "monitor") || str_igual(arg, "escuchar") || str_igual(arg, "vigilar") || str_igual(arg, "watch"))) {
@@ -1950,6 +2189,55 @@ static void ejecutar_comando_usb(const char *arg) {
     } else {
         consola_imprimir_linea_color("[NO DETECTADO - Sondeo y Hotplug Activos]", COLOR_AVISO_DEFAULT);
     }
+
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    int total_msc = usb_msc_obtener_cantidad();
+    consola_imprimir("Almacenamiento USB (MSC): ");
+    if (total_msc > 0) {
+        consola_imprimir_color("[OPERATIVO] ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_dec(total_msc);
+        consola_imprimir_linea(" unidad(es) detectada(s)");
+        for (int i = 0; i < USB_MSC_MAX_DISPOSITIVOS; i++) {
+            const struct usb_msc_dispositivo *msc = usb_msc_obtener_dispositivo(i);
+            if (msc && msc->activo) {
+                consola_imprimir("  * Disco #");
+                consola_imprimir_dec(i);
+                consola_imprimir(": ");
+                consola_imprimir_color(msc->fabricante, COLOR_EXITO_DEFAULT);
+                consola_imprimir(" ");
+                consola_imprimir_color(msc->producto, COLOR_EXITO_DEFAULT);
+                consola_imprimir(" (Rev ");
+                consola_imprimir(msc->revision);
+                consola_imprimir(") en Puerto ");
+                consola_imprimir_dec(msc->puerto_idx);
+                consola_imprimir(" (Slot ");
+                consola_imprimir_dec(msc->slot_id);
+                consola_imprimir(")\n");
+
+                uint64_t cap_mb = msc->capacidad_bytes / (1024ULL * 1024ULL);
+                uint64_t cap_gb = msc->capacidad_bytes / (1024ULL * 1024ULL * 1024ULL);
+                consola_imprimir("    Capacidad : ");
+                if (cap_gb > 0) {
+                    consola_imprimir_dec(cap_gb);
+                    consola_imprimir(" GB (");
+                }
+                consola_imprimir_dec(cap_mb);
+                consola_imprimir(" MB");
+                if (cap_gb > 0) consola_imprimir(")");
+                consola_imprimir(" | Sectores: ");
+                consola_imprimir_dec(msc->sectores_totales);
+                consola_imprimir(" x ");
+                consola_imprimir_dec(msc->tamano_sector);
+                consola_imprimir_linea(" bytes");
+            }
+        }
+    } else {
+        consola_imprimir_linea_color("[NINGUNA UNIDAD DETECTADA]", COLOR_TEXTO_DEFAULT);
+        consola_imprimir_linea("  Conecta un pendrive USB para inicializar SCSI BOT automáticamente.");
+    }
+
+    consola_imprimir_linea_color("Tip: Escribe 'usb leer <lba>' para volcar sectores físicos del pendrive.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'disco' para ver el diagnóstico detallado de unidades SCSI.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("Tip: Escribe 'usb monitor' para probar en vivo conectando y desconectando.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("Tip: Escribe 'usb reset <puerto>' para reiniciar un puerto especifico.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
@@ -2012,7 +2300,9 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  teclado        ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Autodiagnóstico del teclado USB y puertos ('teclado probar').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  usb            ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Inspección de puertos USB ('usb monitor', 'usb diag', 'usb reset <p>').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Inspección USB y lectura física ('usb leer <lba>', 'usb monitor', 'usb reset <p>').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  disco          ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Almacenamiento USB Mass Storage y lectura SCSI ('disco leer <lba>').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
@@ -2428,6 +2718,16 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: disco / storage / pendrive
+    if (str_comienza_con(linea, "disco") || str_comienza_con(linea, "storage") || str_comienza_con(linea, "pendrive")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "disco ")) arg = str_saltar_espacios(linea + 6);
+        else if (str_comienza_con(linea, "storage ")) arg = str_saltar_espacios(linea + 8);
+        else if (str_comienza_con(linea, "pendrive ")) arg = str_saltar_espacios(linea + 9);
+        ejecutar_comando_disco(arg);
+        return;
+    }
+
     // COMANDO: apagar
     if (str_igual(linea, "apagar") || str_igual(linea, "poweroff") || str_igual(linea, "shutdown")) {
         consola_imprimir_linea_color("==> Apagando equipo vía ACPI...", COLOR_AVISO_DEFAULT);
@@ -2471,6 +2771,13 @@ void terminal_ejecutar(void) {
     // 2. Autodiagnóstico enfocado del Teclado y Bus USB xHCI (reemplaza el volcado de líneas PCIe)
     ejecutar_autodiagnostico_teclado();
     consola_imprimir_linea("");
+
+    // 3. Si hay almacenamiento USB detectado, autoprueba de lectura de Sector 0 (MBR)
+    if (usb_msc_obtener_cantidad() > 0) {
+        consola_imprimir_linea_color("==> [ ALMACENAMIENTO USB DETECTADO ] Verificando Sector 0 (MBR)...", COLOR_EXITO_DEFAULT);
+        ejecutar_lectura_usb_msc(0, 0);
+        consola_imprimir_linea("");
+    }
 
     char buffer[256];
 
