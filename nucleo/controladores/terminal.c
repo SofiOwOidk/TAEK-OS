@@ -155,7 +155,6 @@ static void imprimir_banner(void) {
     consola_imprimir_linea_color("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Terminal de Control   ", COLOR_AVISO_DEFAULT);
     consola_imprimir_color      ("  Sesión iniciada como usuario: ", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("sudo (Privilegios Máximos Ring 0)", COLOR_USUARIO_DEFAULT);
-    consola_imprimir_linea_color("  Filosofía: \"Vibecoding en Español y con Buenas Prácticas\"   ", COLOR_PROMPT_DEFAULT);
     consola_imprimir_linea_color("  Escribe 'ayuda' para ver la lista de comandos disponibles.  ", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
     consola_imprimir_linea("");

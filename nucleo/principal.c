@@ -370,7 +370,6 @@ void principal(void) {
     serial_imprimir_linea("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Español   ");
     serial_imprimir_linea("  Procesador: x86_64 (Listo para Intel Core i9-14900HX)       ");
     serial_imprimir_linea("  ¡Hipervisor VMX y Guardián Don Cangrejo Armados!            ");
-    serial_imprimir_linea("  Filosofía: \"Vibecoding en Español y con Buenas Prácticas\"   ");
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("  [ OK ] Todas las etapas verificadas por El Huevo.           ");
     serial_imprimir_linea("  [ OK ] El Huevo sigue 100% INTACTO. Integridad: 100%.       ");
