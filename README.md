@@ -11,7 +11,8 @@
 
 ## 🤖 Desarrollo y Co-Ingeniería
 
-> **Usando apoyo de Gemini (Google DeepMind)** como copiloto de ingeniería, arquitectura de sistemas bare-metal, depuración en bajo nivel y diseño de controladores de hardware.
+> **Usando apoyo de Gemini (Google DeepMind)** como copiloto de ingeniería, arquitectura de sistemas bare-metal, depuración en bajo nivel y diseño de controladores de hardware.  
+> **Documentación creada por Gemini:** Bitácoras técnicas, guías de arranque en hardware real, especificaciones de controladores y manuales de referencia.
 
 ---
 

@@ -1,4 +1,5 @@
 # Guía de Pruebas en Hardware Real (Laptops y PCs x86_64) 🖥️⚡
+> **Documentación creada por Gemini (Google DeepMind)**
 
 Esta guía documenta los pasos de configuración de BIOS UEFI, conexiones de telemetría serial y comandos de verificación para arrancar **TAEK OS** en hardware real: probado y validado en laptops (Intel Core i7-8650U) y en plataformas de escritorio MoDT (Intel Core i9-14900HX con GPU PCIe dedicada).
 
