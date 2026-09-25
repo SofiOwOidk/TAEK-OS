@@ -1,3 +1,7 @@
+param(
+    [switch]$TraceXhci = $false
+)
+
 # Configurar la consola de Windows para UTF-8 nativo (¡Soporte total para la Ñ y tildes!)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -23,15 +27,27 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "==> Lanzando TAEK OS en QEMU UEFI con Audio AC97 y Pantalla Five Nights..." -ForegroundColor Green
+Write-Host "==> Lanzando TAEK OS en QEMU UEFI con xHCI, Teclado USB Virtual y Audio AC97..." -ForegroundColor Green
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $ovmf = "C:\Program Files\qemu\share\edk2-x86_64-code.fd"
 $img  = "$directorioActual\build\taek-os.img"
 
-& $qemu -drive if=pflash,format=raw,readonly=on,file="$ovmf" `
-        -drive file="$img",format=raw `
-        -m 512M `
-        -M q35 `
-        -audiodev dsound,id=snd0 `
-        -device AC97,audiodev=snd0 `
-        -serial stdio
+$argsQemu = @(
+    "-drive", "if=pflash,format=raw,readonly=on,file=$ovmf",
+    "-drive", "file=$img,format=raw",
+    "-m", "512M",
+    "-M", "q35",
+    "-audiodev", "dsound,id=snd0",
+    "-device", "AC97,audiodev=snd0",
+    "-device", "qemu-xhci,id=xhci",
+    "-device", "usb-kbd,bus=xhci.0,id=kbd1",
+    "-device", "usb-kbd,bus=xhci.0,id=kbd2",
+    "-serial", "stdio"
+)
+
+if ($TraceXhci) {
+    Write-Host "  [+] Habilitando trazas de depuración de xHCI: usb_xhci_*" -ForegroundColor Yellow
+    $argsQemu += @("-trace", "usb_xhci_*")
+}
+
+& $qemu @argsQemu

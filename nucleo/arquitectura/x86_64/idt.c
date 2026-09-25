@@ -69,7 +69,7 @@ void despachador_interrupciones(struct marco_interrupcion *marco) {
     if (marco->num_interrupcion < 32) {
         // Excepción de CPU: invocar autopsia forense de El Huevo
         const char *nombre = g_nombres_excepciones[marco->num_interrupcion];
-        huevo_quebrar(nombre, marco->rip, marco->rsp, marco->codigo_error);
+        huevo_quebrar_con_marco(nombre, marco);
         return;
     }
 

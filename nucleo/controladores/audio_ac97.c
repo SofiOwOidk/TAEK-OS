@@ -1,4 +1,5 @@
 #include "audio_ac97.h"
+#include "audio_hda.h"
 #include "../arquitectura/x86_64/pci.h"
 #include "../arquitectura/x86_64/puertos.h"
 #include "../arquitectura/x86_64/serial.h"
@@ -19,6 +20,7 @@ static uint16_t g_nabmbar = 0;
 static uint64_t g_base_fisica  = 0;
 static uint64_t g_base_virtual = 0;
 static int g_iniciado = 0;
+static int g_usar_hda = 0;
 
 // Variables de estado del flujo de audio
 static const uint8_t *g_audio_datos          = 0;
@@ -39,6 +41,14 @@ int audio_ac97_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel
     g_base_fisica  = base_fisica_kernel;
     g_base_virtual = base_virtual_kernel;
 
+    // 1. Probar primero si hay un controlador Intel HDA moderno (Hardware real / Laptop 8086:8d71 / MoDT)
+    if (audio_hda_iniciar() == 0) {
+        g_usar_hda = 1;
+        g_iniciado = 1;
+        return 0;
+    }
+
+    // 2. Si no hay HDA, buscar tarjeta AC97 tradicional (Emulador QEMU)
     if (pci_buscar_dispositivo(AC97_VENDOR_ID, AC97_DEVICE_ID, &g_pci_ac97) != 0) {
         return 1; // Tarjeta AC97 no encontrada
     }
@@ -134,7 +144,12 @@ static int audio_ac97_reproducir_flujo(const void *datos_pcm, uint32_t tamano_by
 }
 
 void audio_ac97_actualizar(void) {
-    if (!g_iniciado || (!g_audio_activo && g_entradas_en_cola == 0)) {
+    if (!g_iniciado) return;
+    if (g_usar_hda) {
+        audio_hda_actualizar();
+        return;
+    }
+    if (!g_audio_activo && g_entradas_en_cola == 0) {
         return;
     }
 
@@ -189,16 +204,23 @@ void audio_ac97_actualizar(void) {
     }
 }
 
+int audio_es_intel_hda(void) {
+    return g_usar_hda;
+}
+
 int audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+    if (g_usar_hda) return audio_hda_reproducir_pcm(datos_pcm, tamano_bytes);
     return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
 }
 
 int audio_ac97_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes) {
+    if (g_usar_hda) return audio_hda_reproducir_pcm_bucle(datos_pcm, tamano_bytes);
     return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 1);
 }
 
 int audio_ac97_esta_reproduciendo(void) {
     if (!g_iniciado) return 0;
+    if (g_usar_hda) return audio_hda_esta_reproduciendo();
     audio_ac97_actualizar();
     if (g_audio_activo || g_entradas_en_cola > 0) {
         return 1;
@@ -209,6 +231,10 @@ int audio_ac97_esta_reproduciendo(void) {
 
 void audio_ac97_detener(void) {
     if (!g_iniciado) return;
+    if (g_usar_hda) {
+        audio_hda_detener();
+        return;
+    }
     escribir_puerto_b(g_nabmbar + 0x1B, 0x00);
     g_audio_activo         = 0;
     g_audio_en_bucle       = 0;

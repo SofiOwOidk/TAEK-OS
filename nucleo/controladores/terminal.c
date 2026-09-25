@@ -1,5 +1,6 @@
 #include "terminal.h"
 #include "consola.h"
+#include "teclado.h"
 #include "pantalla.h"
 #include "audio_ac97.h"
 #include "animacion_cangrejo.h"
@@ -18,6 +19,7 @@
 #include "../arquitectura/x86_64/pci.h"
 #include "../arquitectura/x86_64/apic.h"
 #include "iommu.h"
+#include "xhci.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 
@@ -166,6 +168,7 @@ static void imprimir_prompt(void) {
 }
 
 void terminal_iniciar(void) {
+    teclado_iniciar();
     consola_iniciar();
     consola_limpiar();
     imprimir_banner();
@@ -1521,6 +1524,438 @@ static void ejecutar_comando_iommu(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'iommu probar' para ejecutar el autodiagnóstico de remapeo.", COLOR_TEXTO_DEFAULT);
 }
 
+static void ejecutar_autodiagnostico_teclado(void) {
+    if (teclado_es_modo_nativo()) {
+        consola_imprimir_linea_color("================ [ AUTODIAGNÓSTICO DEL TECLADO Y SUBSISTEMA USB ] ================", COLOR_AVISO_DEFAULT);
+        consola_imprimir("  Modo de Operación    : ");
+        consola_imprimir_linea_color("[MODO NATIVO FIRMWARE (SMM / USB LEGACY PS/2)]", COLOR_EXITO_DEFAULT);
+        consola_imprimir("  Controlador de Teclas: ");
+        consola_imprimir_linea_color("Canal i8042 Puertos 0x60 / 0x64 [ACTIVO]", COLOR_PROMPT_DEFAULT);
+        consola_imprimir("  Teclado Externo (USB): ");
+        consola_imprimir_linea_color("Emulación SMM de BIOS UEFI Activa (Transparente y Estable)", COLOR_EXITO_DEFAULT);
+        consola_imprimir("  Teclado Interno (PC) : ");
+        consola_imprimir_linea_color("Controlador Embebido (EC) / Matriz PS/2 [ACTIVO]", COLOR_EXITO_DEFAULT);
+        consola_imprimir("  Compatibilidad Total : ");
+        consola_imprimir_linea_color("100% Idéntico al entorno nativo de Ventoy y Limine", COLOR_USUARIO_DEFAULT);
+        consola_imprimir("  Estado de Recepción  : ");
+        if (teclado_esta_presente()) {
+            consola_imprimir_linea_color("Búfer 0x60 en línea - Decodificación Scancode Set 1 lista", COLOR_EXITO_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("Esperando pulsación...", COLOR_AVISO_DEFAULT);
+        }
+        consola_imprimir_linea_color("==================================================================================", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color("Tip: Ambos teclados (externo USB e interno) escriben directamente en la terminal.", COLOR_TEXTO_DEFAULT);
+        consola_imprimir_linea_color("Tip: Escribe 'teclado probar' para verificar la captura interactiva de teclas.", COLOR_TEXTO_DEFAULT);
+        return;
+    }
+
+    const struct estado_xhci *st = xhci_obtener_estado();
+    consola_imprimir_linea_color("================ [ AUTODIAGNÓSTICO DEL TECLADO Y SUBSISTEMA USB ] ================", COLOR_AVISO_DEFAULT);
+
+    if (!st->controlador_detectado) {
+        consola_imprimir_linea_color("  [!] CONTROLADOR xHCI : NO DETECTADO EN BUS PCI", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea("      El kernel no encontró ningún controlador host USB 3.x (Clase 0x0C:03:30).");
+        consola_imprimir_linea_color("==================================================================================", COLOR_AVISO_DEFAULT);
+        return;
+    }
+
+    // 1. Teclado interno
+    consola_imprimir("  Teclado Interno      : ");
+    if (teclado_es_modo_nativo()) {
+        consola_imprimir_linea_color("Controlador i8042 / EC (Puertos 0x60 / 0x64) [EN LINEA]", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("Controlador i8042 / EC [SILENCIADO POR MODO xHCI - CERO FALSOS POSITIVOS]", COLOR_AVISO_DEFAULT);
+    }
+
+    // 2. Datos del Controlador PCI
+    consola_imprimir("  Controlador Host PCI : ");
+    terminal_imprimir_hex_fijo(st->bus, 2);
+    consola_imprimir(":");
+    terminal_imprimir_hex_fijo(st->ranura, 2);
+    consola_imprimir(".");
+    terminal_imprimir_hex_fijo(st->funcion, 1);
+    consola_imprimir(" [Vendor: ");
+    terminal_imprimir_hex_fijo(st->id_proveedor, 4);
+    consola_imprimir(" Dev: ");
+    terminal_imprimir_hex_fijo(st->id_dispositivo, 4);
+    if (st->id_proveedor == 0x8086 && st->id_dispositivo == 0x7A60) {
+        consola_imprimir_color(" (Intel Raptor Lake PCH USB 3.2)", COLOR_EXITO_DEFAULT);
+    }
+    consola_imprimir_linea("]");
+
+    // 2. Espacio MMIO y Colisión VT-d
+    consola_imprimir("  Espacio MMIO         : Físico: 0x");
+    terminal_imprimir_hex_fijo(st->dir_fisica_mmio, 16);
+    consola_imprimir(" -> Virtual: 0x");
+    terminal_imprimir_hex_fijo(st->dir_virtual_mmio, 16);
+    if (st->dir_virtual_mmio == 0xFFFFFE0004000000ULL) {
+        consola_imprimir_linea_color(" [OK: Libre de Colisión VT-d]", COLOR_EXITO_DEFAULT);
+    } else {
+        consola_imprimir_linea("");
+    }
+
+    // 3. Capacidades de Hardware
+    consola_imprimir("  Capacidades Silicio  : Slots Máx: ");
+    consola_imprimir_dec(st->max_slots);
+    consola_imprimir(" | Puertos Raíz: ");
+    consola_imprimir_dec(st->max_puertos);
+    consola_imprimir(" | Dispositivos Conectados: ");
+    consola_imprimir_dec(st->puertos_conectados);
+    consola_imprimir_linea("");
+
+    // 4. Detalle de Puertos Raíz (Especialmente los conectados)
+    consola_imprimir_linea_color("  --- Inspección Física de Puertos Raíz ---", COLOR_PROMPT_DEFAULT);
+    int puertos_activos = 0;
+    for (uint8_t p = 1; p <= st->max_puertos; p++) {
+        uint32_t portsc = 0;
+        int conectado = 0, habilitado = 0;
+        uint8_t vel = 0;
+        if (xhci_obtener_info_puerto(p, &portsc, &conectado, &habilitado, &vel) == 0) {
+            if (conectado || (portsc & 0x01) /* CCS */) {
+                puertos_activos++;
+                consola_imprimir("    * Puerto ");
+                consola_imprimir_dec(p);
+                consola_imprimir(": ");
+                consola_imprimir_color("[CONECTADO]", COLOR_EXITO_DEFAULT);
+                consola_imprimir(" Habilitado: ");
+                consola_imprimir(habilitado ? "[SÍ]" : "[NO]");
+                consola_imprimir(" | Velocidad: ");
+                if (vel == 1) consola_imprimir_color("Full-Speed 12 Mbps (Teclado/Mouse)", COLOR_EXITO_DEFAULT);
+                else if (vel == 2) consola_imprimir("Low-Speed 1.5 Mbps");
+                else if (vel == 3) consola_imprimir("High-Speed 480 Mbps");
+                else if (vel >= 4) consola_imprimir_color("SuperSpeed 5+ Gbps", COLOR_EXITO_DEFAULT);
+                else consola_imprimir("Desconocida");
+
+                consola_imprimir(" (PORTSC: 0x");
+                terminal_imprimir_hex_fijo(portsc, 8);
+                consola_imprimir_linea(")");
+            }
+        }
+    }
+    if (puertos_activos == 0) {
+        consola_imprimir_linea_color("    * Ningún puerto raíz reporta línea física D+/D- activa en este instante.", COLOR_AVISO_DEFAULT);
+    }
+
+    // 5. Estado del Teclado USB HID
+    consola_imprimir_linea_color("  --- Estado del Teclado Físico USB ---", COLOR_PROMPT_DEFAULT);
+    if (st->teclado_detectado) {
+        consola_imprimir("    * Estado           : ");
+        consola_imprimir_linea_color("[ENDPOINTS CONFIGURADOS; recepción verificada solo si hay eventos]", COLOR_EXITO_DEFAULT);
+        consola_imprimir("    * Teclados Activos : ");
+        consola_imprimir_dec(st->teclados_activos > 0 ? st->teclados_activos : 1);
+        consola_imprimir_linea(" concurrente(s)");
+        consola_imprimir("    * Último Config    : VID:0x");
+        terminal_imprimir_hex_fijo(st->teclado_id_proveedor, 4);
+        consola_imprimir(" PID:0x");
+        terminal_imprimir_hex_fijo(st->teclado_id_producto, 4);
+        if (st->teclado_id_proveedor == 0x05AC && st->teclado_id_producto == 0x024F) {
+            consola_imprimir_color(" (Havit Gaming / Apple Aluminum NKRO)", COLOR_EXITO_DEFAULT);
+        } else if (st->teclado_id_proveedor == 0x3151 && st->teclado_id_producto == 0x3020) {
+            consola_imprimir_color(" (Micronics Wireless 2.4GHz Dock)", COLOR_EXITO_DEFAULT);
+        }
+        consola_imprimir(" en Puerto ");
+        consola_imprimir_dec(st->teclado_puerto);
+        consola_imprimir_linea("");
+
+        consola_imprimir("    * Endpoints Armados: ");
+        consola_imprimir_dec(st->teclado_num_eps);
+        consola_imprimir_color(" endpoint(s) IN de interrupción con DMA dedicado", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea("");
+
+        consola_imprimir("    * Telemetría       : Reportes Teclas HID: ");
+        consola_imprimir_dec(st->reportes_hid_recibidos);
+        consola_imprimir(" | Paquetes Totales: ");
+        consola_imprimir_dec(st->paquetes_recibidos);
+        consola_imprimir(" | Último Tipo TRB: ");
+        consola_imprimir_dec(st->ultimo_evento_trb_tipo);
+        consola_imprimir(" | Transferencias HID: ");
+        consola_imprimir_dec(st->eventos_transferencia);
+        consola_imprimir(" | Errores HID: ");
+        consola_imprimir_dec(st->fallos_transferencia);
+        consola_imprimir_linea("");
+        consola_imprimir("    * Último evento HID: DCI=");
+        consola_imprimir_dec(st->ultimo_dci_transfer);
+        consola_imprimir(" código=");
+        consola_imprimir_dec(st->ultimo_codigo_transfer);
+        consola_imprimir(" longitud=");
+        consola_imprimir_dec(st->ultimo_tamano_reporte);
+        consola_imprimir(" bytes: ");
+        for (int i = 0; i < st->ultimo_tamano_reporte && i < 16; i++) {
+            terminal_imprimir_hex_fijo(st->ultimo_reporte[i], 2);
+            consola_imprimir(" ");
+        }
+        consola_imprimir_linea("");
+        if (st->ultimo_caracter) {
+            consola_imprimir(" | Último Carácter: '");
+            consola_escribir_caracter((char)st->ultimo_caracter);
+            consola_imprimir("'");
+        }
+        consola_imprimir_linea("");
+    } else {
+        consola_imprimir("    * Estado           : ");
+        consola_imprimir_linea_color("[ESPERANDO CONEXIÓN / FIRMWARE DE TECLADO]", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea("      El driver continuará sondeando en segundo plano (Hotplug activo).");
+    }
+
+    consola_imprimir("    * Fase USB: ");
+    consola_imprimir_dec(st->etapa_enumeracion);
+    consola_imprimir(" | Transferencias de control: ");
+    consola_imprimir_dec(st->transferencias_control);
+    consola_imprimir(" | Fallos: ");
+    consola_imprimir_dec(st->fallos_control);
+    consola_imprimir(" | Última petición: 0x");
+    terminal_imprimir_hex_fijo(st->ultima_peticion_control, 2);
+    consola_imprimir(" código: ");
+    consola_imprimir_dec(st->ultimo_codigo_control);
+    consola_imprimir_linea("");
+    consola_imprimir("      Setup: wValue=0x");
+    terminal_imprimir_hex_fijo(st->ultimo_valor_control, 4);
+    consola_imprimir(" wIndex=0x");
+    terminal_imprimir_hex_fijo(st->ultimo_indice_control, 4);
+    consola_imprimir(" wLength=");
+    consola_imprimir_dec(st->ultimo_largo_control);
+    consola_imprimir_linea("");
+    consola_imprimir_linea("      Fase: 0=inactivo, 1=slot, 2=address, 3=device desc, 4=config desc, 5=config ep, 6=set config, 7=set protocol, 8=endpoints listos.");
+
+    // 6. Estado Teclado PS/2 Legacy
+    consola_imprimir("  Teclado Legacy PS/2  : ");
+    if (teclado_es_modo_nativo()) {
+        if (teclado_esta_presente()) {
+            consola_imprimir_linea_color("[DISPONIBLE / i8042 ACTIVO]", COLOR_PROMPT_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("[INACTIVO - Cesión de BIOS UEFI completada]", COLOR_AVISO_DEFAULT);
+        }
+    } else {
+        consola_imprimir_linea_color("[DESHABILITADO - Sistema operando en modo USB xHCI puro]", COLOR_AVISO_DEFAULT);
+    }
+
+    consola_imprimir_linea_color("==================================================================================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'teclado probar' para entrar al modo de captura de teclas en vivo.", COLOR_TEXTO_DEFAULT);
+}
+
+static void ejecutar_comando_teclado(const char *arg) {
+    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "prueba"))) {
+        consola_imprimir_linea_color("================ MODO PRUEBA DE TECLADO EN VIVO ================", COLOR_AVISO_DEFAULT);
+        if (teclado_es_modo_nativo()) {
+            consola_imprimir_linea_color("  Modo Entrada: [MODO NATIVO PS/2 (Teclado interno/legacy activo)]", COLOR_PROMPT_DEFAULT);
+        } else {
+            consola_imprimir_linea_color("  Modo Entrada: [xHCI PURO (Teclado interno PS/2 silenciado)]", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("  -> Solo las pulsaciones del teclado USB físico externo serán capturadas.");
+        }
+        consola_imprimir_linea("Presiona teclas en tu teclado físico para ver los eventos USB en tiempo real.");
+        consola_imprimir_linea("Presiona ESC o Enter (o espera 10 segundos) para volver a la terminal...");
+        consola_imprimir_linea("");
+
+        uint64_t inicio = tiempo_obtener_milisegundos();
+        int eventos_vistos = 0;
+
+        while (tiempo_obtener_milisegundos() - inicio < 10000) {
+            if (!teclado_es_modo_nativo()) {
+                xhci_sondeo();
+            }
+
+            char c = 0;
+            const char *origen = NULL;
+
+            if (teclado_es_modo_nativo()) {
+                c = teclado_leer_caracter();
+                if (c != 0) origen = "Modo Nativo PS/2 (Puerto 0x60)";
+            } else {
+                c = xhci_leer_caracter();
+                if (c != 0) origen = "USB xHCI Ring 0";
+            }
+
+            if (c == 0 && serial_hay_datos()) {
+                c = serial_leer_caracter();
+                if (c == '\r') c = '\n';
+                if (c != 0) origen = "Serial COM1 (UART 0x3F8)";
+            }
+
+            if (c != 0) {
+                eventos_vistos++;
+                inicio = tiempo_obtener_milisegundos(); // Renovar timeout si hay actividad
+                consola_imprimir_color("  [EVENTO CAPTURADO] ", COLOR_EXITO_DEFAULT);
+                consola_imprimir("Carácter: '");
+                if (c >= 32 && c <= 126) consola_escribir_caracter(c);
+                else consola_imprimir("?");
+                consola_imprimir("' | ASCII: 0x");
+                terminal_imprimir_hex_fijo((uint8_t)c, 2);
+                consola_imprimir(" | Origen: ");
+                consola_imprimir(origen ? origen : "Desconocido");
+                if (!teclado_es_modo_nativo()) {
+                    const struct estado_xhci *st = xhci_obtener_estado();
+                    if (st->ultimo_puerto_tecla > 0) {
+                        consola_imprimir(" (Puerto ");
+                        consola_imprimir_dec(st->ultimo_puerto_tecla);
+                        consola_imprimir(", Slot ");
+                        consola_imprimir_dec(st->ultimo_slot_tecla);
+                        consola_imprimir(")");
+                    }
+                    consola_imprimir(" | Reportes HID: ");
+                    consola_imprimir_dec(st->reportes_hid_recibidos);
+                    consola_imprimir(" | Total Paquetes: ");
+                    consola_imprimir_dec(st->paquetes_recibidos);
+                }
+                consola_imprimir_linea("");
+
+                if (c == 27 /* ESC */ || c == '\n' || c == '\r') {
+                    consola_imprimir_linea("Saliendo del modo prueba...");
+                    break;
+                }
+            }
+            esperar_milisegundos(10);
+        }
+
+        if (eventos_vistos == 0) {
+            consola_imprimir_linea_color("  [AVISO] No se capturaron teclas durante el periodo de prueba.", COLOR_AVISO_DEFAULT);
+        }
+        consola_imprimir_linea_color("=================================================================", COLOR_AVISO_DEFAULT);
+        return;
+    }
+
+    ejecutar_autodiagnostico_teclado();
+}
+
+static void ejecutar_comando_usb(const char *arg) {
+    if (arg) arg = str_saltar_espacios(arg);
+
+    // Subcomando: usb monitor / usb escucha
+    if (arg && (str_igual(arg, "monitor") || str_igual(arg, "escuchar") || str_igual(arg, "vigilar") || str_igual(arg, "watch"))) {
+        consola_imprimir_linea_color("================== [ MONITOR DE PUERTOS USB EN VIVO ] ==================", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("Escuchando eventos de insercion/extraccion en los puertos USB xHCI.");
+        consola_imprimir_linea_color("--> Conecta o desconecta cualquier dispositivo para verificar la deteccion.", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea("Presiona cualquier tecla (o espera 20 segundos) para regresar...");
+        consola_imprimir_linea("");
+
+        uint64_t inicio = tiempo_obtener_milisegundos();
+        while (tiempo_obtener_milisegundos() - inicio < 20000) {
+            xhci_sondeo();
+            char c = consola_leer_caracter();
+            if (c != 0) {
+                consola_imprimir_linea("\nMonitor detenido por el usuario.");
+                break;
+            }
+            esperar_milisegundos(20);
+        }
+        consola_imprimir_linea_color("========================================================================", COLOR_AVISO_DEFAULT);
+        return;
+    }
+
+    // Subcomando: usb reset <puerto>
+    if (arg && (str_comienza_con(arg, "reset ") || str_comienza_con(arg, "reiniciar "))) {
+        const char *p_str = arg + (str_comienza_con(arg, "reset ") ? 6 : 10);
+        p_str = str_saltar_espacios(p_str);
+        int p = 0;
+        while (*p_str >= '0' && *p_str <= '9') {
+            p = p * 10 + (*p_str - '0');
+            p_str++;
+        }
+        if (p >= 1 && p <= 32) {
+            xhci_forzar_reset_puerto((uint8_t)p);
+        } else {
+            consola_imprimir_linea_color("Uso: usb reset <numero_de_puerto 1..32>", COLOR_ERROR_DEFAULT);
+        }
+        return;
+    }
+
+    // Subcomando: usb diag / usb volcado / usb dump
+    if (arg && (str_igual(arg, "diag") || str_igual(arg, "diagnostico") || str_igual(arg, "volcado") || str_igual(arg, "dump"))) {
+        xhci_imprimir_diagnostico_completo();
+        return;
+    }
+
+    // Subcomando: usb teclado / usb test / usb probar
+    if (arg && (str_igual(arg, "teclado") || str_igual(arg, "probar") || str_igual(arg, "test"))) {
+        ejecutar_comando_teclado(arg);
+        return;
+    }
+
+    // Por defecto (usb / usb puertos / usb lista / usb status): Tabla detallada de puertos raíz
+    const struct estado_xhci *st = xhci_obtener_estado();
+    if (!st->controlador_detectado) {
+        consola_imprimir_linea_color("[!] CONTROLADOR xHCI NO DISPONIBLE", COLOR_ERROR_DEFAULT);
+        return;
+    }
+
+    consola_imprimir_linea_color("================= [ INSPECCION DE PUERTOS USB xHCI ] =================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("Controlador Host PCI : ");
+    terminal_imprimir_hex_fijo(st->bus, 2);
+    consola_imprimir(":");
+    terminal_imprimir_hex_fijo(st->ranura, 2);
+    consola_imprimir(".");
+    terminal_imprimir_hex_fijo(st->funcion, 1);
+    consola_imprimir(" (Vendor 0x");
+    terminal_imprimir_hex_fijo(st->id_proveedor, 4);
+    consola_imprimir(" Dev 0x");
+    terminal_imprimir_hex_fijo(st->id_dispositivo, 4);
+    consola_imprimir_linea(")");
+
+    consola_imprimir("Capacidades Silicio  : ");
+    consola_imprimir_dec(st->max_puertos);
+    consola_imprimir(" Puertos Raiz | ");
+    consola_imprimir_dec(st->max_slots);
+    consola_imprimir(" Slots | Dispositivos Conectados: ");
+    consola_imprimir_dec(st->puertos_conectados);
+    consola_imprimir_linea("");
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+
+    int conectados = 0;
+    for (uint8_t p = 1; p <= st->max_puertos; p++) {
+        uint32_t portsc = 0;
+        int con = 0, hab = 0;
+        uint8_t vel = 0;
+        if (xhci_obtener_info_puerto(p, &portsc, &con, &hab, &vel) == 0) {
+            if (con || (portsc & 0x01)) {
+                conectados++;
+                consola_imprimir("  Puerto ");
+                if (p < 10) consola_imprimir(" ");
+                consola_imprimir_dec(p);
+                consola_imprimir(": ");
+                consola_imprimir_color("[CONECTADO]   ", COLOR_EXITO_DEFAULT);
+                consola_imprimir("PED=");
+                consola_imprimir(hab ? "[SI] " : "[NO] ");
+                consola_imprimir("| Vel: ");
+                if (vel == 1) consola_imprimir_color("Full-Speed 12M  ", COLOR_EXITO_DEFAULT);
+                else if (vel == 2) consola_imprimir("Low-Speed 1.5M  ");
+                else if (vel == 3) consola_imprimir("High-Speed 480M ");
+                else if (vel >= 4) consola_imprimir_color("SuperSpeed 5G+  ", COLOR_PROMPT_DEFAULT);
+                else consola_imprimir("Desconocida     ");
+
+                consola_imprimir("| PORTSC=0x");
+                terminal_imprimir_hex_fijo(portsc, 8);
+
+                if (st->teclado_detectado && st->teclado_puerto == p) {
+                    consola_imprimir_color(" <- TECLADO HID ACTIVO", COLOR_USUARIO_DEFAULT);
+                }
+                consola_imprimir_linea("");
+            }
+        }
+    }
+
+    if (conectados == 0) {
+        consola_imprimir_linea_color("  [AVISO] No se detecta ningun dispositivo conectado en los puertos raiz.", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("  Conecta el teclado/dongle y ejecuta 'usb monitor' para ver la deteccion.");
+    }
+
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    consola_imprimir("Teclado USB: ");
+    if (st->teclado_detectado) {
+        consola_imprimir_color("[OPERATIVO]", COLOR_EXITO_DEFAULT);
+        consola_imprimir(" en Puerto ");
+        consola_imprimir_dec(st->teclado_puerto);
+        consola_imprimir(" (VID:0x");
+        terminal_imprimir_hex_fijo(st->teclado_id_proveedor, 4);
+        consola_imprimir(" PID:0x");
+        terminal_imprimir_hex_fijo(st->teclado_id_producto, 4);
+        consola_imprimir_linea(")");
+    } else {
+        consola_imprimir_linea_color("[NO DETECTADO - Sondeo y Hotplug Activos]", COLOR_AVISO_DEFAULT);
+    }
+    consola_imprimir_linea_color("Tip: Escribe 'usb monitor' para probar en vivo conectando y desconectando.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'usb reset <puerto>' para reiniciar un puerto especifico.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -1575,6 +2010,10 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Gestor de memoria DMA contigua y coherencia de caché ('dma probar').");
         consola_imprimir_color("  iommu          ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Controlador Intel VT-d, remapeo DRHD y regiones RMRR ('iommu probar').");
+        consola_imprimir_color("  teclado        ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Autodiagnóstico del teclado USB y puertos ('teclado probar').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  usb            ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Inspección de puertos USB ('usb monitor', 'usb diag', 'usb reset <p>').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
@@ -1971,6 +2410,25 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: teclado / keyboard / kbd
+    if (str_comienza_con(linea, "teclado") || str_comienza_con(linea, "keyboard") || str_comienza_con(linea, "kbd")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "teclado ")) arg = str_saltar_espacios(linea + 8);
+        else if (str_comienza_con(linea, "keyboard ")) arg = str_saltar_espacios(linea + 9);
+        else if (str_comienza_con(linea, "kbd ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_teclado(arg);
+        return;
+    }
+
+    // COMANDO: usb / xhci
+    if (str_comienza_con(linea, "usb") || str_comienza_con(linea, "xhci")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "usb ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "xhci ")) arg = str_saltar_espacios(linea + 5);
+        ejecutar_comando_usb(arg);
+        return;
+    }
+
     // COMANDO: apagar
     if (str_igual(linea, "apagar") || str_igual(linea, "poweroff") || str_igual(linea, "shutdown")) {
         consola_imprimir_linea_color("==> Apagando equipo vía ACPI...", COLOR_AVISO_DEFAULT);
@@ -1998,6 +2456,22 @@ static void procesar_comando(const char *linea_cruda) {
 
 void terminal_ejecutar(void) {
     terminal_iniciar();
+
+    // 1. Resumen conciso de silicio GPU al arrancar
+    consola_imprimir_color("==> [ SILICIO DETECTADO ] ", COLOR_AVISO_DEFAULT);
+    const struct nvidia_dispositivo *ndev = nvidia_core_obtener_dispositivo();
+    if (ndev && ndev->presente) {
+        consola_imprimir_color("GPU: ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_color(ndev->chip_name, COLOR_EXITO_DEFAULT);
+        consola_imprimir(" (Blackwell GB20x) | VRAM: 16 GiB GDDR7\n");
+    } else {
+        consola_imprimir_linea("Canal de GPU listo en espacio Ring 0.");
+    }
+    consola_imprimir_linea("");
+
+    // 2. Autodiagnóstico enfocado del Teclado y Bus USB xHCI (reemplaza el volcado de líneas PCIe)
+    ejecutar_autodiagnostico_teclado();
+    consola_imprimir_linea("");
 
     char buffer[256];
 

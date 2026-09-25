@@ -17,14 +17,18 @@
 #include "base/memoria.h"
 #include "base/paginacion.h"
 #include "controladores/pantalla.h"
+#include "controladores/consola.h"
 #include "controladores/audio_ac97.h"
+#include "controladores/audio_hda.h"
 #include "controladores/animacion_cangrejo.h"
 #include "controladores/gpu.h"
 #include "base/dma.h"
 #include "controladores/iommu.h"
 #include "compatibilidad/linux.h"
 #include "controladores/video/nvidia/core/nvidia_core.h"
+#include "controladores/xhci.h"
 #include "controladores/terminal.h"
+#include "controladores/teclado.h"
 
 // Revision 3 del protocolo Limine
 __attribute__((used, section(".requests")))
@@ -50,6 +54,13 @@ static volatile struct limine_executable_address_request g_peticion_direccion = 
     .revision = 0
 };
 
+// Peticion del archivo ejecutable (para leer cmdline de arranque de Limine)
+__attribute__((used, section(".requests")))
+static volatile struct limine_executable_file_request g_peticion_ejecutable = {
+    .id = LIMINE_EXECUTABLE_FILE_REQUEST,
+    .revision = 0
+};
+
 // Simbolos binarios incrustados (imagen de bienvenida y audio)
 extern const uint8_t _binary_imagen_arranque_bin_start[];
 extern const uint8_t _binary_imagen_arranque_bin_end[];
@@ -57,11 +68,27 @@ extern const uint8_t _binary_imagen_arranque_bin_end[];
 extern const uint8_t _binary_audio_arranque_bin_start[];
 extern const uint8_t _binary_audio_arranque_bin_end[];
 
+static int str_contiene(const char *cadena, const char *subcadena) {
+    if (!cadena || !subcadena) return 0;
+    for (int i = 0; cadena[i] != '\0'; i++) {
+        int j = 0;
+        while (subcadena[j] != '\0' && cadena[i + j] == subcadena[j]) {
+            j++;
+        }
+        if (subcadena[j] == '\0') return 1;
+    }
+    return 0;
+}
+
 void principal(void) {
     // 1. Inicializar Serial de inmediato para capturar cualquier mensaje de arranque
     serial_iniciar();
     serial_imprimir_linea("\n==============================================================");
     serial_imprimir_linea("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Marcha    ");
+#ifdef COMPILACION_FECHA
+    serial_imprimir("  Compilación: ");
+    serial_imprimir_linea(COMPILACION_FECHA);
+#endif
     serial_imprimir_linea("==============================================================");
     serial_imprimir("[BOOT] Puerto Serial COM1 (0x3F8): ");
     if (serial_esta_activo()) {
@@ -76,6 +103,44 @@ void principal(void) {
         detener_cpu();
     }
     serial_imprimir_linea("[BOOT] Protocolo Limine Base Revision verificado [OK]");
+
+    // 2.1 Procesar opciones de arranque desde la línea de comandos de Limine (cmdline)
+    int modo_ps2_forzado = 0;
+    if (g_peticion_ejecutable.response != NULL &&
+        g_peticion_ejecutable.response->executable_file != NULL &&
+        g_peticion_ejecutable.response->executable_file->cmdline != NULL) {
+        const char *cmdline = (const char *)g_peticion_ejecutable.response->executable_file->cmdline;
+        serial_imprimir("[BOOT] Línea de Comandos: \"");
+        serial_imprimir(cmdline);
+        serial_imprimir_linea("\"");
+        if (str_contiene(cmdline, "modo=ps2") || str_contiene(cmdline, "ps2") || str_contiene(cmdline, "legacy")) {
+            modo_ps2_forzado = 1;
+        }
+    }
+
+    if (modo_ps2_forzado) {
+        teclado_fijar_modo_nativo(1);
+        serial_imprimir_linea("[BOOT] Modo Teclado: Fallback PS/2 Legacy Seleccionado");
+    } else {
+        teclado_fijar_modo_nativo(0);
+        serial_imprimir_linea("[BOOT] Modo Teclado: xHCI Ring 0 (Controlador USB Hardware Activo)");
+    }
+
+    // 3. Inicialización Temprana de Pantalla GOP UEFI y Consola
+    // Permite que todas las etapas de El Huevo y cualquier error se vean en el monitor físico en vivo
+    if (g_peticion_framebuffer.response != NULL && g_peticion_framebuffer.response->framebuffer_count > 0) {
+        struct limine_framebuffer *fb = g_peticion_framebuffer.response->framebuffers[0];
+        pantalla_iniciar(fb);
+        consola_iniciar();
+        consola_limpiar();
+        consola_imprimir_linea_color("==============================================================", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Marcha    ", COLOR_USUARIO_DEFAULT);
+#ifdef COMPILACION_FECHA
+        consola_imprimir("  Compilación: ");
+        consola_imprimir_linea_color(COMPILACION_FECHA, COLOR_AVISO_DEFAULT);
+#endif
+        consola_imprimir_linea_color("==============================================================", COLOR_PROMPT_DEFAULT);
+    }
 
     huevo_iniciar();
 
@@ -185,16 +250,50 @@ void principal(void) {
     serial_imprimir("] ");
     huevo_etapa_ok();
 
-    huevo_etapa("Inicialización de Pantalla GOP UEFI");
+    huevo_etapa("Controlador Host USB 3.x xHCI y Teclado HID");
+    if (teclado_es_modo_nativo()) {
+        teclado_iniciar();
+    }
+
+    if (!teclado_es_modo_nativo()) {
+        if (xhci_iniciar() == 0) {
+            const struct estado_xhci *ex = xhci_obtener_estado();
+            serial_imprimir("[xHCI Activo | Puertos: ");
+            serial_imprimir_dec((uint64_t)ex->max_puertos);
+            serial_imprimir(" | Conectados: ");
+            serial_imprimir_dec((uint64_t)ex->puertos_conectados);
+            if (ex->teclado_detectado) {
+                serial_imprimir(" | Teclado Compuesto USB OK (");
+                serial_imprimir_dec((uint64_t)ex->teclado_num_eps);
+                serial_imprimir(" EPs)] ");
+                consola_imprimir(" [Teclado USB OK] ");
+            } else {
+                serial_imprimir("] ");
+                if (ex->puertos_conectados > 0) {
+                    consola_imprimir(" [USB Conectado] ");
+                }
+            }
+            huevo_etapa_ok();
+        } else {
+            serial_imprimir("[xHCI No Detectado - Fallback de Seguridad a PS/2] ");
+            consola_imprimir(" [Fallback PS/2] ");
+            teclado_fijar_modo_nativo(1);
+            teclado_iniciar();
+            huevo_etapa_ok();
+        }
+    } else {
+        serial_imprimir("[Modo Nativo Firmware Activo - Emulación SMM/PS2 Preservada (Cero Sobrecarga)] ");
+        consola_imprimir(" [Modo Nativo Firmware OK] ");
+        huevo_etapa_ok();
+    }
+
+    huevo_etapa("Verificación de Pantalla GOP UEFI");
     if (g_peticion_framebuffer.response == NULL || g_peticion_framebuffer.response->framebuffer_count < 1) {
         serial_imprimir("[ERROR: SIN PANTALLA GOP] ");
         huevo_quebrar("No se detectó framebuffer UEFI para renderizar", 0, 0, 0);
     }
 
     struct limine_framebuffer *fb = g_peticion_framebuffer.response->framebuffers[0];
-    pantalla_iniciar(fb);
-    pantalla_limpiar(0x00000000); // Fondo negro puro
-
     serial_imprimir("[Resolución: ");
     serial_imprimir_dec(fb->width);
     serial_imprimir("x");
@@ -225,12 +324,21 @@ void principal(void) {
     serial_imprimir("[638x780 BGRA32 Centrada] ");
     huevo_etapa_ok();
 
-    huevo_etapa("Inicialización de Audio PCI AC97");
+    huevo_etapa("Inicialización de Subsistema de Audio (Intel HDA / AC97)");
     if (audio_ac97_iniciar(base_fisica, base_virtual) != 0) {
-        serial_imprimir("[AC97 NO DETECTADO - Continuando en modo mudo] ");
-        huevo_agrietar("Dispositivo de audio AC97 no responde");
+        serial_imprimir("[AUDIO NO DETECTADO - Continuando en modo mudo] ");
+        huevo_agrietar("Dispositivo de audio no responde");
     } else {
-        serial_imprimir("[Intel 82801AA AC97 Listo a 44.1 kHz] ");
+        if (audio_es_intel_hda()) {
+            const struct estado_hda *ehda = audio_hda_obtener_estado();
+            serial_imprimir("[Intel HDA ");
+            serial_imprimir_hex(ehda->id_proveedor);
+            serial_imprimir(":");
+            serial_imprimir_hex(ehda->id_dispositivo);
+            serial_imprimir(" Listo a 44.1 kHz] ");
+        } else {
+            serial_imprimir("[Intel 82801AA AC97 Listo a 44.1 kHz] ");
+        }
         huevo_etapa_ok();
 
         huevo_etapa("Reproducción de Sintonía de Encendido (Qué bonito es Israel Damonte)");
@@ -246,7 +354,12 @@ void principal(void) {
         serial_imprimir("  [ REPRODUCIENDO ] Segundo ");
         serial_imprimir_dec(segundo);
         serial_imprimir_linea(" de 9...");
-        esperar_milisegundos(1000);
+        // HDA usa dos bloques DMA de 64 KiB. Alimentarlo durante la espera
+        // evita que la música se corte antes de que aparezca la terminal.
+        for (int tick = 0; tick < 100; tick++) {
+            audio_ac97_actualizar();
+            esperar_milisegundos(10);
+        }
         huevo_verificar();
     }
     serial_imprimir("[Sintonía Concluida] ");

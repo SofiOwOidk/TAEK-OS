@@ -2,6 +2,8 @@ CC      = clang
 LD      = ld.lld
 NASM    = nasm
 
+FECHA_BUILD = $(shell date +'%Y-%m-%d %H:%M:%S')
+
 CFLAGS  = -target x86_64-unknown-none-elf \
           -std=c11 \
           -Wall -Wextra \
@@ -12,6 +14,7 @@ CFLAGS  = -target x86_64-unknown-none-elf \
           -m64 -march=x86-64 \
           -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
           -mcmodel=kernel \
+          -DCOMPILACION_FECHA="\"$(FECHA_BUILD)\"" \
           -I./nucleo -I.
 
 LDFLAGS = -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 -T linker.ld
@@ -35,6 +38,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/base/paginacion.c \
             nucleo/controladores/pantalla.c \
             nucleo/controladores/audio_ac97.c \
+            nucleo/controladores/audio_hda.c \
             nucleo/controladores/animacion_cangrejo.c \
             nucleo/controladores/teclado.c \
             nucleo/controladores/consola.c \
@@ -45,6 +49,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/video/nvidia/core/nvidia_core.c \
             nucleo/controladores/video/nvidia/firmware/gsp_firmware.c \
             nucleo/controladores/video/nvidia/gsp/gsp_rpc.c \
+            nucleo/controladores/xhci.c \
             nucleo/controladores/terminal.c
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
@@ -138,11 +143,17 @@ $(IMG): $(KERNEL) boot/limine.conf
 
 $(ISO): $(KERNEL) boot/limine.conf
 	@echo "==> Generando Imagen ISO Booteable UEFI/BIOS Híbrida..."
+	@mkdir -p "build antigua"
+	@if ls $(BUILD_DIR)/taek-os-*.iso 1> /dev/null 2>&1; then \
+		echo "==> Archivando compilaciones anteriores en 'build antigua'..."; \
+		cp -u $(BUILD_DIR)/taek-os-*.iso "build antigua/" 2>/dev/null || true; \
+	fi
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine $(BUILD_DIR)/iso_root/EFI/BOOT
 	@cp boot/limine/limine-bios-cd.bin boot/limine/limine-bios.sys boot/limine/limine-uefi-cd.bin $(BUILD_DIR)/iso_root/boot/limine/
 	@cp boot/limine/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/
-	@cp boot/limine.conf $(BUILD_DIR)/iso_root/boot/limine/
-	@cp boot/limine.conf $(BUILD_DIR)/iso_root/
+	@FECHA_MENU=$$(date +'%Y-%m-%d_%H-%M-%S'); \
+	sed "s|/TAEK OS|/TAEK OS ($${FECHA_MENU})|" boot/limine.conf > $(BUILD_DIR)/iso_root/boot/limine/limine.conf; \
+	cp $(BUILD_DIR)/iso_root/boot/limine/limine.conf $(BUILD_DIR)/iso_root/limine.conf
 	@cp $(KERNEL) $(BUILD_DIR)/iso_root/boot/nucleo.elf
 	@xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
 	        -no-emul-boot -boot-load-size 4 -boot-info-table \
@@ -152,9 +163,44 @@ $(ISO): $(KERNEL) boot/limine.conf
 	@if [ -f boot/limine/limine ]; then \
 		boot/limine/limine bios-install $@ > /dev/null 2>&1; \
 	fi
-	@echo "==> Imagen ISO $(ISO) lista para grabar en USB con Rufus / Ventoy / Etcher!"
+	@FECHA_ARCHIVO=$$(date +'%Y-%m-%d_%H-%M-%S'); \
+	cp $@ $(BUILD_DIR)/taek-os-$${FECHA_ARCHIVO}.iso; \
+	echo "==> Imagen ISO principal: $(ISO)"; \
+	echo "==> Copia fechada creada: $(BUILD_DIR)/taek-os-$${FECHA_ARCHIVO}.iso"; \
+	echo "==> Lista para grabar en USB con Rufus / Ventoy / Etcher!"
 
 clean:
+	@mkdir -p "build antigua"
+	@if ls $(BUILD_DIR)/taek-os-*.iso 1> /dev/null 2>&1; then \
+		cp -u $(BUILD_DIR)/taek-os-*.iso "build antigua/" 2>/dev/null || true; \
+	fi
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all clean
+qemu: $(IMG)
+	@echo "==> Lanzando QEMU con controlador xHCI y teclado USB virtual..."
+	@"/mnt/c/Program Files/qemu/qemu-system-x86_64.exe" \
+		-drive if=pflash,format=raw,readonly=on,file="/mnt/c/Program Files/qemu/share/edk2-x86_64-code.fd" \
+		-drive file="$(IMG)",format=raw \
+		-m 512M \
+		-M q35 \
+		-audiodev dsound,id=snd0 \
+		-device AC97,audiodev=snd0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-serial stdio
+
+qemu-trace: $(IMG)
+	@echo "==> Lanzando QEMU con xHCI, teclado USB y trazas activas..."
+	@"/mnt/c/Program Files/qemu/qemu-system-x86_64.exe" \
+		-drive if=pflash,format=raw,readonly=on,file="/mnt/c/Program Files/qemu/share/edk2-x86_64-code.fd" \
+		-drive file="$(IMG)",format=raw \
+		-m 512M \
+		-M q35 \
+		-audiodev dsound,id=snd0 \
+		-device AC97,audiodev=snd0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-trace "usb_xhci_*" \
+		-serial stdio
+
+.PHONY: all clean qemu qemu-trace

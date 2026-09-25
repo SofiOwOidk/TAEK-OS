@@ -114,6 +114,7 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
             void *virt = (void *)(phys + hhdm);
 
             memset(virt, 0, (uint64_t)pags_necesarias * TAMANO_PAGINA);
+            dma_sincronizar_cpu_a_dispositivo(virt, (uint64_t)pags_necesarias * TAMANO_PAGINA);
             return virt;
         }
     }
@@ -168,9 +169,19 @@ void dma_sincronizar_cpu_a_dispositivo(const void *dir_virtual, uint64_t bytes) 
 }
 
 void dma_sincronizar_dispositivo_a_cpu(const void *dir_virtual, uint64_t bytes) {
-    (void)dir_virtual;
-    (void)bytes;
-    // En arquitecturas coherentes con DMA snooping, mfence es suficiente
+    if (!dir_virtual || bytes == 0) return;
+
+    uintptr_t inicio = (uintptr_t)dir_virtual;
+    uintptr_t fin = inicio + bytes;
+
+    // Alinear al tamaño estándar de línea de caché x86_64 (64 bytes)
+    inicio &= ~63ULL;
+
+    for (uintptr_t p = inicio; p < fin; p += 64) {
+        __asm__ volatile ("clflush (%0)" :: "r"(p) : "memory");
+    }
+
+    // Barrera completa de memoria: asegura que las lecturas lean de DRAM físico
     __asm__ volatile ("mfence" ::: "memory");
 }
 

@@ -40,6 +40,7 @@ void animacion_don_cangrejo_explotar(int bucles) {
         for (int f = 0; f < CANGREJO_FRAMES; f++) {
             const uint32_t *frame_actual = &frames[f * total_pixeles_frame];
             pantalla_dibujar_imagen_centrada(CANGREJO_ANCHO, CANGREJO_ALTO, frame_actual);
+            audio_ac97_actualizar();
             esperar_milisegundos(33);
         }
     }

@@ -21,11 +21,14 @@ typedef struct {
     uint64_t       canario;
 } huevo_estabilidad_t;
 
+struct marco_interrupcion;
+
 void huevo_iniciar(void);
 void huevo_etapa(const char *nombre_etapa);
 void huevo_etapa_ok(void);
 void huevo_verificar(void);
 void huevo_agrietar(const char *motivo);
 void huevo_quebrar(const char *motivo_fatal, uint64_t rip, uint64_t rsp, uint64_t codigo_error) __attribute__((noreturn));
+void huevo_quebrar_con_marco(const char *motivo_fatal, const struct marco_interrupcion *marco) __attribute__((noreturn));
 
 #endif // BASE_HUEVO_H

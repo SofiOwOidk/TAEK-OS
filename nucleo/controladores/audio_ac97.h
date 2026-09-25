@@ -10,5 +10,6 @@ int  audio_ac97_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_byte
 void audio_ac97_actualizar(void);
 int  audio_ac97_esta_reproduciendo(void);
 void audio_ac97_detener(void);
+int  audio_es_intel_hda(void);
 
 #endif // CONTROLADORES_AUDIO_AC97_H

@@ -1,4 +1,4 @@
-﻿build/
+build/
 *.img
 *.iso
 *.bin
@@ -6,3 +6,12 @@
 *.o
 
 recursos
+
+# Logs y depuracion
+qemu*.log
+.waifu/
+scratch_*.py
+*.pyc
+__pycache__/
+.vscode/
+.idea/

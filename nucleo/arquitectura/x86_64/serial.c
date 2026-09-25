@@ -60,6 +60,9 @@ void serial_escribir_caracter(char c) {
     }
     g_log_total_bytes++;
 
+    // Si no hay chip UART físico activo (modo dmesg en RAM), no perder ciclos sondeando puertos I/O
+    if (!g_serial_listo) return;
+
     // 2. Transmisión física por UART COM1 con límite de tiempo para no colgar el CPU en placas sin chip serial
     uint32_t timeout = 50000;
     while ((serial_transmisor_vacio() == 0) && (--timeout > 0));

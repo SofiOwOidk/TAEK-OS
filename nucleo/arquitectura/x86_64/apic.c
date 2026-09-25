@@ -118,14 +118,18 @@ int apic_iniciar(void) {
 
     if (soporta_x2apic) {
         // Habilitar x2APIC (Bit 11: Global Enable, Bit 10: x2APIC Enable)
-        apic_base |= (1ULL << 11) | (1ULL << 10);
-        wrmsr(MSR_IA32_APIC_BASE, apic_base);
+        if (!(apic_base & (1ULL << 10))) {
+            apic_base |= (1ULL << 11) | (1ULL << 10);
+            wrmsr(MSR_IA32_APIC_BASE, apic_base);
+        }
         g_apic.es_x2apic = 1;
         g_apic.dir_virtual_base = 0; // Se accede por MSRs directos
     } else {
         // Modo xAPIC estándar con mapeo MMIO
-        apic_base |= (1ULL << 11);
-        wrmsr(MSR_IA32_APIC_BASE, apic_base);
+        if (!(apic_base & (1ULL << 11))) {
+            apic_base |= (1ULL << 11);
+            wrmsr(MSR_IA32_APIC_BASE, apic_base);
+        }
         g_apic.es_x2apic = 0;
         g_apic.dir_virtual_base = APIC_MMIO_VIRTUAL_BASE;
 
@@ -161,9 +165,7 @@ int apic_iniciar(void) {
 
     g_apic.activo = 1;
 
-    // Habilitar interrupciones por hardware a nivel de CPU
-    __asm__ volatile ("sti");
-
+    // Las interrupciones externas permanecen enmascaradas (cli) durante el arranque temprano
     return 0;
 }
 

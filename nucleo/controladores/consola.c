@@ -1,6 +1,8 @@
 #include "consola.h"
+#include "audio_ac97.h"
 #include "pantalla.h"
 #include "teclado.h"
+#include "xhci.h"
 #include "../base/utf8.h"
 #include "../base/tiempo.h"
 #include "../arquitectura/x86_64/serial.h"
@@ -31,8 +33,6 @@ void consola_iniciar(void) {
     g_cursor_y = 0;
     g_color_fg = COLOR_TEXTO_DEFAULT;
     g_color_bg = COLOR_FONDO_DEFAULT;
-
-    teclado_iniciar();
 }
 
 void consola_limpiar(void) {
@@ -180,11 +180,17 @@ void consola_imprimir_hex(uint64_t valor) {
 }
 
 char consola_leer_caracter(void) {
-    // 1. Revisar teclado PS/2
-    char c = teclado_leer_caracter();
-    if (c != 0) return c;
+    // 1. En Modo Nativo (modo=ps2), leer exclusivamente del teclado PS/2 (i8042 / EC)
+    if (teclado_es_modo_nativo()) {
+        char c = teclado_leer_caracter();
+        if (c != 0) return c;
+    } else {
+        // 2. En Modo xHCI (modo=xhci), leer exclusivamente del controlador USB xHCI
+        char cu = xhci_leer_caracter();
+        if (cu != 0) return cu;
+    }
 
-    // 2. Revisar puerto serial COM1
+    // 3. Revisar puerto serial COM1 (siempre disponible para telemetría y depuración)
     if (serial_hay_datos()) {
         char cs = serial_leer_caracter();
         if (cs == '\r') cs = '\n'; // Normalizar enter de terminal
@@ -204,6 +210,10 @@ int consola_leer_linea(char *buffer, int max_len) {
     int estado_cursor = 1;
 
     for (;;) {
+        // Mantener el búfer ping-pong de HDA abastecido mientras la terminal
+        // espera una tecla. AC97 ignora esta llamada cuando no hay audio.
+        audio_ac97_actualizar();
+
         // Dibujar cursor parpadeante de bloque
         ciclo_cursor++;
         if (ciclo_cursor >= 50000) {

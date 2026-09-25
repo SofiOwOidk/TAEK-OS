@@ -65,3 +65,17 @@ uint64_t tiempo_obtener_milisegundos(void) {
     return rdtsc_interno() / g_ciclos_por_ms;
 }
 
+void esperar_microsegundos(uint32_t us) {
+    if (g_ciclos_por_ms == 0) {
+        tiempo_iniciar();
+    }
+    // g_ciclos_por_ms / 1000 = ciclos por microsegundo
+    // Evitar división cero en CPUs extremadamente lentas (<1 MHz calibradas)
+    uint64_t ciclos_por_us = g_ciclos_por_ms / 1000;
+    if (ciclos_por_us == 0) ciclos_por_us = 1;
+    uint64_t fin = rdtsc_interno() + ((uint64_t)us * ciclos_por_us);
+    while (rdtsc_interno() < fin) {
+        __asm__ volatile ("pause");
+    }
+}
+
