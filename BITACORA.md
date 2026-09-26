@@ -1724,3 +1724,23 @@
   * Imagen principal: `build/taek-os.iso` (56,977,408 bytes).
   * Imagen fechada: `build/taek-os-2026-09-25_18-51-00.iso` (56,977,408 bytes).
   * Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
+
+---
+
+## 🛠️ Registro de Errores y Lecciones Aprendidas (Post-Mortem)
+
+### [2026-09-25 18:59] — Incidente de Bloqueo de E/S en Host Windows (BugCheck 0x1E / STATUS_IN_PAGE_ERROR)
+* **Contexto:** Durante las pruebas automatizadas del subsistema de almacenamiento multiformato (formateo concurrente de discos USB virtuales en WSL2 y ejecución de QEMU).
+* **Síntoma:** Reinicio abrupto del sistema anfitrión Windows (pantallazo azul / BSOD).
+* **Diagnóstico Forense (Visor de Eventos de Windows):**
+  - **Kernel-Power (Evento 41, Tarea 63):** `BugcheckCode: 0x1E` (`KMODE_EXCEPTION_NOT_HANDLED`).
+  - **Parámetro 1:** `0xC0000006` (`STATUS_IN_PAGE_ERROR`).
+  - **volmgr (Evento 161):** Imposibilidad de generar archivo de volcado de memoria (`Memory.dmp`) debido a bloqueo temporal del subsistema de almacenamiento físico.
+* **Causa Raíz:**
+  - Conflicto de contención de cerrojos de entrada/salida (*I/O lock contention*) en el sistema de archivos NTFS anfitrión: WSL2 ejecutó utilidades de bajo nivel (`dd`, `mkfs.ntfs`, `mkfs.exfat`) escribiendo bloques crudos en `/mnt/c/Users/Pat/.../build/*.img` a través del controlador de redirección virtual 9P/drvfs de Hyper-V.
+  - Simultáneamente, el proceso Win32 de QEMU intentó mapear y bloquear en modo exclusivo (`-drive format=raw`) los mismos archivos de imagen mientras los descriptores de Hyper-V aún se encontraban volcando buffers.
+  - El gestor de memoria virtual del kernel de Windows (`ntoskrnl.exe`) intentó paginar una página de memoria a disco; al quedar la solicitud retenida en la cola de E/S por el bloqueo cruzado, arrojó la excepción crítica `STATUS_IN_PAGE_ERROR` provocando el reinicio protector del sistema.
+* **Lecciones Aprendidas y Protocolo de Mitigación:**
+  1. **Serialización Estricta de E/S:** Nunca lanzar el emulador QEMU contra una imagen de disco virtual sin antes garantizar la terminación completa del proceso de generación y ejecutar un `sync` explícito que libere los descriptores de archivo en Hyper-V/drvfs.
+  2. **Aislamiento en RAM / FS Nativo:** Realizar formateos intensivos de imágenes crudas en el sistema de archivos nativo de WSL2 (`/tmp` ext4) antes de copiarlas a la partición de Windows, evitando colisiones entre el filtro de sistema de archivos de Windows (`FilterManager`) y la capa de virtualización de Hyper-V.
+
