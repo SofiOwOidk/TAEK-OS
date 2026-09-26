@@ -15,3 +15,6 @@ scratch_*.py
 __pycache__/
 .vscode/
 .idea/
+
+# Recursos multimedia pesados (>50MB)
+Recursos Asets/Video 1080p.mp4

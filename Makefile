@@ -58,6 +58,10 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/vfs.c \
             nucleo/controladores/terminal.c
 
+C_SRCS   += $(wildcard nucleo/controladores/video/h264/*.c)
+H264_SRCS = $(filter-out %/reproductor.c,$(wildcard nucleo/controladores/video/h264/*.c))
+H264_HEADERS = $(wildcard nucleo/controladores/video/h264/*.h)
+
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
 
 OBJS      = $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS)) \
@@ -211,4 +215,20 @@ qemu-trace: $(IMG)
 		-trace "usb_xhci_*" \
 		-serial stdio
 
-.PHONY: all clean qemu qemu-trace
+# Esta ruta genera únicamente una ISO nueva en /tmp nativo de WSL.
+# No ejecuta la receta histórica de IMG ni modifica imágenes en uso.
+h264-iso: $(KERNEL)
+	bash herramientas/h264/crear_iso.sh "$(KERNEL)"
+
+$(filter $(BUILD_DIR)/nucleo/controladores/video/h264/%.o,$(OBJS)): $(H264_HEADERS)
+
+$(BUILD_DIR)/h264-pruebas/decodificar: herramientas/h264/diagnostico.c $(H264_SRCS) $(H264_HEADERS)
+	@mkdir -p $(dir $@)
+	clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer -I nucleo $< $(H264_SRCS) -o $@
+
+h264-validar: $(BUILD_DIR)/h264-pruebas/decodificar
+	python3 herramientas/h264/validar.py "Recursos Asets/Video 360p.mp4" --fallos build/h264-pruebas/fallo360
+	python3 herramientas/h264/validar.py "Recursos Asets/Video 1080p.mp4" --fallos build/h264-pruebas/fallo1080
+
+.PHONY: all clean qemu qemu-trace h264-iso h264-validar

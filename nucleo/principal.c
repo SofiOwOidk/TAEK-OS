@@ -29,6 +29,7 @@
 #include "controladores/xhci.h"
 #include "controladores/terminal.h"
 #include "controladores/teclado.h"
+#include "controladores/video/h264/reproductor.h"
 
 // Revision 3 del protocolo Limine
 __attribute__((used, section(".requests")))
@@ -380,6 +381,8 @@ void principal(void) {
     esperar_milisegundos(1000);
 
     // Iniciar la Terminal interactiva con el usuario 'sudo'
+    if (g_peticion_ejecutable.response && g_peticion_ejecutable.response->executable_file)
+        video_h264_arranque(g_peticion_ejecutable.response->executable_file->cmdline);
     terminal_ejecutar();
 
     for (;;) {

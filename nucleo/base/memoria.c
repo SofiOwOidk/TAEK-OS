@@ -234,14 +234,18 @@ void *asignar_memoria(uint64_t bytes) {
     }
 
     uint64_t paginas_necesarias = tamano_expansion / TAMANO_PAGINA;
+    // El mapa UEFI puede terminar en regiones libres pequeñas. Incorporarlas
+    // al heap permite avanzar a la siguiente región en lugar de reintentar
+    // siempre el mismo prefijo insuficiente de la pila. Trabajo acotado.
+    for (unsigned intento = 0; intento < 128 && g_pila_marcos_libres; intento++) {
     uint64_t primera_fisica = pmm_asignar_pagina_fisica();
     if (primera_fisica == 0) {
         huevo_agrietar("Heap: Memoria agotada al intentar expandir");
         return NULL;
     }
 
-    // Para la expansión necesitamos un buffer contiguo. Si asignamos páginas una a una,
-    // en su mayoría serán contiguas en el inicio. Verificamos contigüidad:
+    // La pila intrusiva suele entregar páginas en orden DESCENDENTE. Ambas
+    // direcciones forman una arena válida; primera_fisica conserva el mínimo.
     uint64_t pagina_previa = primera_fisica;
     uint64_t paginas_obtenidas = 1;
 
@@ -251,6 +255,9 @@ void *asignar_memoria(uint64_t bytes) {
         if (nueva_pag == pagina_previa + TAMANO_PAGINA) {
             pagina_previa = nueva_pag;
             paginas_obtenidas++;
+        } else if (nueva_pag + TAMANO_PAGINA == primera_fisica) {
+            primera_fisica = nueva_pag;
+            paginas_obtenidas++;
         } else {
             // No contigua: devolvemos la página y nos quedamos con lo obtenido hasta aquí
             pmm_liberar_pagina_fisica(nueva_pag);
@@ -258,12 +265,15 @@ void *asignar_memoria(uint64_t bytes) {
         }
     }
 
+    heap_agregar_arena(FISICA_A_VIRTUAL(primera_fisica), paginas_obtenidas * TAMANO_PAGINA);
     if (paginas_obtenidas * TAMANO_PAGINA >= bytes + sizeof(bloque_heap_t)) {
-        heap_agregar_arena(FISICA_A_VIRTUAL(primera_fisica), paginas_obtenidas * TAMANO_PAGINA);
         // Reintentar recursivamente una vez con la nueva arena incorporada
         return asignar_memoria(bytes);
     }
 
+    // Las páginas de este fragmento quedan como arena libre para peticiones
+    // menores: conservan propietario, contadores y canarios verificables.
+    }
     serial_imprimir_linea("[HEAP ADVERTENCIA] No fue posible conseguir arena contigua suficiente para asignación grande.");
     return NULL;
 }

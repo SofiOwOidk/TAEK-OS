@@ -5,6 +5,7 @@
 #include "audio_ac97.h"
 #include "audio_hda.h"
 #include "animacion_cangrejo.h"
+#include "video/h264/reproductor.h"
 #include "gpu.h"
 #include "../compatibilidad/linux.h"
 #include "../compatibilidad/nv_os_interface.h"
@@ -2418,6 +2419,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la animación de Don Cangrejo explotando.");
+        consola_imprimir_color("  h264 [opción]  ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Reproductor H.264 por CPU (experimental); h264 muestra su ayuda.");
         consola_imprimir_color("  calc <expr>    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Evalúa operaciones aritméticas (ej: calc 42 * 2 + 10).");
         consola_imprimir_color("  quiensoy       ", COLOR_PROMPT_DEFAULT);
@@ -2786,6 +2789,11 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea_color("==> Reproduciendo sintonía 'Qué bonito es Israel Damonte'...", COLOR_PROMPT_DEFAULT);
         uint32_t tam = (uint32_t)(_binary_audio_arranque_bin_end - _binary_audio_arranque_bin_start);
         audio_ac97_reproducir_pcm(_binary_audio_arranque_bin_start, tam);
+        return;
+    }
+
+    if (str_igual(linea, "h264") || str_comienza_con(linea, "h264 ")) {
+        video_h264_comando(str_igual(linea, "h264") ? "" : str_saltar_espacios(linea + 5));
         return;
     }
 
