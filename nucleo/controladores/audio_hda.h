@@ -4,8 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// Dirección virtual MMIO para el controlador Intel HDA
-#define HDA_MMIO_VIRTUAL_BASE 0xFFFFFE0003000000ULL
+// Dirección virtual MMIO para el controlador Intel HDA (aislado de GPU, APIC, IOMMU, ACPI y xHCI)
+#define HDA_MMIO_VIRTUAL_BASE 0xFFFFFE0005000000ULL
 
 // Número máximo de entradas en el Buffer Descriptor List (BDL)
 #define HDA_MAX_BDL_ENTRADAS 32
@@ -60,5 +60,8 @@ void audio_hda_detener(void);
 
 // Obtiene el estado actual del controlador Intel HDA
 const struct estado_hda *audio_hda_obtener_estado(void);
+
+// Indica si el controlador Intel HDA fue detectado e inicializado exitosamente
+int  audio_hda_esta_operativo(void);
 
 #endif // CONTROLADORES_AUDIO_HDA_H

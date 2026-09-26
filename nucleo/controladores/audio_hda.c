@@ -47,7 +47,7 @@
 
 // Banderas de CORBCTL y RIRBCTL
 #define CORBCTL_RUN        (1U << 1)
-#define RIRBCTL_RUN        (1U << 1)
+#define RIRBCTL_RUN        ((1U << 1) | (1U << 0)) // bit 1 = DMA Enable, bit 0 = Response Interrupt Enable
 
 // Banderas de Stream Control (SD_CTL)
 #define SD_CTL_SRST        (1U << 1) // Stream Reset
@@ -128,6 +128,9 @@ static inline void mmio_escribir32(uint64_t dir, uint32_t val) {
 static uint32_t hda_enviar_verbo(uint8_t codec, uint8_t nodo, uint32_t payload) {
     if (!g_corb || !g_rirb) return 0;
 
+    // Asegurar que banderas residuales de RIRB estén limpias antes de despachar
+    mmio_escribir8(g_mmio_base + REG_RIRBSTS, 0x05);
+
     uint32_t verbo = ((uint32_t)(codec & 0x0F) << 28) |
                      ((uint32_t)(nodo  & 0xFF) << 20) |
                      (payload & 0x000FFFFF);
@@ -138,14 +141,17 @@ static uint32_t hda_enviar_verbo(uint8_t codec, uint8_t nodo, uint32_t payload) 
     mmio_escribir16(g_mmio_base + REG_CORBWP, g_corb_wp);
 
     // Esperar respuesta en RIRB: 50 µs × 400 iteraciones = 20 ms máximo por verbo
-    // (antes era 1 ms × 1000 = 1 s, causando cuelgue de hasta 204 s)
     int timeout = 400;
     while (timeout > 0) {
         uint16_t rirb_wp = mmio_leer16(g_mmio_base + REG_RIRBWP) & 0xFF;
         if (rirb_wp != g_rirb_rp) {
             g_rirb_rp = (g_rirb_rp + 1) & 0xFF;
             dma_sincronizar_dispositivo_a_cpu(&g_rirb[g_rirb_rp], sizeof(g_rirb[g_rirb_rp]));
-            return g_rirb[g_rirb_rp].respuesta;
+            uint32_t resp = g_rirb[g_rirb_rp].respuesta;
+            // CRÍTICO: Limpiar RIRBSTS (bit 0 = RINTFL, bit 2 = ERIS) para reiniciar rirb_count a 0
+            // y permitir que el hardware/QEMU procese el siguiente verbo en CORB sin bloquearse.
+            mmio_escribir8(g_mmio_base + REG_RIRBSTS, 0x05);
+            return resp;
         }
         esperar_microsegundos(50);
         timeout--;
@@ -161,7 +167,12 @@ static uint8_t hda_encontrar_grupo_audio(uint8_t codec) {
     uint8_t inicio = (sub_count >> 16) & 0xFF;
     uint8_t cantidad = sub_count & 0xFF;
 
-    if (cantidad == 0 || cantidad > 32) return 0;
+    if (cantidad == 0 || cantidad > 32) {
+        // Si el nodo 0 no reporta subnodos válidos, probar nodo 1 por defecto (estándar en la mayoría de códecs)
+        uint32_t tipo1 = hda_enviar_verbo(codec, 1, 0xF0005);
+        if ((tipo1 & 0xFF) == 0x01) return 1;
+        return 0;
+    }
 
     for (uint8_t i = 0; i < cantidad; i++) {
         uint8_t nodo = inicio + i;
@@ -180,8 +191,8 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
     serial_imprimir_dec(codec);
     serial_imprimir_linea("...");
 
-    // Tiempo límite global: 500 ms máximo
-    uint64_t t_limite = tiempo_obtener_milisegundos() + 500;
+    // Tiempo límite global: 800 ms máximo
+    uint64_t t_limite = tiempo_obtener_milisegundos() + 800;
 
     // 1. Localizar y despertar el Audio Function Group real del códec.
     uint8_t afg = hda_encontrar_grupo_audio(codec);
@@ -190,6 +201,9 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
         return;
     }
 
+    serial_imprimir("[HDA] AFG detectado en nodo ");
+    serial_imprimir_dec(afg);
+    serial_imprimir_linea(" — Activando estado de energía D0.");
     hda_enviar_verbo(codec, afg, 0x70500); // SET_POWER_STATE D0
     esperar_milisegundos(2);
 
@@ -213,7 +227,7 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
     serial_imprimir_dec(nodo_fin);
     serial_imprimir_linea("");
 
-    // 3. Recorrer nodos y configurar solo DACs y Pines de salida
+    // 3. Recorrer nodos y configurar DACs y Pines de salida
     for (uint8_t n = nodo_inicio; n <= nodo_fin; n++) {
         if (tiempo_obtener_milisegundos() >= t_limite) {
             serial_imprimir_linea("[HDA AVISO] Timeout en configuración de nodos.");
@@ -227,9 +241,6 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
         //   0x2 = Audio Mixer
         //   0x3 = Audio Selector
         //   0x4 = Pin Complex
-        //   0x5 = Power Widget
-        //   0x6 = Volume Knob Widget
-        //   0x7 = Beep Generator Widget
         uint32_t widget_cap = hda_enviar_verbo(codec, n, 0xF0009);
         uint8_t widget_type = (widget_cap >> 20) & 0x0F;
 
@@ -239,22 +250,22 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
             serial_imprimir_dec(n);
             serial_imprimir_linea(": DAC — Configurando Stream 1, Formato 44.1k/16b estéreo");
 
-            hda_enviar_verbo(codec, n, 0x70500);                        // Power State D0
+            hda_enviar_verbo(codec, n, 0x70500);                                // Power State D0
             hda_enviar_verbo(codec, n, 0x20000 | HDA_FORMATO_44K_16B_STEREO); // Converter Format
-            hda_enviar_verbo(codec, n, 0x70610);                        // Stream=1, Channel=0
+            hda_enviar_verbo(codec, n, 0x70610);                                // Stream=1, Channel=0
             // SET_AMP_GAIN_MUTE: Output, Left+Right, Index=0, Mute=0, Gain=0x77 (-3dB aprox)
             hda_enviar_verbo(codec, n, 0x3B077); // Amp-Out Both, Unmute, Gain=0x77
             hda_enviar_verbo(codec, n, 0x3B777); // Amp-Out alternativo
+            hda_enviar_verbo(codec, n, 0x39077);
 
         } else if (widget_type == 0x4) {
             // --- Pin Complex ---
-            // GET_CONFIGURATION_DEFAULT para saber si es salida física
             uint32_t cfg_default = hda_enviar_verbo(codec, n, 0xF1C00);
             uint8_t port_conn = (cfg_default >> 30) & 0x3; // 0=Jack, 1=NoPhysical, 2=Fixed, 3=Both
-            uint8_t default_dev = (cfg_default >> 20) & 0xF; // 0=LineOut,1=Speaker,2=HP...
+            uint8_t default_dev = (cfg_default >> 20) & 0xF; // 0=LineOut, 1=Speaker, 2=HP...
             uint8_t location = (cfg_default >> 24) & 0x3F;
 
-            // Solo configurar si es una salida real (no "No Physical" que es solo interno virtual)
+            // Configurar si es salida física o fija
             if (port_conn != 1) {
                 serial_imprimir("  [HDA] Nodo ");
                 serial_imprimir_dec(n);
@@ -262,38 +273,34 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
                 serial_imprimir_dec(default_dev);
                 serial_imprimir(" Loc=");
                 serial_imprimir_dec(location);
-                serial_imprimir_linea(" — Habilitando salida");
+                serial_imprimir_linea(" — Habilitando salida física y amplificador");
 
                 hda_enviar_verbo(codec, n, 0x70500); // D0
-                // Seleccionar la primera conexión válida del pin. En códecs
-                // Realtek e Intel HDMI es el enlace por defecto hacia el DAC.
-                hda_enviar_verbo(codec, n, 0x70100);
+                hda_enviar_verbo(codec, n, 0x70100); // Conexión índice 0
 
-                // PIN_WIDGET_CONTROL: Out Enable (bit 6) + HP Drive (bit 7 si aplica)
+                // PIN_WIDGET_CONTROL: Out Enable (bit 6 = 0x40) + HP Drive (bit 7 = 0x80)
                 uint8_t pin_ctrl = 0x40; // Out Enable
-                if (default_dev == 2) pin_ctrl |= 0x80; // HP Enable también para auriculares
+                if (default_dev <= 2) pin_ctrl |= 0x80; // HP Enable para LineOut, Speaker y Auriculares
                 hda_enviar_verbo(codec, n, 0x70700 | pin_ctrl);
 
-                // EAPD Enable (bit 1 = Enable), ignorar si no soportado
+                // EAPD Enable (External Amplifier Power Down: bit 1 = Enable), vital en portátiles y MoDT
                 hda_enviar_verbo(codec, n, 0x70C02);
 
-                // Amplificador de salida: Desmutear ambos canales, ganancia = 0x77
+                // Amplificador de salida: Desmutear ambos canales, ganancia máxima
                 hda_enviar_verbo(codec, n, 0x3B077);
                 hda_enviar_verbo(codec, n, 0x39077);
             }
 
         } else if (widget_type == 0x2) {
-            // --- Audio Mixer: desmutear todas sus entradas ---
-            // GET_PARAMETER(0x12) = Input Amp Capabilities
+            // --- Audio Mixer: desmutear entradas ---
             uint32_t in_cap = hda_enviar_verbo(codec, n, 0xF0012);
             uint8_t num_inputs = (in_cap >> 16) & 0x7F;
-            if (num_inputs > 8) num_inputs = 8; // Limitar por seguridad
+            if (num_inputs > 8) num_inputs = 8;
             for (uint8_t i = 0; i < num_inputs; i++) {
-                // SET_AMP_GAIN_MUTE: Input, Index=i, Mute=0, Gain máximo
                 hda_enviar_verbo(codec, n, 0x3A000 | (i << 8) | 0x77);
             }
         } else if (widget_type == 0x3) {
-            // Audio Selector: elegir la primera ruta del grafo del códec.
+            // Audio Selector: elegir la primera ruta
             hda_enviar_verbo(codec, n, 0x70500);
             hda_enviar_verbo(codec, n, 0x70100);
         }
@@ -466,200 +473,283 @@ const struct estado_hda *audio_hda_obtener_estado(void) {
     return &g_hda_estado;
 }
 
+int audio_hda_esta_operativo(void) {
+    return g_hda_estado.inicializado;
+}
+
 // --- INICIALIZACIÓN DEL CONTROLADOR INTEL HDA ---
 int audio_hda_iniciar(void) {
     if (g_hda_estado.inicializado) return 0;
 
-    serial_imprimir_linea("[HDA] Escaneando bus PCI en busca de controlador Intel High Definition Audio...");
+    serial_imprimir_linea("[HDA] Escaneando bus PCI en busca de controladores de audio (Intel HDA / Multimedia)...");
 
     int total_devs = pci_obtener_conteo();
-    const struct dispositivo_pci *pci_hda = NULL;
+    #define MAX_CANDIDATOS_HDA 8
+    const struct dispositivo_pci *candidatos[MAX_CANDIDATOS_HDA];
+    int num_candidatos = 0;
 
-    for (int i = 0; i < total_devs; i++) {
+    // Prioridad 1: Controladores de Audio Intel (Vendor 0x8086)
+    // Coincide con Subclase 0x03 (HDA) o Subclase 0x01 (Audio Controller / cAVS en portátiles)
+    for (int i = 0; i < total_devs && num_candidatos < MAX_CANDIDATOS_HDA; i++) {
         const struct dispositivo_pci *d = pci_obtener_dispositivo(i);
-        if (d && d->clase == 0x04 && d->subclase == 0x03) {
-            pci_hda = d;
-            break;
+        if (d && d->id_proveedor == 0x8086 && d->clase == 0x04 &&
+            (d->subclase == 0x03 || d->subclase == 0x01)) {
+            // Evitar confundir con legacy AC97 ICH si estuviera presente
+            if (d->id_dispositivo != 0x2415) {
+                candidatos[num_candidatos++] = d;
+            }
         }
     }
 
-    if (!pci_hda) {
-        serial_imprimir_linea("[HDA AVISO] No se detectó controlador Intel HDA en el bus PCI.");
+    // Prioridad 2: Otros controladores HDA (NVIDIA 0x10DE, AMD 0x1002, Realtek 0x10EC, QEMU/RedHat)
+    for (int i = 0; i < total_devs && num_candidatos < MAX_CANDIDATOS_HDA; i++) {
+        const struct dispositivo_pci *d = pci_obtener_dispositivo(i);
+        if (d && d->id_proveedor != 0x8086 && d->clase == 0x04 &&
+            (d->subclase == 0x03 || d->subclase == 0x01)) {
+            candidatos[num_candidatos++] = d;
+        }
+    }
+
+    if (num_candidatos == 0) {
+        serial_imprimir_linea("[HDA AVISO] No se detectó ningún controlador Intel HDA / Audio en el bus PCI.");
         return -1;
     }
 
-    g_hda_estado.controlador_detectado = 1;
-    g_hda_estado.bus            = pci_hda->bus;
-    g_hda_estado.ranura         = pci_hda->ranura;
-    g_hda_estado.funcion        = pci_hda->funcion;
-    g_hda_estado.id_proveedor   = pci_hda->id_proveedor;
-    g_hda_estado.id_dispositivo = pci_hda->id_dispositivo;
-    g_hda_estado.dir_fisica_mmio= pci_hda->barras[0].dir_base;
-    g_hda_estado.tamano_mmio    = (uint32_t)pci_hda->barras[0].tamano;
+    serial_imprimir("[HDA] Se encontraron ");
+    serial_imprimir_dec(num_candidatos);
+    serial_imprimir_linea(" candidato(s) de audio PCI. Evaluando silicio...");
 
-    serial_imprimir("[HDA] Detectado: ");
-    serial_imprimir_hex(g_hda_estado.bus);
-    serial_imprimir(":");
-    serial_imprimir_hex(g_hda_estado.ranura);
-    serial_imprimir(".");
-    serial_imprimir_hex(g_hda_estado.funcion);
-    serial_imprimir(" [Vendor: ");
-    serial_imprimir_hex(g_hda_estado.id_proveedor);
-    serial_imprimir(" Dev: ");
-    serial_imprimir_hex(g_hda_estado.id_dispositivo);
-    serial_imprimir(" | BAR0: 0x");
-    serial_imprimir_hex(g_hda_estado.dir_fisica_mmio);
-    serial_imprimir_linea("]");
-
-    // 1. Activar Bus Master y Memory Space en PCI Command
-    pci_activar_bus_master(pci_hda);
-
-    // 2. Mapear BAR0 MMIO en el espacio virtual del kernel
-    g_hda_estado.dir_virtual_mmio = HDA_MMIO_VIRTUAL_BASE;
-    uint32_t paginas = (g_hda_estado.tamano_mmio + TAMANO_PAGINA - 1) / TAMANO_PAGINA;
-    if (paginas == 0) paginas = 4; // Mínimo 16 KiB
-
-    for (uint32_t p = 0; p < paginas; p++) {
-        paginacion_mapear(g_hda_estado.dir_virtual_mmio + (p * TAMANO_PAGINA),
-                          g_hda_estado.dir_fisica_mmio + (p * TAMANO_PAGINA),
-                          PAGINA_ATRIBUTOS_MMIO);
-    }
-    g_mmio_base = g_hda_estado.dir_virtual_mmio;
-
-    // 3. Reset del controlador HDA (GCTL.CRST)
-    uint32_t gctl = mmio_leer32(g_mmio_base + REG_GCTL);
-    mmio_escribir32(g_mmio_base + REG_GCTL, gctl & ~GCTL_CRST); // Entrar en reset
-
-    int timeout = 500;
-    while ((mmio_leer32(g_mmio_base + REG_GCTL) & GCTL_CRST) && timeout > 0) {
-        esperar_milisegundos(1);
-        timeout--;
-    }
-    esperar_milisegundos(5);
-
-    // Salir de reset
-    mmio_escribir32(g_mmio_base + REG_GCTL, GCTL_CRST);
-    timeout = 500;
-    while (!(mmio_leer32(g_mmio_base + REG_GCTL) & GCTL_CRST) && timeout > 0) {
-        esperar_milisegundos(1);
-        timeout--;
-    }
-
-    if (timeout == 0) {
-        serial_imprimir_linea("[HDA ERROR] Timeout saliendo del reset del controlador");
-        return -2;
-    }
-
-    // Esperar 100 ms para que todos los códecs señalen su presencia en STATESTS
-    // (el spec HDA dice mínimo 25 ms después de CRST=1; algunos códecs lentos necesitan más)
-    esperar_milisegundos(100);
-
-    // STATESTS es W1C. Debe leerse antes de limpiarlo: borrar primero hacía
-    // que el controlador olvidara todos los códecs físicos detectados.
-    uint16_t statests = mmio_leer16(g_mmio_base + REG_STATESTS);
-    for (int intento = 0; statests == 0 && intento < 25; intento++) {
-        esperar_milisegundos(10);
-        statests = mmio_leer16(g_mmio_base + REG_STATESTS);
-    }
-    mmio_escribir16(g_mmio_base + REG_STATESTS, statests);
-
-    // Deshabilitar interrupciones (usamos polling, no IRQ)
-    mmio_escribir32(g_mmio_base + REG_INTCTL, 0x00000000);
-
-    // 4. Leer capacidades globales y códecs conectados
-    uint16_t gcap = mmio_leer16(g_mmio_base + REG_GCAP);
-    g_hda_estado.num_iss = (gcap >> 8) & 0x0F;
-    g_hda_estado.num_oss = (gcap >> 12) & 0x0F;
-    g_hda_estado.num_bss = (gcap >> 3) & 0x1F;
-
-    g_hda_estado.codecs_detectados = statests;
-
-    serial_imprimir("[HDA] Capacidades: Input Streams: ");
-    serial_imprimir_dec(g_hda_estado.num_iss);
-    serial_imprimir(" | Output Streams: ");
-    serial_imprimir_dec(g_hda_estado.num_oss);
-    serial_imprimir(" | Códecs Detectados (STATESTS): 0x");
-    serial_imprimir_hex(statests);
-    serial_imprimir_linea("");
-
-    if (statests == 0) {
-        serial_imprimir_linea("[HDA ERROR] Ningún códec respondió tras el reset.");
-        return -5;
-    }
-
-    if (g_hda_estado.num_oss == 0) {
-        serial_imprimir_linea("[HDA ERROR] El controlador no expone streams de salida.");
-        return -6;
-    }
-
-    // 5. Asignar estructuras DMA de CORB y RIRB
-    g_corb = (uint32_t *)dma_asignar_bufer_contiguo(1024, 128, &g_corb_fisica);
-    g_rirb = (struct rirb_entrada *)dma_asignar_bufer_contiguo(2048, 128, &g_rirb_fisica);
-    if (!g_corb || !g_rirb) {
-        serial_imprimir_linea("[HDA ERROR] Falló asignación de memoria DMA para CORB/RIRB");
-        return -3;
-    }
-
-    // Configurar CORB
-    mmio_escribir8(g_mmio_base + REG_CORBCTL, 0); // Detener
-    mmio_escribir32(g_mmio_base + REG_CORBLBASE, (uint32_t)g_corb_fisica);
-    mmio_escribir32(g_mmio_base + REG_CORBUBASE, (uint32_t)(g_corb_fisica >> 32));
-    mmio_escribir8(g_mmio_base + REG_CORBSIZE, 0x02); // 256 entradas
-    mmio_escribir16(g_mmio_base + REG_CORBRP, 0x8000); // Reset read pointer
-    mmio_escribir16(g_mmio_base + REG_CORBRP, 0x0000);
-    mmio_escribir16(g_mmio_base + REG_CORBWP, 0x0000);
-    g_corb_wp = 0;
-    mmio_escribir8(g_mmio_base + REG_CORBCTL, CORBCTL_RUN); // Iniciar
-
-    // Configurar RIRB
-    mmio_escribir8(g_mmio_base + REG_RIRBCTL, 0); // Detener
-    mmio_escribir32(g_mmio_base + REG_RIRBLBASE, (uint32_t)g_rirb_fisica);
-    mmio_escribir32(g_mmio_base + REG_RIRBUBASE, (uint32_t)(g_rirb_fisica >> 32));
-    mmio_escribir8(g_mmio_base + REG_RIRBSIZE, 0x02); // 256 entradas
-    mmio_escribir16(g_mmio_base + REG_RIRBWP, 0x8000); // Reset write pointer
-    mmio_escribir8(g_mmio_base + REG_RIRBSTS, 0x05);   // Limpiar RIRBOIS/RINTFL
-    mmio_escribir16(g_mmio_base + REG_RINTCNT, 1);
-    g_rirb_rp = 0;
-    mmio_escribir8(g_mmio_base + REG_RIRBCTL, RIRBCTL_RUN); // Iniciar
-
-    serial_imprimir_linea("[HDA] Anillos CORB/RIRB activos y operativos.");
-
-    // 6. Asignar BDL y búfer DMA ping-pong
-    g_bdl = (struct hda_bdl_entrada *)dma_asignar_bufer_contiguo(HDA_MAX_BDL_ENTRADAS * sizeof(struct hda_bdl_entrada), 128, &g_bdl_fisica);
-    g_dma_pcm_buffer = (uint8_t *)dma_asignar_bufer_contiguo(HDA_TAMANO_TOTAL_DMA, 128, &g_dma_pcm_fisica);
-    if (!g_bdl || !g_dma_pcm_buffer) {
-        serial_imprimir_linea("[HDA ERROR] Falló asignación de memoria DMA para BDL y PCM");
-        return -4;
-    }
-
-    // Configurar las 2 entradas del BDL
-    g_bdl[0].dir_fisica      = g_dma_pcm_fisica;
-    g_bdl[0].longitud_bytes  = HDA_TAMANO_BLOQUE_DMA;
-    g_bdl[0].ioc             = 1;
-
-    g_bdl[1].dir_fisica      = g_dma_pcm_fisica + HDA_TAMANO_BLOQUE_DMA;
-    g_bdl[1].longitud_bytes  = HDA_TAMANO_BLOQUE_DMA;
-    g_bdl[1].ioc             = 1;
-
-    // 7. Base del primer Descriptor de Stream de Salida
-    g_stream_base = g_mmio_base + 0x80 + (g_hda_estado.num_iss * 0x20);
-
-    // 8. Configurar códecs detectados
-    //    Límite de tiempo global: máximo 3 s para toda la fase de configuración de códecs
-    uint64_t t_inicio_codecs = tiempo_obtener_milisegundos();
-    uint64_t t_limite_codecs = t_inicio_codecs + 3000;
-
-    for (uint8_t c = 0; c < 15; c++) {
-        if (statests & (1U << c)) {
-            if (tiempo_obtener_milisegundos() >= t_limite_codecs) {
-                serial_imprimir_linea("[HDA AVISO] Tiempo máximo de configuración de códecs alcanzado. Modo silencioso.");
-                break;
-            }
-            hda_configurar_nodos_codec(c);
+    for (int cand = 0; cand < num_candidatos; cand++) {
+        const struct dispositivo_pci *pci_hda = candidatos[cand];
+        if (!pci_hda->barras[0].valida || pci_hda->barras[0].es_io || pci_hda->barras[0].dir_base == 0) {
+            continue;
         }
+
+        serial_imprimir("  [HDA Intento ");
+        serial_imprimir_dec(cand + 1);
+        serial_imprimir("] Dispositivo ");
+        serial_imprimir_hex(pci_hda->bus);
+        serial_imprimir(":");
+        serial_imprimir_hex(pci_hda->ranura);
+        serial_imprimir(".");
+        serial_imprimir_hex(pci_hda->funcion);
+        serial_imprimir(" [Vendor: 0x");
+        serial_imprimir_hex(pci_hda->id_proveedor);
+        serial_imprimir(" Dev: 0x");
+        serial_imprimir_hex(pci_hda->id_dispositivo);
+        serial_imprimir(" | BAR0: 0x");
+        serial_imprimir_hex(pci_hda->barras[0].dir_base);
+        serial_imprimir_linea("]");
+
+        // 1. Activar Bus Master y Memory Space en PCI Command
+        pci_activar_bus_master(pci_hda);
+
+        // 2. Mapear BAR0 MMIO en el espacio virtual soberano del kernel (0xFFFFFE0005000000ULL)
+        uint64_t mmio_virt = HDA_MMIO_VIRTUAL_BASE;
+        uint32_t tamano_mmio = (uint32_t)pci_hda->barras[0].tamano;
+        uint32_t paginas = (tamano_mmio + TAMANO_PAGINA - 1) / TAMANO_PAGINA;
+        if (paginas == 0) paginas = 4; // Mínimo 16 KiB
+
+        for (uint32_t p = 0; p < paginas; p++) {
+            paginacion_mapear(mmio_virt + (p * TAMANO_PAGINA),
+                              pci_hda->barras[0].dir_base + (p * TAMANO_PAGINA),
+                              PAGINA_ATRIBUTOS_MMIO);
+        }
+        g_mmio_base = mmio_virt;
+
+        // 3. Reset del controlador HDA (GCTL.CRST)
+        // Paso A: Entrar en reset (CRST = 0)
+        uint32_t gctl = mmio_leer32(g_mmio_base + REG_GCTL);
+        mmio_escribir32(g_mmio_base + REG_GCTL, gctl & ~GCTL_CRST);
+
+        int timeout = 100;
+        while ((mmio_leer32(g_mmio_base + REG_GCTL) & GCTL_CRST) && timeout > 0) {
+            esperar_milisegundos(1);
+            timeout--;
+        }
+        esperar_milisegundos(10);
+
+        // Paso B: Salir de reset (CRST = 1)
+        mmio_escribir32(g_mmio_base + REG_GCTL, GCTL_CRST);
+        timeout = 100;
+        while (!(mmio_leer32(g_mmio_base + REG_GCTL) & GCTL_CRST) && timeout > 0) {
+            esperar_milisegundos(1);
+            timeout--;
+        }
+
+        if (timeout == 0) {
+            serial_imprimir_linea("  [HDA AVISO] Timeout saliendo del reset del silicio. Descartando controlador.");
+            continue;
+        }
+
+        // Esperar que los códecs físicos señalen presencia en STATESTS (mínimo 25 ms según spec)
+        esperar_milisegundos(50);
+
+        uint16_t statests = mmio_leer16(g_mmio_base + REG_STATESTS);
+        for (int intento = 0; statests == 0 && intento < 20; intento++) {
+            esperar_milisegundos(10);
+            statests = mmio_leer16(g_mmio_base + REG_STATESTS);
+        }
+
+        if (statests == 0) {
+            serial_imprimir_linea("  [HDA AVISO] Ningún códec respondió (STATESTS=0). Buscando alternativa...");
+            continue;
+        }
+
+        // STATESTS es W1C: limpiar bits detectados
+        mmio_escribir16(g_mmio_base + REG_STATESTS, statests);
+
+        // Deshabilitar interrupciones
+        mmio_escribir32(g_mmio_base + REG_INTCTL, 0x00000000);
+
+        // 4. Leer capacidades globales
+        uint16_t gcap = mmio_leer16(g_mmio_base + REG_GCAP);
+        uint8_t num_iss = (gcap >> 8) & 0x0F;
+        uint8_t num_oss = (gcap >> 12) & 0x0F;
+        uint8_t num_bss = (gcap >> 3) & 0x1F;
+
+        if (num_oss == 0) {
+            serial_imprimir_linea("  [HDA AVISO] El controlador no tiene streams de salida de audio.");
+            continue;
+        }
+
+        // Registrar datos del controlador exitoso en estado global
+        g_hda_estado.controlador_detectado = 1;
+        g_hda_estado.bus            = pci_hda->bus;
+        g_hda_estado.ranura         = pci_hda->ranura;
+        g_hda_estado.funcion        = pci_hda->funcion;
+        g_hda_estado.id_proveedor   = pci_hda->id_proveedor;
+        g_hda_estado.id_dispositivo = pci_hda->id_dispositivo;
+        g_hda_estado.dir_fisica_mmio= pci_hda->barras[0].dir_base;
+        g_hda_estado.dir_virtual_mmio = g_mmio_base;
+        g_hda_estado.tamano_mmio    = tamano_mmio;
+        g_hda_estado.num_iss        = num_iss;
+        g_hda_estado.num_oss        = num_oss;
+        g_hda_estado.num_bss        = num_bss;
+        g_hda_estado.codecs_detectados = statests;
+
+        serial_imprimir("[HDA] Seleccionado con éxito. Input Streams: ");
+        serial_imprimir_dec(num_iss);
+        serial_imprimir(" | Output Streams: ");
+        serial_imprimir_dec(num_oss);
+        serial_imprimir(" | Códecs Detectados (STATESTS): 0x");
+        serial_imprimir_hex(statests);
+        serial_imprimir_linea("");
+
+        // 5. Asignar estructuras DMA de CORB y RIRB si aún no están asignadas
+        if (!g_corb) {
+            g_corb = (uint32_t *)dma_asignar_bufer_contiguo(1024, 128, &g_corb_fisica);
+        }
+        if (!g_rirb) {
+            g_rirb = (struct rirb_entrada *)dma_asignar_bufer_contiguo(2048, 128, &g_rirb_fisica);
+        }
+        if (!g_corb || !g_rirb) {
+            serial_imprimir_linea("[HDA ERROR] Falló asignación de memoria DMA para CORB/RIRB.");
+            return -3;
+        }
+
+        // --- Configuración y Handshake Robusto de CORB ---
+        // 1. Detener motor CORB
+        mmio_escribir8(g_mmio_base + REG_CORBCTL, 0);
+        for (int t = 0; (mmio_leer8(g_mmio_base + REG_CORBCTL) & CORBCTL_RUN) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+        // 2. Programar dirección base y tamaño (0x02 = 256 entradas)
+        mmio_escribir32(g_mmio_base + REG_CORBLBASE, (uint32_t)g_corb_fisica);
+        mmio_escribir32(g_mmio_base + REG_CORBUBASE, (uint32_t)(g_corb_fisica >> 32));
+        mmio_escribir8(g_mmio_base + REG_CORBSIZE, 0x02);
+        // 3. Reset del puntero de lectura CORBRP (bit 15: escribir 1, esperar 1, escribir 0, esperar 0)
+        mmio_escribir16(g_mmio_base + REG_CORBRP, 0x8000);
+        for (int t = 0; !(mmio_leer16(g_mmio_base + REG_CORBRP) & 0x8000) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+        mmio_escribir16(g_mmio_base + REG_CORBRP, 0x0000);
+        for (int t = 0; (mmio_leer16(g_mmio_base + REG_CORBRP) & 0x8000) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+        // 4. Reset del puntero de escritura CORBWP
+        mmio_escribir16(g_mmio_base + REG_CORBWP, 0x0000);
+        g_corb_wp = 0;
+        // 5. Iniciar motor CORB
+        mmio_escribir8(g_mmio_base + REG_CORBCTL, CORBCTL_RUN);
+        for (int t = 0; !(mmio_leer8(g_mmio_base + REG_CORBCTL) & CORBCTL_RUN) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+
+        // --- Configuración y Handshake Robusto de RIRB ---
+        // 1. Detener motor RIRB
+        mmio_escribir8(g_mmio_base + REG_RIRBCTL, 0);
+        for (int t = 0; (mmio_leer8(g_mmio_base + REG_RIRBCTL) & RIRBCTL_RUN) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+        // 2. Programar dirección base y tamaño (0x02 = 256 entradas)
+        mmio_escribir32(g_mmio_base + REG_RIRBLBASE, (uint32_t)g_rirb_fisica);
+        mmio_escribir32(g_mmio_base + REG_RIRBUBASE, (uint32_t)(g_rirb_fisica >> 32));
+        mmio_escribir8(g_mmio_base + REG_RIRBSIZE, 0x02);
+        // 3. Reset del puntero de escritura RIRBWP (bit 15: escribir 1, esperar 1, escribir 0, esperar 0)
+        mmio_escribir16(g_mmio_base + REG_RIRBWP, 0x8000);
+        for (int t = 0; !(mmio_leer16(g_mmio_base + REG_RIRBWP) & 0x8000) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+        mmio_escribir16(g_mmio_base + REG_RIRBWP, 0x0000);
+        for (int t = 0; (mmio_leer16(g_mmio_base + REG_RIRBWP) & 0x8000) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+        // 4. Limpiar estado de interrupciones RIRB
+        mmio_escribir8(g_mmio_base + REG_RIRBSTS, 0x05); // W1C: RINTFL y ERIS
+        mmio_escribir16(g_mmio_base + REG_RINTCNT, 1);
+        g_rirb_rp = 0;
+        // 5. Iniciar motor RIRB
+        mmio_escribir8(g_mmio_base + REG_RIRBCTL, RIRBCTL_RUN);
+        for (int t = 0; !(mmio_leer8(g_mmio_base + REG_RIRBCTL) & RIRBCTL_RUN) && t < 100; t++) {
+            esperar_microsegundos(50);
+        }
+
+        serial_imprimir_linea("[HDA] Anillos CORB/RIRB activos y sincronizados con el silicio.");
+
+        // 6. Asignar BDL y búfer DMA ping-pong
+        if (!g_bdl) {
+            g_bdl = (struct hda_bdl_entrada *)dma_asignar_bufer_contiguo(HDA_MAX_BDL_ENTRADAS * sizeof(struct hda_bdl_entrada), 128, &g_bdl_fisica);
+        }
+        if (!g_dma_pcm_buffer) {
+            g_dma_pcm_buffer = (uint8_t *)dma_asignar_bufer_contiguo(HDA_TAMANO_TOTAL_DMA, 128, &g_dma_pcm_fisica);
+        }
+        if (!g_bdl || !g_dma_pcm_buffer) {
+            serial_imprimir_linea("[HDA ERROR] Falló asignación de memoria DMA para BDL y PCM.");
+            return -4;
+        }
+
+        // Configurar las 2 entradas del BDL
+        g_bdl[0].dir_fisica      = g_dma_pcm_fisica;
+        g_bdl[0].longitud_bytes  = HDA_TAMANO_BLOQUE_DMA;
+        g_bdl[0].ioc             = 1;
+
+        g_bdl[1].dir_fisica      = g_dma_pcm_fisica + HDA_TAMANO_BLOQUE_DMA;
+        g_bdl[1].longitud_bytes  = HDA_TAMANO_BLOQUE_DMA;
+        g_bdl[1].ioc             = 1;
+
+        // 7. Base del primer Descriptor de Stream de Salida
+        g_stream_base = g_mmio_base + 0x80 + (g_hda_estado.num_iss * 0x20);
+
+        // 8. Configurar códecs detectados
+        uint64_t t_inicio_codecs = tiempo_obtener_milisegundos();
+        uint64_t t_limite_codecs = t_inicio_codecs + 3000;
+
+        for (uint8_t c = 0; c < 15; c++) {
+            if (statests & (1U << c)) {
+                if (tiempo_obtener_milisegundos() >= t_limite_codecs) {
+                    serial_imprimir_linea("[HDA AVISO] Tiempo máximo de configuración de códecs alcanzado.");
+                    break;
+                }
+                hda_configurar_nodos_codec(c);
+            }
+        }
+
+        g_hda_estado.inicializado = 1;
+        serial_imprimir_linea("[HDA EXITOSO] ¡Controlador Intel HDA inicializado y listo para reproducir!");
+        return 0;
     }
 
-    g_hda_estado.inicializado = 1;
-    serial_imprimir_linea("[HDA EXITOSO] ¡Controlador Intel HDA inicializado y listo para reproducir!");
-    return 0;
+    serial_imprimir_linea("[HDA AVISO] Ningún controlador Intel HDA / Audio completó la inicialización.");
+    return -1;
 }

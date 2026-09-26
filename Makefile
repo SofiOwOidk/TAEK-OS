@@ -183,27 +183,29 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 qemu: $(IMG)
-	@echo "==> Lanzando QEMU con controlador xHCI y teclado USB virtual..."
+	@echo "==> Lanzando QEMU con Intel HDA, controlador xHCI y teclado USB virtual..."
 	@"/mnt/c/Program Files/qemu/qemu-system-x86_64.exe" \
 		-drive if=pflash,format=raw,readonly=on,file="/mnt/c/Program Files/qemu/share/edk2-x86_64-code.fd" \
 		-drive file="$(IMG)",format=raw \
 		-m 512M \
 		-M q35 \
 		-audiodev dsound,id=snd0 \
-		-device AC97,audiodev=snd0 \
+		-device intel-hda \
+		-device hda-output,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
 		-serial stdio
 
 qemu-trace: $(IMG)
-	@echo "==> Lanzando QEMU con xHCI, teclado USB y trazas activas..."
+	@echo "==> Lanzando QEMU con Intel HDA, xHCI, teclado USB y trazas activas..."
 	@"/mnt/c/Program Files/qemu/qemu-system-x86_64.exe" \
 		-drive if=pflash,format=raw,readonly=on,file="/mnt/c/Program Files/qemu/share/edk2-x86_64-code.fd" \
 		-drive file="$(IMG)",format=raw \
 		-m 512M \
 		-M q35 \
 		-audiodev dsound,id=snd0 \
-		-device AC97,audiodev=snd0 \
+		-device intel-hda \
+		-device hda-output,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
 		-trace "usb_xhci_*" \

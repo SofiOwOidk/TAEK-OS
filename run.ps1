@@ -1,7 +1,8 @@
 param(
     [switch]$UsbDisk = $true,
     [ValidateSet("ntfs", "fat32", "exfat", "ext4")][string]$Fs = "ext4",
-    [switch]$TraceXhci = $false
+    [switch]$TraceXhci = $false,
+    [ValidateSet("hda", "ac97")][string]$Audio = "hda"
 )
 
 # Configurar la consola de Windows para UTF-8 nativo (¡Soporte total para la Ñ y tildes!)
@@ -29,7 +30,7 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "==> Lanzando TAEK OS en QEMU UEFI con xHCI, Teclado USB, Disco USB Mass Storage y Audio AC97..." -ForegroundColor Green
+Write-Host "==> Lanzando TAEK OS en QEMU UEFI con xHCI, Teclado USB, Disco USB Mass Storage y Audio ($Audio)..." -ForegroundColor Green
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $ovmf = "C:\Program Files\qemu\share\edk2-x86_64-code.fd"
 $img  = "$directorioActual\build\taek-os.img"
@@ -39,8 +40,16 @@ $argsQemu = @(
     "-drive", "file=$img,format=raw",
     "-m", "512M",
     "-M", "q35",
-    "-audiodev", "dsound,id=snd0",
-    "-device", "AC97,audiodev=snd0",
+    "-audiodev", "dsound,id=snd0"
+)
+
+if ($Audio -eq "hda") {
+    $argsQemu += @("-device", "intel-hda", "-device", "hda-output,audiodev=snd0")
+} else {
+    $argsQemu += @("-device", "AC97,audiodev=snd0")
+}
+
+$argsQemu += @(
     "-device", "qemu-xhci,id=xhci",
     "-device", "usb-kbd,bus=xhci.0,id=kbd1",
     "-device", "usb-kbd,bus=xhci.0,id=kbd2",

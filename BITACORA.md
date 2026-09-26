@@ -1789,6 +1789,41 @@
 
 ---
 
+### [2026-09-25 22:15] — Hito 52: Diagnóstico y Corrección Integral del Subsistema de Audio (Intel High Definition Audio y AC97)
+* **Objetivo:** Resolver definitivamente el fallo de detección e integración del controlador de audio en TAEK OS, garantizando la inicialización robusta tanto en hardware físico real (MoDT Intel Core i9-14900HX con GPU NVIDIA Blackwell y portátil Core i7-8650U con audio cAVS) como en entornos de emulación QEMU con controlador nativo `intel-hda` o legado `AC97`.
+* **Diagnóstico y Causas Raíz Resueltas:**
+  1. **Aislamiento de Espacio Virtual MMIO (`audio_hda.h`):**
+     - Se corrigió la colisión crítica en la que `HDA_MMIO_VIRTUAL_BASE` compartía la misma dirección virtual (`0xFFFFFE0003000000ULL`) con la ventana dinámica de tablas ACPI (`ACPI_VENTANA_VIRT_BASE` en `iommu.c`).
+     - Se reubicó el espacio MMIO de Intel HDA en `0xFFFFFE0005000000ULL`, quedando totalmente aislado de GPU (`0x0`), APIC (`0x1`), IOMMU (`0x2`), ACPI (`0x3`) y xHCI (`0x4`).
+  2. **Resolución del Bloqueo del Anillo RIRB (`audio_hda.c`):**
+     - En el bucle de envío de verbos (`hda_enviar_verbo`), se identificó que el flag `RIRBSTS` (`0x05`, W1C) nunca se limpiaba tras leer la respuesta. Al estar configurado `RINTCNT = 1`, tras el primer verbo el silicio/emulador incrementaba `rirb_count` a 1, activando la condición `d->rirb_count == d->rirb_cnt` que bloqueaba de forma permanente el motor de despacho CORB.
+     - Se incorporó la bandera `ICH6_RBCTL_IRQ_EN` (bit 0) en `RIRBCTL_RUN` (`(1 << 1) | (1 << 0)`) para que las respuestas marquen el estado de interrupción y la limpieza por software en `RIRBSTS` reinicie efectivamente el contador `rirb_count` a 0 en cada transacción.
+     - Gracias a esto, el procesamiento de verbos opera de forma continua y fluida (ej. 19 verbos consecutivos procesados con 0 timeouts).
+  3. **Handshake Robusto de Reset en Punteros de Anillo:**
+     - Se solventó la falta de liberación del puntero `REG_RIRBWP`, el cual permanecía congelado con el bit 15 (`0x8000`) sin transicionar a `0x0000` en hardware Intel real.
+     - Se implementó polling de verificación bidireccional tanto para `CORBRP` como para `RIRBWP` (espera a bit 15 = 1, escritura de 0, espera a bit 15 = 0).
+  4. **Enumeración PCI Robusta y Desactivación de Sombra por dGPU:**
+     - Se implementó un algoritmo de escaneo en 2 fases con capacidad para hasta 8 candidatos: prioriza controladores de audio integrados Intel (`Vendor 0x8086`, Subclase `0x03` HDA o `0x01` Audio Controller / cAVS en portátiles) antes que GPUs dedicadas (NVIDIA `0x10DE` / AMD `0x1002`).
+     - Si un controlador de audio de GPU secundaria no tiene pantallas HDMI activas (`STATESTS == 0`), el kernel ya no aborta ni quiebra El Huevo; continúa evaluando los siguientes controladores del bus PCI hasta enlazar con el códec de la placa base.
+  5. **Configuración y Enrutamiento Completo de Códecs:**
+     - Detección precisa del Audio Function Group (AFG) real.
+     - Configuración de convertidores DAC a Stream 1, 44.1 kHz, 16 bits estéreo y desmuteo con ganancia óptima (`0x3B077`, `0x39077`).
+     - Habilitación física de Pin Complex con salida activa (`0x40`), amplificador de auriculares (`0x80`), activación del External Amplifier (`EAPD 0x70C02`) y apertura de mezcladores.
+  6. **Capa Dual HDA / AC97 y Soporte de Emulación (`run.ps1` y `Makefile`):**
+     - `run.ps1` ahora soporta `-Audio hda` (predeterminado con `-device intel-hda -device hda-output`) y `-Audio ac97` (fallback con `-device AC97`).
+     - `Makefile` actualizado para arrancar nativamente con Intel HDA en `make qemu` y `make qemu-trace`.
+     - Comando `sistema` / `info` de la terminal muestra en tiempo real el chip de audio activo y sus IDs PCI.
+* **Pruebas y Verificación:**
+  - Compilación limpia con Clang/LLD en WSL (`make`) con **0 errores y 0 advertencias**.
+  - Prueba en vivo en QEMU Intel HDA: 19 verbos CORB/RIRB ejecutados consecutivamente sin un solo timeout, detección del AFG en nodo 1, configuración de DAC nodo 2 y Pin nodo 3, y arranque del flujo DMA con reproducción de "Qué bonito es Israel Damonte".
+  - Prueba en vivo en QEMU Fallback AC97: Detección y fallback instantáneo a `[Intel 82801AA AC97 Listo a 44.1 kHz] [ OK ]`.
+  - **Salud del Huevo intacta: 100% de salud, 0 grietas.**
+* **Artefactos y Compilación:**
+  - Imagen principal: `build/taek-os.iso`.
+  - Imagen fechada: `build/taek-os-2026-09-25_22-10-00.iso`.
+
+---
+
 ## 🛠️ Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 ### [2026-09-25 18:59] — Incidente de Bloqueo de E/S en Host Windows (BugCheck 0x1E / STATUS_IN_PAGE_ERROR)

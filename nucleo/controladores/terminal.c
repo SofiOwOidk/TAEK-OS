@@ -3,6 +3,7 @@
 #include "teclado.h"
 #include "pantalla.h"
 #include "audio_ac97.h"
+#include "audio_hda.h"
 #include "animacion_cangrejo.h"
 #include "gpu.h"
 #include "../compatibilidad/linux.h"
@@ -2657,7 +2658,18 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_dec(pantalla_obtener_alto());
         consola_imprimir_linea(" (UEFI GOP 32bpp)");
         consola_imprimir("  Subsistema Audio  : ");
-        consola_imprimir_linea("PCI Intel AC97 DMA Directo @ 44.1 kHz");
+        if (audio_es_intel_hda()) {
+            const struct estado_hda *ehda = audio_hda_obtener_estado();
+            consola_imprimir("Intel HDA [0x");
+            consola_imprimir_hex(ehda->id_proveedor);
+            consola_imprimir(":0x");
+            consola_imprimir_hex(ehda->id_dispositivo);
+            consola_imprimir_linea("] DMA Directo @ 44.1 kHz");
+        } else if (audio_esta_iniciado()) {
+            consola_imprimir_linea("PCI Intel AC97 DMA Directo @ 44.1 kHz");
+        } else {
+            consola_imprimir_linea_color("Inactivo / No detectado (Modo Mudo)", COLOR_AVISO_DEFAULT);
+        }
         return;
     }
 

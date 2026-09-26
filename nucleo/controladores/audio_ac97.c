@@ -208,6 +208,10 @@ int audio_es_intel_hda(void) {
     return g_usar_hda;
 }
 
+int audio_esta_iniciado(void) {
+    return g_iniciado;
+}
+
 int audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
     if (g_usar_hda) return audio_hda_reproducir_pcm(datos_pcm, tamano_bytes);
     return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
