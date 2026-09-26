@@ -296,12 +296,17 @@ static int presentar(void *usuario, const h264_imagen *im) {
                          (tiempo_obtener_milisegundos() - p->inicio);
 
         if (ahora < destino) {
+            uint64_t c_ms_pts = tiempo_ciclos_por_ms();
+            if (c_ms_pts == 0) c_ms_pts = 2500000;
+            uint64_t max_ciclos_espera = c_ms_pts * 500ULL; // 500 ms máximo de seguridad
             uint64_t t_pts0 = rdtsc();
+
             while (1) {
                 uint64_t t_act = audio_ac97_esta_reproduciendo() ?
                                  audio_ac97_obtener_tiempo_ms() :
                                  (tiempo_obtener_milisegundos() - p->inicio);
                 if (t_act >= destino) break;
+                if ((rdtsc() - t_pts0) >= max_ciclos_espera) break;
                 if (atender(p)) return 1;
                 esperar_microsegundos(200);
             }
@@ -698,6 +703,38 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
         }
     }
 
+    // Prebuffer inicial de audio para cebar el pipeline DMA (128 KiB = ambos bloques DMA de 64 KiB + margen)
+    if (dec_aac && mp4.tiene_audio && modo == MODO_INTERACTIVO) {
+        serial_imprimir_linea("[MULTIMEDIA] Precargando buffer de audio AAC (lookahead)...");
+        // Precargar al menos 160 KiB de PCM (~900 ms de audio) o hasta agotar la pista de audio
+        while (mp4.a_indice < mp4.a_muestras && audio_ac97_cola_ocupada() < (160 * 1024)) {
+            const uint8_t *datos_audio;
+            size_t bytes_audio;
+            int64_t pts_audio;
+            uint64_t t_da0 = rdtsc();
+            int res_a = mp4_siguiente_audio(&mp4, &datos_audio, &bytes_audio, &pts_audio);
+            p.telem.ciclos_demux += (rdtsc() - t_da0);
+            if (res_a <= 0) break;
+
+            const uint8_t *ptr_aac = datos_audio;
+            int rem_aac = (int)bytes_audio;
+            int16_t pcm_buf[2048];
+
+            uint64_t t_aac0 = rdtsc();
+            int s = aac_decodificar(dec_aac, &ptr_aac, &rem_aac, pcm_buf);
+            p.telem.ciclos_aac += (rdtsc() - t_aac0);
+
+            if (s > 0) {
+                uint64_t t_snd0 = rdtsc();
+                audio_ac97_encolar_pcm(pcm_buf, (uint32_t)(s * sizeof(int16_t)));
+                p.telem.ciclos_hda_usb += (rdtsc() - t_snd0);
+                p.telem.avance_dma_bytes += (uint32_t)(s * sizeof(int16_t));
+            }
+        }
+        // Iniciar hardware DMA con datos 100% reales
+        audio_ac97_iniciar_stream();
+    }
+
     consola_imprimir("Reproductor Multimedia TAEK OS. Presiona ESC para salir...");
     if (modo == MODO_PRUEBA_FORENSE) {
         consola_imprimir_linea_color(" [MODO PRUEBA FORENSE FNV-1a]", COLOR_AVISO_DEFAULT);
@@ -729,14 +766,12 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
         if (dt_dv > p.telem.max_ciclos_demux) p.telem.max_ciclos_demux = dt_dv;
         if (siguiente <= 0) { resultado = (h264_resultado)siguiente; break; }
 
-        // 2. Audio AAC (solo en MODO_INTERACTIVO)
+        // 2. Audio AAC (solo en MODO_INTERACTIVO): mantener reserva de al menos 128 KiB en cola
         if (dec_aac && mp4.tiene_audio && modo == MODO_INTERACTIVO) {
             const uint8_t *datos_audio;
             size_t bytes_audio;
             int64_t pts_audio;
-            uint32_t escala_a = mp4.a_escala_tiempo ? mp4.a_escala_tiempo : 44100;
-            while (mp4.a_indice < mp4.a_muestras &&
-                   (int64_t)(mp4.a_tiempo * p.escala / escala_a) <= pts) {
+            while (mp4.a_indice < mp4.a_muestras && audio_ac97_cola_ocupada() < (128 * 1024)) {
                 uint64_t t_da0 = rdtsc();
                 int res_a = mp4_siguiente_audio(&mp4, &datos_audio, &bytes_audio, &pts_audio);
                 uint64_t dt_da = rdtsc() - t_da0;
@@ -772,6 +807,7 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
     uint64_t duracion_real_ms = tiempo_obtener_milisegundos() - t_inicio_reproduccion;
 
     if (dec_aac) {
+        p.telem.vaciados_audio = audio_ac97_obtener_vaciados();
         audio_ac97_detener();
         aac_destruir(dec_aac);
     }

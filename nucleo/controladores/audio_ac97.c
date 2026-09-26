@@ -62,11 +62,11 @@ int audio_ac97_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel
     escribir_puerto_w(g_nambar + 0x00, 0x0001);
     esperar_io();
 
-    // Fijar volumen maestro a 0 dB (sin mute)
-    escribir_puerto_w(g_nambar + 0x02, 0x0000);
+    // Fijar volumen maestro a ~24 dB de atenuación de confort (16 * 1.5 dB = 24 dB, sin mute)
+    escribir_puerto_w(g_nambar + 0x02, 0x1010);
 
-    // Fijar volumen PCM Out a 0 dB (sin mute)
-    escribir_puerto_w(g_nambar + 0x18, 0x0000);
+    // Fijar volumen PCM Out a ~24 dB de atenuación (sin mute)
+    escribir_puerto_w(g_nambar + 0x18, 0x1010);
 
     // 44,1 kHz sólo es válido si el códec anuncia y acepta VRA.
     if (!(leer_puerto_w(g_nambar + 0x28) & 0x0001)) {
@@ -236,6 +236,24 @@ int audio_ac97_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
 
     // Fallback AC97: streaming continuo con buffer estático
     return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
+}
+
+int audio_ac97_iniciar_stream(void) {
+    if (!g_iniciado) return -1;
+    if (g_usar_hda) return audio_hda_iniciar_stream();
+    return 0;
+}
+
+uint32_t audio_ac97_cola_ocupada(void) {
+    if (!g_iniciado) return 0;
+    if (g_usar_hda) return audio_hda_cola_ocupada();
+    return 0;
+}
+
+uint32_t audio_ac97_cola_disponible(void) {
+    if (!g_iniciado) return 0;
+    if (g_usar_hda) return audio_hda_cola_disponible();
+    return 65536;
 }
 
 uint64_t audio_ac97_obtener_tiempo_ms(void) {

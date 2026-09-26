@@ -2734,6 +2734,12 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: video 360p / video 1080p (Reproductor multimedia H.264 / AAC)
+    if (str_comienza_con(linea, "video 360") || str_comienza_con(linea, "video 1080")) {
+        video_h264_comando(str_saltar_espacios(linea + 6));
+        return;
+    }
+
     // COMANDO: gpu / video / vram
     if (str_comienza_con(linea, "gpu") || str_comienza_con(linea, "video") || str_comienza_con(linea, "vram")) {
         const char *arg = NULL;

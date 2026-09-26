@@ -57,6 +57,15 @@ int  audio_hda_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes
 // Encola datos PCM (44.1 kHz, 16 bits estéreo) en la cola persistente para streaming A/V continuo
 int  audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes);
 
+// Inicia explícitamente el stream DMA de audio continuo tras la precarga inicial
+int  audio_hda_iniciar_stream(void);
+
+// Devuelve el número de bytes ocupados en la cola circular de streaming
+uint32_t audio_hda_cola_ocupada(void);
+
+// Devuelve el número de bytes libres en la cola circular de streaming
+uint32_t audio_hda_cola_disponible(void);
+
 // Obtiene el tiempo de audio transcurrido según el DMA de hardware en milisegundos
 uint64_t audio_hda_obtener_tiempo_ms(void);
 

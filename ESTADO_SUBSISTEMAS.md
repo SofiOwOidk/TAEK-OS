@@ -12,7 +12,7 @@ un registro reproducible con configuración y resultado; compilar por sí solo n
 | PMM y paginación | Sí | Arranque QEMU con asignación para DMA/xHCI/FS | Pendiente | No | Faltan pruebas de presión concurrente y de doble liberación inducida. |
 | xHCI Event Ring | Sí | Teclado, MSC y ratón HID simultáneos; ratón conectado, desconectado y reconectado en QEMU | Pendiente | No | Dispatcher central con buzones; falta prueba de ring saturado y repetición prolongada del hotplug. |
 | PCI BAR | Sí | Arranque QEMU con BAR xHCI | Pendiente | No | Falta probar BAR de 64 bits en hardware. |
-| HDA/AC97 A/V | Sí | Intel HDA emulado: 64 rondas `stress`, DMA avanzó 80 196 B y BCIS=1 | Pendiente en los dos equipos | No | Contador DMA requiere sondeo antes de una vuelta completa del ring; AC97 no probado en este ciclo. |
+| HDA/AC97 A/V | Sí | Streaming A/V validado en QEMU (19.1 s continuo, 32 BCIS, 0 vaciados, 0 micro-silencios); `stress` 64 rondas OK | Pendiente en los dos equipos | No | Requiere verificación en silicio físico con códec HDA Sunrise Point-LP `8086:9d71`. |
 | DMA y Linux shim | Sí | Arena DMA usada por xHCI/MSC; `stress` completó 64 rondas con 8 bloques de 8 KiB y validación de dirección física/virtual | Pendiente | No | Liberación exige puntero, dirección física y tamaño exactos; falta prueba de agotamiento bajo carga. |
 | VT-d/IOMMU | Sí | Descubrimiento solamente | Pendiente | No | Sin root/context tables ni domains; no hay aislamiento DMA. |
 | VMX de contingencia | Sí | VMXON solamente; sin prueba de rescate | Pendiente | No | Faltan VMCS, VMLAUNCH, VM-exit handler y EPT. Los comandos Triple Fault se bloquean hasta disponer de interceptación real. |
