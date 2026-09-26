@@ -1820,7 +1820,7 @@
   - **Salud del Huevo intacta: 100% de salud, 0 grietas.**
 * **Artefactos y Compilación:**
   - Imagen principal: `build/taek-os.iso`.
-  - Imagen fechada: `build/taek-os-2026-09-25_22-10-00.iso`.
+  - Imagen fechada: `build/taek-os-2026-09-25_22-25-50.iso`.
 
 ---
 
