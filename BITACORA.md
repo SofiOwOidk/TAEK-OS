@@ -1841,3 +1841,31 @@
   1. **Serialización Estricta de E/S:** Nunca lanzar el emulador QEMU contra una imagen de disco virtual sin antes garantizar la terminación completa del proceso de generación y ejecutar un `sync` explícito que libere los descriptores de archivo en Hyper-V/drvfs.
   2. **Aislamiento en RAM / FS Nativo:** Realizar formateos intensivos de imágenes crudas en el sistema de archivos nativo de WSL2 (`/tmp` ext4) antes de copiarlas a la partición de Windows, evitando colisiones entre el filtro de sistema de archivos de Windows (`FilterManager`) y la capa de virtualización de Hyper-V.
 
+---
+
+### [2026-09-26] — Hito 53: Decodificador H.264 por software en Ring 0 y reproducción MP4
+
+* **Objetivo:** Implementar desde cero en C11 un decodificador AVC/H.264 por software dentro de TAEK OS, sin copiar ni enlazar bibliotecas de códecs. Las tablas normativas CABAC se transcribieron/generaron a partir de ITU-T H.264 (08/2024); FFmpeg se utilizó como referencia de comportamiento y oráculo de pruebas, no como códec del núcleo.
+* **Implementación:**
+  1. Decodificación de NAL y RBSP, lectura acotada de bits/Exp-Golomb y parseo SPS/PPS/VUI, incluida la configuración `avcC` del MP4.
+  2. Aritmética CABAC propia; macroblocks I/P/B; predicción intra 4×4, 8×8 y 16×16; listas de referencias, vectores de movimiento, compensación fraccional, pesos explícitos/implícitos, modos directos, reconstrucción de residuo y filtro de desbloqueo.
+  3. DPB, POC de tipo 0, reordenamiento y gestión adaptativa de referencias; salida YUV420p y conversión entera a RGB para framebuffer GOP. El reproductor se integra en la terminal con `h264`, `h264 360p` y `h264 1080p`; ESC cancela la reproducción.
+  4. Demultiplexación MP4 no fragmentado mediante las tablas de muestras y chunks y los tiempos de decodificación/composición. El núcleo sigue recibiendo los bytes H.264 comprimidos; no reproduce fotogramas preconvertidos.
+* **Errores y correcciones registrados:**
+  1. Una permutación incorrecta en la transformada Hadamard DC permitió que pasaran fotogramas iniciales negros, pero alteró los cuadros con imagen. Se corrigió siguiendo la ecuación de la especificación y se repitieron las comparaciones completas.
+  2. Un signo y la escala de un término de la transformada inversa 8×8 ocasionaban diferencias de luminancia en 1080p. La corrección eliminó esa discrepancia.
+  3. Un bloque B sin referencia para una de las listas se trataba como vecino inexistente. H.264 lo considera disponible con `RefIdx = -1`; el error desviaba los vectores predichos y se propagaba a bloques vecinos.
+  4. El DPB aún no aplicaba las operaciones adaptativas MMCO. Un fragmento de 360p se detenía en la muestra 48; se incorporaron las operaciones permitidas y las secuencias pudieron continuar.
+  5. La expansión original del heap suponía páginas físicas ascendentes. El PMM las entrega con frecuencia en orden descendente y el mapa UEFI también contiene fragmentos pequeños. El heap pasó a aceptar ambas direcciones e incorporar arenas fragmentadas con una búsqueda acotada. La reproducción 1080p pudo entonces reservar el DPB y completar los fotogramas. Se corrigió además la devolución al PMM cuando una reserva contigua falla.
+  6. `video` ya era alias del diagnóstico GPU; el comando nuevo es `h264` para conservar el comportamiento previo.
+* **Pruebas de la implementación registrada:**
+  - Compilación freestanding del núcleo con `-nostdlib -ffreestanding`, sin dependencias de libc ni FPU/SSE en el decodificador.
+  - Comparación de cada muestra visible Y, U y V con FFmpeg: **4.350/4.350 fotogramas idénticos** en el MP4 Main 640×360 y **4.637/4.637 idénticos** en el MP4 High 1920×1080. Se hicieron ejecuciones con AddressSanitizer/UndefinedBehaviorSanitizer y una comparación optimizada adicional.
+  - Fragmento de 32 fotogramas recodificado con predicción temporal y múltiples slices: idéntico a FFmpeg. El mismo fragmento con CTTS negativo también coincidió en los 32 fotogramas.
+  - Un archivo Baseline que requiere CAVLC se rechazó explícitamente como no soportado; no se presenta como compatibilidad implementada.
+  - Fuzzing host con sanitizadores: 311 casos en el corpus MP4/NAL y 175.181 ejecuciones sobre el corpus corto, sin fallo detectado. Estas ejecuciones acotadas no prueban ausencia de defectos.
+  - Kernel completo en QEMU/TCG, 1 GiB RAM: 360p completó 4.350 fotogramas en 118.832 ms de invitado y 1080p completó 4.637 en 1.081.162 ms. Las huellas YUV coincidieron con el host (`984a4460415d1b1c` y `ee33f1f16b0a0c7f`); memoria heap en uso volvió a cero y los canarios respondieron intactos. El tiempo no garantiza reproducción en tiempo real fuera de la prueba medida.
+  - **Confirmación física:** El usuario informa que verificó el funcionamiento en su dispositivo real. Conforme a la política del proyecto, el hito queda **confirmado por el usuario en hardware físico**. El modelo del dispositivo y las condiciones de esa verificación no quedaron registrados en esta sesión.
+* **Límites de esta versión:** Sólo CABAC, cuadros progresivos YUV420 de ocho bits, POC tipo 0, matrices de escala uniformes y MP4 no fragmentado. No están implementados CAVLC, I_PCM, POC tipo 1/2, entrelazado/MBAFF, FMO, SP/SI, bit depths mayores, otros formatos de croma, listas de edición, rotación ni píxeles no cuadrados. Por tanto, el hito confirma funcionamiento en el material probado y no conformidad total con el estándar H.264. AAC y la reorganización posterior en `multimedia/` son cambios posteriores, sin cobertura en las comparaciones registradas aquí.
+* **Integridad y seguridad del host:** Los videos se mantuvieron comprimidos. Las ISOs de diagnóstico se generaron en `/tmp` nativo de WSL, se sincronizaron antes de copiarlas con nombres nuevos a `build/`, y QEMU usó medios de sólo lectura. No se ejecutó `git push`.
+* **Trazabilidad:** Resultados y límites ampliados en [`H264_VALIDACION.md`](H264_VALIDACION.md). Las imágenes, seriales y salidas de sanitizadores se conservaron localmente en `build/h264/` y `build/h264-pruebas/`.

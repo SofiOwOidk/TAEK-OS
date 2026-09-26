@@ -52,7 +52,7 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 
 ### 🎬 Decodificador H.264 por Software en Ring 0 (Experimental)
 * Implementación **100% nativa** en C11 para Anillo 0 (*Ring 0*), sin dependencias externas, librerías de usuario ni códecs de terceros.
-* Soporte para decodificación AVC/H.264 (procesamiento de unidades NAL, conjuntos de parámetros SPS/PPS, entropía CAVLC y CABAC, predicción espacial intra e inter-cuadro, compensación de movimiento y filtros de desbloqueo *deblocking*).
+* Soporte experimental para AVC/H.264 CABAC: unidades NAL, conjuntos de parámetros SPS/PPS, predicción intra e inter-cuadro, compensación de movimiento y filtro de desbloqueo (*deblocking*). CAVLC, video entrelazado, POC 1/2 y otras funciones no están soportadas; consulta [resultados y límites](H264_VALIDACION.md).
 * **Demuxer de Contenedores MP4:** Parseo directo de la estructura jerárquica de cajas/átomos ISO Base Media File Format (`moov`, `trak`, `mdia`, `stbl`, tablas de muestras y chunks).
 * Reconstrucción y conversión de espacio de color YUV420p a RGB/BGR en memoria física con volcado en tiempo real directamente sobre el *framebuffer* lineal UEFI GOP.
 * Reproducción interactiva e integración directa en la consola del núcleo.
