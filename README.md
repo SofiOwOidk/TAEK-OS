@@ -50,6 +50,13 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 * Renderizado directo en el búfer de cuadros gráfico UEFI (*Linear Framebuffer RGB/BGR*).
 * Reproductor de video y animaciones integrado para secuencias gráficas de Don Cangrejo con sincronización de audio.
 
+### 🎬 Decodificador H.264 por Software en Ring 0 (Experimental)
+* Implementación **100% nativa** en C11 para Anillo 0 (*Ring 0*), sin dependencias externas, librerías de usuario ni códecs de terceros.
+* Soporte para decodificación AVC/H.264 (procesamiento de unidades NAL, conjuntos de parámetros SPS/PPS, entropía CAVLC y CABAC, predicción espacial intra e inter-cuadro, compensación de movimiento y filtros de desbloqueo *deblocking*).
+* **Demuxer de Contenedores MP4:** Parseo directo de la estructura jerárquica de cajas/átomos ISO Base Media File Format (`moov`, `trak`, `mdia`, `stbl`, tablas de muestras y chunks).
+* Reconstrucción y conversión de espacio de color YUV420p a RGB/BGR en memoria física con volcado en tiempo real directamente sobre el *framebuffer* lineal UEFI GOP.
+* Comandos y herramientas integradas para pruebas de rendimiento, validación y reproducción interactiva en vivo.
+
 ### 🐧 Capa de Compatibilidad Linux Shim
 * Infraestructura de compatibilidad a nivel de kernel diseñada para facilitar la adaptación de módulos y controladores complejos (gestión de `mutex`, `waitqueue`, `workqueue`, temporizadores e interfaces RPC para el microcontrolador GSP de tarjetas gráficas modernas).
 
@@ -59,6 +66,7 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
   * `pci`: Escaneo e inspección exhaustiva de dispositivos en el bus PCI/PCIe.
   * `audio`: Reproducción y pruebas de los subsistemas de audio HDA/AC97.
   * `video`: Lanzador de animaciones multimedia.
+  * `h264`: Reproductor y banco de pruebas de video H.264/MP4 por CPU.
   * `huevo`: Diagnóstico del estado del canario de integridad.
   * `apagar` / `reiniciar`: Gestión de energía mediante controladores ACPI y teclado PS/2 / 8042.
 
@@ -101,12 +109,13 @@ Este script automatiza:
 ```text
 taek-os/
 ├── boot/                      # Configuración y binarios de Limine Bootloader
+├── herramientas/              # Utilidades de desarrollo, scripts de validación y fuzzer
 ├── nucleo/
 │   ├── arquitectura/x86_64/   # IDT, GDT, APIC, interrupciones, serial y VMX
 │   ├── base/                  # Memoria, DMA, canarios del Huevo y tiempo
-│   ├── controladores/         # Drivers: xHCI (USB 3.x), Audio HDA/AC97, Teclado, Terminal
+│   ├── controladores/         # Drivers: xHCI (USB 3.x), Audio HDA/AC97, Video/H.264, Teclado, Terminal
 │   ├── principal.c            # Punto de entrada del kernel (kmain)
-├── Recursos Asets/            # Medios, texturas, fuentes y pistas de audio
+├── Recursos Asets/            # Medios, texturas, fuentes y pistas de audio/video
 ├── BITACORA.md                # Registro histórico de hitos y sesiones de ingeniería
 ├── Makefile                   # Reglas de compilación y enlace
 └── run.ps1                    # Script automatizado de compilación y prueba en QEMU
