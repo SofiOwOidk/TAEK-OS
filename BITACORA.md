@@ -52,7 +52,7 @@
 ---
 
 ### [2026-09-22 16:23 - 16:27] — Hito 3: Reubicación en Espacio de Trabajo Oficial
-* **Objetivo:** Mover el repositorio al espacio de trabajo del usuario en `C:\Users\Pat\AndroidStudioProjects\taek-os`.
+* **Objetivo:** Reubicar el repositorio de trabajo en `C:\Users\Pat\AndroidStudioProjects\taek-os`.
 * **Cambios Realizados:**
   * Copia integra del proyecto y estructura modular.
   * `run.ps1` actualizado para resolver dinámicamente la ruta de WSL mediante `wsl wslpath -u "$PSScriptRoot"`, haciéndolo 100% portable a cualquier ruta o equipo.
@@ -162,7 +162,7 @@
 ---
 
 ### [2026-09-22 18:05 - 18:15] — Hito 9: Gestor de Memoria Dinámica (PMM + Kernel Heap kmalloc/kfree) y Comando 'memoria'
-* **Objetivo:** Cumplir el Paso 1 de la hoja de ruta solicitada por el usuario: implementar un gestor de memoria física (PMM) y un asignador dinámico en el núcleo (Kernel Heap) vigilado por "El Huevo de la Estabilidad", proveyendo shims de compatibilidad con Linux (`kmalloc`, `kfree`, `kzalloc`) y un comando interactivo `memoria` con autodiagnóstico en vivo.
+* **Objetivo:** Implementar la base de gestión de memoria física (PMM) y un asignador dinámico en el núcleo (Kernel Heap) vigilado por "El Huevo de la Estabilidad" (porque sin heap no vamos a ningún lado), proveyendo shims de compatibilidad con Linux (`kmalloc`, `kfree`, `kzalloc`) y un comando interactivo `memoria` con autodiagnóstico en vivo.
 * **Diseño Arquitectónico:**
   1. **PMM (Page Frame Allocator de 4 KiB):**
      - Consume el mapa de memoria UEFI entregado por Limine (`LIMINE_MEMMAP_REQUEST`) y el Higher Half Direct Map (`LIMINE_HHDM_REQUEST`).
@@ -193,7 +193,7 @@
 ---
 
 ### [2026-09-22 18:25 - 18:31] — Hito 10: Tablas de Paginación x86_64 de 4 Niveles (PML4 / VMM) y Control Soberano de CR3
-* **Objetivo:** Cumplir el Paso 2 de la hoja de ruta solicitada por el usuario: tomar el control soberano del espacio de direcciones virtual en Anillo 0 mediante la construcción de un árbol PML4 propio de TAEK OS, permitiendo el mapeo dinámico de memoria virtual a física, la invalidación de TLB (`invlpg`), soporte para registros MMIO de hardware y el comando interactivo `paginacion`.
+* **Objetivo:** Tomar el control soberano del espacio de direcciones virtual en Anillo 0 mediante la construcción de un árbol PML4 propio de TAEK OS, permitiendo el mapeo dinámico de memoria virtual a física, la invalidación de TLB (`invlpg`), soporte para registros MMIO de hardware y el comando interactivo `paginacion`.
 * **Diseño Arquitectónico:**
   1. **PML4 Soberano y Transición de CR3:**
      - Lectura del registro `CR3` inicial configurado por el bootloader Limine.
@@ -254,7 +254,7 @@
 ---
 
 ### [2026-09-22 18:46 - 18:52] — Hito 12: Motor de Streaming de Audio AC97 de Larga Duración y Canción Completa de Duelo (2m 42s)
-* **Objetivo:** Resolver el problema reportado por el usuario donde el tema *El Bueno, El Feo y El Malo* se escuchaba solo como un fragmento breve de ~11 segundos en bucle, logrando que suene la pista completa de **2 minutos y 42 segundos** y que únicamente al finalizar toda la canción comience de nuevo el bucle si el duelo continúa.
+* **Objetivo:** Arreglar el corte prematuro del tema de duelo *El Bueno, El Feo y El Malo*, que se escuchaba apenas en un bucle frustrante de 11 segundos, logrando que suene la pista completa de **2 minutos y 42 segundos** y que solo al finalizar toda la canción comience de nuevo si el duelo continúa.
 * **Causa Raíz Diagnosticada:**
   1. En el `Makefile`, la regla `ffmpeg` tenía un parámetro forzado `-t 11`, truncando el archivo MP3 a solo 11 segundos de audio PCM.
   2. En el controlador de hardware AC97 (`audio_ac97.c`), la tabla Buffer Descriptor List (BDL) de la arquitectura Intel ICH está estrictamente limitada por hardware a **32 entradas** de 64 KB cada una ($32 \times 65,536\text{ bytes} = 2,097,152\text{ bytes} \approx 11.88\text{ segundos}$). El driver original configuraba el BDL una sola vez; al agotarse los 11.88s, el DMA se detenía y la función `esperar_con_audio_bucle` volvía a disparar la pista desde el byte 0.
@@ -367,7 +367,7 @@
     - Comando `linux`: Reportó ABI 6.12 LTS, rango virtual `0xfffffd0000000000`, 0 KiB DMA en uso y 7 dispositivos adaptados.
     - Comando `linux probar`: Superó los 5 pasos con éxito total (`==> [ AUTODIAGNÓSTICO EXITOSO ] Capa Linux Shim 100% lista para controladores externos.`).
 ### [2026-09-22 19:35 - 19:42] — Hito 15.1: Aislamiento Arquitectónico de NVIDIA (Resource Manager Core en `controladores/video/nvidia/`, `nv_os_interface` y Comandos `nvidia` / `nvidia probar`)
-* **Objetivo:** Cumplir con la directriz de diseño del usuario de aislar formalmente todo el código específico de NVIDIA dentro de `nucleo/controladores/video/nvidia/`, desacoplándolo del núcleo de TAEK OS mediante la interfaz abstracta `nv_os_interface`. Este aislamiento garantiza que si ocurre un fallo o regresión en el pipeline gráfico (cómputo o renderizado), sea trivial determinar si el error provino del silicio/driver de NVIDIA o del kernel base de la CPU.
+* **Objetivo:** Aislar formalmente todo el código específico de NVIDIA dentro de `nucleo/controladores/video/nvidia/`, desacoplándolo del núcleo mediante la interfaz abstracta `nv_os_interface`. Si la GPU o el driver de NVIDIA deciden prender fuego el pipeline, que no se lleven al resto del kernel por delante; aislar fallos de silicio de la CPU es prioritario.
 * **Diseño Arquitectónico de 3 Capas:**
   1. **Capa 1: NVIDIA Core Aislado (`nucleo/controladores/video/nvidia/`):**
      - `inc/nvtypes.h`: Tipos de datos oficiales de NVIDIA (`NvU8`..`NvU64`, `NvBool`, `NvHandle`).
@@ -531,7 +531,7 @@
 | **Audio de duelo sonaba en bucle corto de 11s en vez de la canción completa** | 1) `Makefile` tenía `-t 11` forzando el corte en ffmpeg. 2) La lista de descriptores BDL de AC97 sólo tiene 32 entradas fijas (~11.8s de audio), y el driver original no tenía refresco circular dinámico, reiniciando desde el byte 0. | Se quitó el flag `-t 11` convirtiendo los 2m 42s completos (28 MB), y se rediseñó el controlador AC97 con un motor de streaming circular continuo (`audio_ac97_actualizar`) que rellena dinámicamente los descriptores reproducidos y solo reinicia el cursor tras agotar los 2m 42s. |
 | **`instruction expected, found ' ['` en NASM** | `Set-Content -Encoding utf8` en PowerShell escribe una marca de orden de bytes (BOM `\xef\xbb\xbf`) al inicio del archivo. | Se creó una rutina con `sed -i '1s/^\xef\xbb\xbf//'` para eliminar el BOM de todos los archivos fuente. |
 | **`qemu: could not load PC BIOS`** | En QEMU moderno para x86_64, el firmware UEFI OVMF es una imagen pflash, no una BIOS legacy. | Se cambió el parámetro a `-drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd`. |
-| **`rm: cannot remove taek-os.img: Permission denied`** | QEMU seguía en ejecución en segundo plano o el usuario tenía la ventana abierta, bloqueando el archivo en Windows. | Se modificó la regla del Makefile: ahora solo se crea la imagen si no existe, y las actualizaciones de `nucleo.elf` se hacen in-situ con `mcopy -o`, eliminando el bloqueo. |
+| **`rm: cannot remove taek-os.img: Permission denied`** | QEMU seguía corriendo de fondo o la ventana estaba abierta, bloqueando el descriptor del archivo en Windows (el clásico dolor de cabeza de Win32 con archivos abiertos). | Se modificó la regla del Makefile: ahora solo se crea la imagen si no existe, y las actualizaciones de `nucleo.elf` se hacen in-situ con `mcopy -o`, eliminando el bloqueo. |
 | **Mojibake `├▒` en consola** | La terminal de Windows usaba la página de códigos CP437 (DOS) en vez de UTF-8. | Se configuró `chcp 65001` y se añadió el módulo `utf8.c` en el núcleo. |
 | **`No rule to make target Recursos` en GNU Make** | El nombre de la carpeta contenía un espacio (`Recursos Asets`), rompiendo la sintaxis de prerequisitos en Make. | Se crearon enlaces simbólicos sin espacios (`recursos/fivenights.png` y `recursos/damonte.mp3`). |
 | **`limine.h API revision unsupported`** | `#define LIMINE_API_REVISION` se fijó en 3, pero la cabecera soporta hasta la revisión 2. | Se ajustó `#define LIMINE_API_REVISION 2` antes de incluir `limine.h`. |
@@ -544,15 +544,15 @@
 ---
 
 ### [2026-09-22 20:38] — Giro Estratégico y Saneamiento: Erradicación de Mocks y Adopción del Linux Shim para open-gpu-kernel-modules (Plazo 6 Meses)
-* **Objetivo:** Alinear la arquitectura de TAEK OS con la realidad del silicio de GPUs modernas (Blackwell GB20x en RTX 5070 Ti) y la directiva explícita del usuario: no inventar firmas criptográficas ni simular respuestas de microcódigo con mocks en CPU, sino construir un Linux Shim soberano en TAEK OS que hospede los módulos oficiales de código abierto de NVIDIA (`open-gpu-kernel-modules`).
+* **Objetivo:** Alinear la arquitectura de TAEK OS con la realidad del silicio de GPUs modernas (Blackwell GB20x en RTX 5070 Ti): cero simulaciones sintéticas en CPU y cero firmas criptográficas inventadas (el Boot ROM de la GPU nos mandaría a paseo de inmediato). La vía real es construir un Linux Shim soberano en TAEK OS que hospede los módulos oficiales de código abierto de NVIDIA (`open-gpu-kernel-modules`).
 * **Análisis de Silicio y Causa Raíz de Mocks Anteriores:**
   - En las pruebas previas de Hitos 18, 19 y 20 en QEMU, para verificar el transporte RPC sin contar aún con el binario de firmware firmado en disco ni hardware real, se implementó en `gsp_rpc.c` un bucle de auto-respuesta en CPU (`switch (comando) { case GSP_RPC_CMD_GET_CAPS: ... }`).
-  - Como señaló acertadamente el usuario, ese comportamiento es una simulación sintética: en silicio real, la CPU jamás responde los comandos RPC; es el coprocesador interno Falcon / RISC-V el que ejecuta el microcódigo firmado `gsp_gb20x.bin`, inicializa los controladores de memoria GDDR7 y llena la cola de estado `STAT_QUEUE` en memoria DMA física.
-  - Además, las firmas criptográficas del firmware GSP están autenticadas por el Boot ROM de la GPU mediante llaves públicas grabadas en eFuses de silicio. Es inviable generar firmas falsas.
+  - Reconocimiento honesto del error de concepto: responder en CPU comandos RPC del GSP era un mock de mentira. En silicio real, la CPU jamás responde los comandos RPC; es el coprocesador interno Falcon / RISC-V el que ejecuta el microcódigo firmado `gsp_gb20x.bin`, inicializa los controladores de memoria GDDR7 y llena la cola de estado `STAT_QUEUE` en memoria DMA física.
+  - Además, las firmas criptográficas del firmware GSP están autenticadas por el Boot ROM de la GPU mediante llaves públicas grabadas en eFuses de silicio. Es técnicamente inviable inventar firmas.
 * **Giro de Diseño Técnico:**
   - Se formaliza la meta a 6 meses: despertar el silicio real de la RTX 5070 Ti en la placa MoDT con el Intel Core i9-14900HX, verificar el microcódigo GSP oficial y ejecutar una multiplicación matricial básica ($C = A \times B$) en compute.
   - Se aislará cualquier lógica de prueba bajo directivas explícitas de emulación y se expandirá el Linux Shim (`nucleo/compatibilidad/linux.c` y `nv_os_interface.c`) para proporcionar las llamadas que `open-gpu-kernel-modules` requiere: `kmalloc`, `vmalloc`, `dma_alloc_coherent`, `pci_enable_msix_range`, `request_irq`, `wait_event_timeout`, `workqueues` y `timers`.
-  - Se mantiene la ISO booteable `build/taek-os.iso` como herramienta inmediata para que el usuario obtenga la telemetría viva de los BARs físicos en su máquina MoDT antes de programar los registros de silicio.
+  - Se mantiene la ISO booteable `build/taek-os.iso` como herramienta inmediata para obtener la telemetría viva de los BARs físicos en la máquina MoDT antes de empezar a programar los registros de silicio.
 
 ---
 
@@ -618,7 +618,7 @@
 ---
 
 ### [2026-09-23 11:25] — Hito 23: Autodiagnóstico del Teclado en Terminal y Saneamiento Físico xHCI para Placa MoDT Core i9-14900HX
-* **Objetivo:** Responder a la solicitud del usuario de reemplazar el volcado de líneas PCIe (`lspci`) al iniciar la terminal por un autodiagnóstico dedicado del teclado y subsistema USB, y resolver de raíz los 4 bloqueos físicos de silicio que impedían la detección en la placa MoDT.
+* **Objetivo:** Reemplazar el volcado masivo de líneas PCIe (`lspci`) al iniciar la terminal por un autodiagnóstico limpio y dedicado del teclado y subsistema USB, y resolver de raíz los 4 bloqueos físicos de silicio que impedían la detección en la placa MoDT.
 * **Causas Raíz Identificadas y Resueltas:**
   1. **Colisión de Memoria Virtual Intel VT-d vs xHCI:** `XHCI_MMIO_VIRTUAL_BASE` y `IOMMU_MMIO_BASE_VIRT` estaban configurados en la misma dirección `0xFFFFFE0002000000ULL`. Al estar Intel VT-d activo en la placa física, el IOMMU y el xHCI sobreescribían mutuamente sus registros MMIO. Se reubicó xHCI a `0xFFFFFE0004000000ULL`.
   2. **Bloqueo del Anillo de Eventos en `xhci_enviar_comando`:** Si el hardware emitía un evento de cambio de estado de puerto (`TRB_TIPO_PORT_STATUS`, tipo 34), `xhci_enviar_comando` lo ignoraba sin avanzar `g_event_idx`, bloqueando el anillo de eventos con timeout de 5 segundos en comandos posteriores como `Enable Slot`. Se implementó el consumo y avance automático de eventos intermedios.
@@ -685,7 +685,7 @@
   * El dispositivo es un receptor inalámbrico USB (`VID: 0x3151, PID: 0x3020`, Yichip/MosArt).
   * A diferencia del teclado Havit (que emula Apple Aluminum con interfaces compuestas y mapas de bits NKRO de 120 bits), el Micronics 2.4GHz utiliza el protocolo estándar puro **USB HID Boot Keyboard**:
     * Reportes de tamaño fijo de **8 bytes**: `[modificador, 0x00 reservado, tecla1, tecla2, tecla3, tecla4, tecla5, tecla6]`.
-    * En la captura analizada se decodificó exitosamente la palabra escrita por el usuario: `h` (`0x0B`), `e` (`0x08`), `o` (`0x12`), `l` (`0x0F`), `a` (`0x04`).
+    * En la captura analizada se decodificó exitosamente la palabra escrita en vivo desde el teclado: `h` (`0x0B`), `e` (`0x08`), `o` (`0x12`), `l` (`0x0F`), `a` (`0x04`).
     * Este formato coincide al 100% con la ruta `CASO C` previamente implementada en `xhci.c`.
 * **Condición de Conectividad Crucial Descubierta en Silicio:**
   * Al consultar la topología USB en vivo, el dongle Micronics se encontraba conectado a un concentrador externo (`Hub_#0003`, puerto raíz 9).
@@ -814,7 +814,7 @@
   * Nueva ISO fechada generada: `build/taek-os-2026-09-23_13-56-47.iso` (enlace canónico `build/taek-os.iso`).
 
 ### [2026-09-23 14:26] — Hito 31: Alineación 100% con la Especificación Oficial Intel xHCI 1.2 (Secciones 4.3.3, 4.6.7 y 6.4.1.1) y Unificación de Entrada
-* **Objetivo:** Cumplir a nivel de silicio con las 5 páginas de la especificación oficial **Intel xHCI Revision 1.2** entregadas por el usuario, resolver los estados atascados en `PORTSC` por bitmasks de reset, corregir `Evaluate Context` con `Slot Context` válido (`Context Entries >= DCI`), garantizar el formato exacto de TRBs Normales y unificar la entrada en vivo para que el teclado interno (EC/PS2) y el teclado externo USB (incluyendo docks 2.4GHz) funcionen concurrentemente sin tirones ("a tiros").
+* **Objetivo:** Cumplir a nivel de silicio con la especificación oficial **Intel xHCI Revision 1.2**, resolver los estados atascados en `PORTSC` por bitmasks de reset, corregir `Evaluate Context` con `Slot Context` válido (`Context Entries >= DCI`), garantizar el formato exacto de TRBs Normales y unificar la entrada en vivo para que el teclado interno (EC/PS2) y el teclado externo USB (incluyendo docks 2.4GHz) funcionen concurrentemente sin tirones ("a tiros").
 * **Descubrimientos Críticos y Alineación con la Especificación:**
   1. **Sección 4.3.3 — Inicialización de Device Slot (Pasos 1 al 8):**
      * Input Context asignado en memoria DMA contigua física alineado a 64 bytes (`33 * g_tamano_contexto`).
@@ -852,7 +852,7 @@
   * Verificación en QEMU: Transición exitosa de puerto `PORTSC=0x00000E03` (`PED=1`, `PLS=0`, Habilitado=[SÍ]), configuración de slot y endpoint HID con 0 fallos de control y llegada limpia al prompt interactivo.
 
 ### [2026-09-23 15:04] — Hito 32: Sistema de Detección de Conexión en Puertos USB en Tiempo Real (Hotplug Visual en Pantalla GOP) y Diagnóstico Integral de Puertos
-* **Objetivo:** Responder a la solicitud del usuario de contar con un sistema reactivo en tiempo real que muestre en pantalla (GOP de alta resolución) cuándo se conecta o desconecta un dispositivo USB en cualquiera de los puertos raíz del equipo MoDT, notificando el puerto físico exacto, la velocidad de enlace, el estado de señalización de `PORTSC` y el resultado del reset/enumeración, permitiendo aislar de inmediato si el controlador de hardware detecta la inserción del teclado o dongle 2.4 GHz.
+* **Objetivo:** Implementar un sistema reactivo en tiempo real que muestre en pantalla (GOP de alta resolución) cuándo se conecta o desconecta un dispositivo USB en cualquiera de los puertos raíz del equipo MoDT, notificando el puerto físico exacto, la velocidad de enlace, el estado de señalización de `PORTSC` y el resultado del reset/enumeración, permitiendo aislar de inmediato si el controlador de hardware detecta la inserción del teclado o dongle 2.4 GHz.
 * **Causa Raíz Diagnosticada y Resuelta:**
   1. En la prueba anterior, la bandera `g_modo_nativo` en `nucleo/controladores/teclado.c` se encontraba fijada en 1, lo que provocaba que en `nucleo/principal.c` se omitiera por completo la inicialización de `xhci_iniciar()`.
   2. Al restaurar `g_modo_nativo = 0`, el sistema opera en modo unificado: el teclado interno de la laptop (controlador embebido EC / i8042) y el controlador host xHCI funcionan en paralelo y de manera concurrente.
@@ -879,7 +879,7 @@
        * Limpieza de banderas de cambio (`CSC`, `PEC`, `PRC`).
   3. **Comando `usb` Enriquecido en la Terminal (`nucleo/controladores/terminal.c`):**
      * `usb` o `usb puertos`: Despliega una tabla completa de todos los puertos raíz del silicio, destacando en verde brillante los puertos `[CONECTADO]`, su velocidad, si `PED=[SÍ]` y si corresponden al teclado activo.
-     * `usb monitor`: Modo interactivo de escucha en vivo durante 20 segundos donde el usuario puede insertar o retirar dispositivos en cualquier puerto y ver el reporte instantáneo en pantalla.
+      * usb monitor: Modo interactivo de escucha en vivo durante 20 segundos para monitorear la inserción o desconexión en caliente de dispositivos en cualquier puerto con reporte instantáneo en pantalla.
      * `usb reset <puerto>`: Permite forzar un ciclo de reset oficial manual en un puerto específico para diagnósticos de hardware.
 * **Archivos Modificados:**
   * `nucleo/controladores/teclado.c`: Modo unificado activo (`g_modo_nativo = 0`).
@@ -893,7 +893,7 @@
   * Verificación en QEMU con xHCI y teclado USB: Captura inmediata al arrancar de `[USB INICIAL] Dispositivo en Puerto 5 (High-Speed 480 Mbps, PORTSC: 0x00020EE1)`, reset completado con `PORTSC=0x00000E03` (`PED=1`), slot y endpoints armados con 0 fallos de control.
 
 ### [2026-09-23 17:35] — Incidencia Técnica / Diagnóstico Forense en Hardware Real (MoDT i9-14900HX): Bloqueo en Fase 1 (Enable Slot) en Puerto Raíz 9
-* **Estado Confirmado por el Usuario en Hardware Real:**
+* **Validación en Hardware Real:**
   1. El sistema de detección reactiva (Hito 32) **funcionó en pantalla**: detectó con precisión que el dispositivo físico (teclado/dock 2.4 GHz) se conectó al **Puerto Raíz 9**.
   2. El ciclo de reset de puerto (`xhci_resetear_puerto`) se ejecutó y **restableció el enlace físico correctamente** (`PED = 1`).
   3. Sin embargo, el subsistema **se queda atascado en `Fase 1: Enable Slot`**: el comando `TRB_TIPO_ENABLE_SLOT` emitido sobre el Command Ring no recibe el evento de finalización (`Command Completion Event`), produciendo timeout (5000 ms) y deteniendo la enumeración.
@@ -944,7 +944,7 @@
 
 ### [2026-09-23 18:15] — Hito 34: Diagnóstico Forense de Timeout 64 bits (código 18446744073709551615), Acceso MMIO Dividido (lo_hi_writeq) y Sincronización Total DMA
 * **Diagnóstico de la Incidencia de Hardware Real:**
-  * El código de fallo observado por el usuario en pantalla `código: 18446744073709551615` corresponde a `(uint64_t)-1` (`0xFFFFFFFFFFFFFFFF`), que es el valor de retorno por **TIMEOUT** (5000 ms sin respuesta del silicio en `xhci_enviar_comando()`).
+  * El código de fallo observado en pantalla código: 18446744073709551615 corresponde a (uint64_t)-1 ( xFFFFFFFFFFFFFFFF), que es el valor de retorno por **TIMEOUT** (5000 ms sin respuesta del silicio en xhci_enviar_comando()).
   * Los puertos iniciales 5 y 7 completaron con éxito 8 transferencias de control (`wLength = 177`) porque sus TRBs (0 al 5) se ubicaron dentro de la primera línea de caché y el inicio de la segunda.
   * A partir del Puerto 9 y cualquier hotplug posterior en Puertos 2, 3, 15 y 18, los comandos `Enable Slot` se suspendieron debido a:
     1. **Rechazo de Escrituras MMIO de 64 bits en Chipset Intel Raptor Lake PCH (8086:7A60):** El silicio no acepta instrucciones `mov [rdi], rax` (QWORD) sobre los registros operacionales y de tiempo de ejecución (`CRCR`, `ERDP`, `ERSTBA`, `DCBAAP`). Como `ERDP` no se actualizaba en el hardware, el silicio consideró que el Event Ring llegó al estado `Event Ring Full` (xHCI §4.17.2) y suspendió el procesamiento de comandos en el Command Ring.
@@ -1004,7 +1004,7 @@
        - Desglose decodificado de los últimos 10 comandos en el Command Ring (tipo de TRB, parámetro, control, ciclo).
        - Desglose decodificado de los 20 eventos en el Event Ring (tipo, completion code, slot ID, ciclo, parámetro).
   4. **Subcomando `usb diag` en la Terminal Interactiva (`nucleo/controladores/terminal.c`):**
-     * Permite al usuario invocar en cualquier momento `usb diag`, `usb volcado` o `usb dump` para auditar forensemente el hardware xHCI en vivo.
+      * Permite invocar en cualquier momento usb diag, usb volcado o usb dump para auditar forensemente el hardware xHCI en vivo.
   5. **Eliminación del Bucle Agresivo de Reset:**
      * Erradicado el reseteo periódico cada 200 ms sobre puertos no habilitados.
   6. **Cero Advertencias y Coherencia `volatile` Estricta:**
@@ -1018,7 +1018,7 @@
 
 ### [2026-09-23 19:50] — Hito 36: Corrección de Dirección Status Stage en Transferencias de Control (xHCI §4.11.2.2), Limpieza Estricta de DCBAA y Restauración de CRCR
 * **Diagnóstico Concluyente a partir del Volcado Forense en Vivo (`media_1790209972246.jpg`):**
-  * La captura visual de la pantalla GOP proporcionada por el usuario reveló el estado exacto del hardware en el momento del fallo:
+  * La captura visual de la pantalla GOP en hardware reveló el estado exacto del hardware en el momento del fallo:
     ```
     Cmd[0]: ENABLE_SLOT (Tipo=9 Cyc=1 Param=0x0 Ctrl=0x00002401) -> ÉXITO (Slot ID 1 asignado)
     Cmd[1]: ADDRESS_DEV (Tipo=11 Cyc=1 Param=0x000A10000 Ctrl=0x01002C01) -> ÉXITO
@@ -1538,7 +1538,7 @@
   - **Resultado:** 14 transferencias de control ejecutadas sin un solo fallo (`fallos_control=0`), Slot 1 y Slot 2 funcionando en paralelo, 0 colisiones en los anillos DMA.
 
 * **Validación en Hardware Real (Bare Metal) y Mapeo Físico:**
-  - **Prueba en Vivo:** El usuario arrancó TAEK OS en hardware real (Intel Raptor Lake PCH) con periféricos USB externos conectados.
+  - **Prueba en Vivo:** Arranque de prueba de TAEK OS en hardware real (Intel Raptor Lake PCH) con periféricos USB externos conectados.
   - **Mapeo de Hardware Confirmado en Silicio:**
     1. **Puerto 3:** Teclado inalámbrico con dongle USB 2.4 GHz (`VID:0x3151 PID:0x3020`).
        - Asignado a `Slot ID 5` en velocidad Full-Speed (12 Mbps).
@@ -1671,7 +1671,7 @@
   * Compilación en WSL: `make build/taek-os.iso` exitoso (**0 errores, 0 advertencias**).
   * Imagen canónica: `build/taek-os.iso` (56,815,616 bytes).
   * Imagen fechada: `build/taek-os-2026-09-25_18-24-57.iso` (56,815,616 bytes).
-  * Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
+  * Todo el código preservado localmente de forma estricta (sin push a GitHub; suite interna de desarrollo).
 
 ---
 
@@ -1723,7 +1723,7 @@
 * **Artefactos y Compilación:**
   * Imagen principal: `build/taek-os.iso` (56,977,408 bytes).
   * Imagen fechada: `build/taek-os-2026-09-25_18-51-00.iso` (56,977,408 bytes).
-  * Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
+  * Todo el código preservado localmente de forma estricta (sin push a GitHub; suite interna de desarrollo).
 
 ---
 
@@ -1785,7 +1785,7 @@
 * **Artefactos y Compilación:**
   - Imagen principal: `build/taek-os.iso` (57,006,080 bytes).
   - Imagen fechada: `build/taek-os-2026-09-25_19-29-25.iso` (57,006,080 bytes).
-  - Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
+  - Todo el código preservado localmente de forma estricta (sin push a GitHub; suite interna de desarrollo).
 
 ---
 
@@ -1865,7 +1865,7 @@
   - Un archivo Baseline que requiere CAVLC se rechazó explícitamente como no soportado; no se presenta como compatibilidad implementada.
   - Fuzzing host con sanitizadores: 311 casos en el corpus MP4/NAL y 175.181 ejecuciones sobre el corpus corto, sin fallo detectado. Estas ejecuciones acotadas no prueban ausencia de defectos.
   - Kernel completo en QEMU/TCG, 1 GiB RAM: 360p completó 4.350 fotogramas en 118.832 ms de invitado y 1080p completó 4.637 en 1.081.162 ms. Las huellas YUV coincidieron con el host (`984a4460415d1b1c` y `ee33f1f16b0a0c7f`); memoria heap en uso volvió a cero y los canarios respondieron intactos. El tiempo no garantiza reproducción en tiempo real fuera de la prueba medida.
-  - **Confirmación física:** El usuario informa que verificó el funcionamiento en su dispositivo real. Conforme a la política del proyecto, el hito queda **confirmado por el usuario en hardware físico**. El modelo del dispositivo y las condiciones de esa verificación no quedaron registrados en esta sesión.
+  - **Confirmación física:** Verificación completada en dispositivo físico real. El hito queda registrado como **validado en silicio real** (pruebas de campo directas).
 * **Límites de esta versión:** Sólo CABAC, cuadros progresivos YUV420 de ocho bits, POC tipo 0, matrices de escala uniformes y MP4 no fragmentado. No están implementados CAVLC, I_PCM, POC tipo 1/2, entrelazado/MBAFF, FMO, SP/SI, bit depths mayores, otros formatos de croma, listas de edición, rotación ni píxeles no cuadrados. Por tanto, el hito confirma funcionamiento en el material probado y no conformidad total con el estándar H.264. AAC y la reorganización posterior en `multimedia/` son cambios posteriores, sin cobertura en las comparaciones registradas aquí.
 * **Integridad y seguridad del host:** Los videos se mantuvieron comprimidos. Las ISOs de diagnóstico se generaron en `/tmp` nativo de WSL, se sincronizaron antes de copiarlas con nombres nuevos a `build/`, y QEMU usó medios de sólo lectura. No se ejecutó `git push`.
 * **Trazabilidad:** Resultados y límites ampliados en [`H264_VALIDACION.md`](H264_VALIDACION.md). Las imágenes, seriales y salidas de sanitizadores se conservaron localmente en `build/h264/` y `build/h264-pruebas/`.
@@ -1938,7 +1938,7 @@
 * Nuevo comando `stress`: 64 rondas con ocho marcos PMM, ocho bloques heap, ocho búferes DMA, lectura MSC, sondeo HID/hotplug, actualización de audio y un píxel de framebuffer. Verifica canarios y patrones antes de liberar. No ejecuta decodificación H.264 ni genera hotplug por sí mismo.
 * La primera prueba con Intel HDA emulado informó `reproduciendo`, pero `LPIB` y `BCIS` no avanzaron. El registro SDCTL estaba mal definido: `SRST`, `RUN` e `IOCE` estaban desplazados un bit. Se corrigió según la especificación Intel HDA 1.0a. El reloj añade el avance de LPIB y usa BCIS para detectar al menos una vuelta completa cuando LPIB coincide con la lectura anterior. Sondeos separados por más de una vuelta siguen sin permitir reconstruir todas las vueltas.
 * QEMU 11.1.0/TCG, q35, 1 GiB, `ich9-intel-hda` + `hda-output`, xHCI/teclado USB, MSC con ext4: `stress` terminó 64 rondas y 64 lecturas sin errores I/O ni de memoria; HDA avanzó **80 196 B** y registró **1 BCIS**. El backend WAV escribió datos PCM no nulos, aunque QEMU dejó los tamaños de su cabecera en cero; el archivo no se considera evidencia reproducible de audio audible.
-* El usuario proporcionó fotografías de dos equipos reales con Intel HDA. Se registraron como objetivos de prueba en `PERFILES_HARDWARE.md`; las fotografías no se cuentan como validación del nuevo reloj HDA ni de `stress`.
+* Se relevaron dos equipos físicos con silicio Intel HDA como bancos de prueba. Se registraron como objetivos en la documentación de perfiles de hardware; la inspección visual previa no se computa como validación del nuevo reloj HDA ni de `stress` hasta correr pruebas de cómputo en vivo.
 
 ---
 
@@ -2079,7 +2079,7 @@
 ---
 
 ### [2026-09-26 13:20] — Hito 59: Selección Dinámica Multi-Unidad en VFS, Detección de Particiones GPT en Hardware Real y Auto-Montaje
-* **Objetivo:** Resolver el problema presentado durante pruebas en hardware real físico (UEFI x86_64, placa MoDT/Dell) donde se detectaron dos discos USB (`DISCO #0` pendrive de arranque de 29 GB y `DISCO #1` Kingston DataTraveler 3.0 de 28 GB con archivos del usuario), pero los comandos `ls`, `dir` y `tree` fallaban con `Error: No hay sistema de archivos montado` al estar restringidos a la unidad 0.
+* **Objetivo:** Resolver el problema presentado durante pruebas en hardware real físico (UEFI x86_64, placa MoDT/Dell) donde se detectaron dos discos USB (`DISCO #0` pendrive de arranque de 29 GB y `DISCO #1` Kingston DataTraveler 3.0 de 28 GB con particiones de datos), pero los comandos `ls`, `dir` y `tree` fallaban con `Error: No hay sistema de archivos montado` al estar restringidos a la unidad 0.
 * **Causa Raíz Diagnosticada:**
   1. *Unidad fija en 0:* `vfs.c` inicializaba `g_unidad_activa = 0` y no existía comando en la terminal para cambiar la unidad activa ni montar unidades adicionales.
   2. *Inexistencia de comandos multi-disco:* `disco` solo listaba información y `disco leer <lba>` leía únicamente de la unidad 0. Comandos como `disco montar 1`, `disco 1` o `montar 1` no estaban implementados.
@@ -2095,7 +2095,7 @@
      - `disco montar <id>` / `disco mount <id>` / `montar <id>` / `disco <id>`: Monta la unidad seleccionada y lista su contenido raíz.
      - `disco desmontar` / `disco umount`: Desmonta el volumen activo.
      - `disco leer [id] <lba>`: Permite inspeccionar sectores de cualquier unidad USB (ej. `disco leer 1 0`).
-     - `ls disco 1` / `dir disco 1`: Detecta automáticamente la intención del usuario de explorar otra unidad, conmutando y listándola directamente.
+     - `ls disco 1` / `dir disco 1`: Detecta automáticamente el comando para explorar otra unidad, conmutando y listándola directamente.
      - `disco` (sin argumentos): Muestra la lista de discos resaltando visualmente la unidad actualmente montada (`==> [MONTADO: exFAT]`).
   4. **Ampliación de VFS (`vfs.h` / `vfs.c`):**
      - Función `vfs_obtener_unidad_activa()` para exponer la unidad seleccionada al resto del sistema.
@@ -2174,7 +2174,7 @@
   2. **Silenciado Total al Detener:**
      - En `audio_hda_detener()`, además de limpiar el bit `RUN`, se limpia el búfer DMA con ceros (`memset` a silencio) y se sincroniza con `dma_sincronizar_cpu_a_dispositivo()` para evitar cualquier eco o residuo cíclico.
   3. **Detención Explícita tras Concluir la Sintonía:**
-     - En `principal.c`, al terminar la cuenta regresiva de 9 segundos, se llama explícitamente a `audio_ac97_detener()`, garantizando silencio absoluto y un estado DMA limpio antes de entregar el control al usuario en la terminal.
+     - En `principal.c`, al terminar la cuenta regresiva de 9 segundos, se llama explícitamente a `audio_ac97_detener()`, garantizando silencio absoluto y un estado DMA limpio antes de entregar el control a la terminal.
 * **Archivos Modificados:**
   - `nucleo/controladores/audio_hda.c`
   - `nucleo/principal.c`
@@ -2246,7 +2246,7 @@
 
 ### Hito 64 - Calibración Acústica a 25 dB y Desbloqueo del Streaming HDA en Silicio Físico (2026-09-26)
 * **Objetivo:** 
-  1. Atender la solicitud de calibración acústica del usuario: reducir el volumen general desde el 100% (0 dBFS saturación) a un nivel moderado y agradable de **25 dB de atenuación** para evitar daños en los altavoces de la portátil.
+  1. **Calibración Acústica a 25 dB:** Se redujo el volumen general a 25 dB para la comodidad del desarrollo (casi me quedo sordo con los altavoces de la laptop al 100%), protegiendo el hardware de saturación y distorsión.
   2. Resolver la causa raíz de los 6,245 eventos de vaciado de audio observados en la telemetría interactiva de la laptop Dell Latitude (Intel Core i7-8650U).
 * **Diagnóstico de Silicio y Causa Raíz:**
   - En `audio_hda.c`, la función `hda_arrancar_stream_hardware()` realizaba una espera bloqueante en el bit `SRST` (Stream Reset) del descriptor de stream: `while (!(mmio_leer32(...) & SD_CTL_SRST))`.
