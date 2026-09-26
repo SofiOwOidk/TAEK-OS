@@ -18,3 +18,6 @@ __pycache__/
 
 # Recursos multimedia pesados (>50MB)
 Recursos Asets/Video 1080p.mp4
+
+# Herramientas de prueba, fuzzer y scripts de validacion
+herramientas/
