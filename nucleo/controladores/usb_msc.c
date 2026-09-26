@@ -319,6 +319,31 @@ int usb_msc_leer_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, vo
     return usb_msc_ejecutar_transaccion(dev, cdb_read, 10, buffer_destino, tamano_total, 1 /* IN */);
 }
 
+int usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, const void *buffer_origen) {
+    if (id_unidad >= USB_MSC_MAX_DISPOSITIVOS) return -1;
+    struct usb_msc_dispositivo *dev = &g_msc_dispositivos[id_unidad];
+    if (!dev->activo || !dev->listo) return -2;
+    if (cantidad == 0) return 0;
+
+    uint32_t tamano_total = (uint32_t)cantidad * dev->tamano_sector;
+    if (tamano_total > 65536) return -3; // Límite de búfer DMA
+
+    uint8_t cdb_write[10] = {
+        SCSI_CMD_WRITE_10,
+        0,
+        (uint8_t)((lba >> 24) & 0xFF),
+        (uint8_t)((lba >> 16) & 0xFF),
+        (uint8_t)((lba >> 8) & 0xFF),
+        (uint8_t)(lba & 0xFF),
+        0,
+        (uint8_t)((cantidad >> 8) & 0xFF),
+        (uint8_t)(cantidad & 0xFF),
+        0
+    };
+
+    return usb_msc_ejecutar_transaccion(dev, cdb_write, 10, (void *)buffer_origen, tamano_total, 0 /* OUT */);
+}
+
 int usb_msc_obtener_cantidad(void) {
     int total = 0;
     for (int i = 0; i < USB_MSC_MAX_DISPOSITIVOS; i++) {

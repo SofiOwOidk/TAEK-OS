@@ -465,3 +465,184 @@ int exfat_leer_archivo_texto(const char *ruta) {
     consola_imprimir_linea("");
     return 0;
 }
+
+// Escribe un cluster completo en disco
+static int exfat_escribir_cluster(uint32_t cluster, const uint8_t *origen) {
+    uint32_t lba = exfat_cluster_a_lba(cluster);
+    if (lba == 0) return -1;
+    return usb_msc_escribir_sectores(g_vol_exfat.unidad_msc, lba, g_vol_exfat.sectores_por_cluster, origen);
+}
+
+// Calcula el hash de nombre exFAT en mayúsculas
+static uint16_t exfat_hash_nombre_str(const char *nombre) {
+    uint16_t hash = 0;
+    for (int i = 0; nombre[i]; i++) {
+        char c = nombre[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        uint16_t u = (uint16_t)(uint8_t)c;
+        hash = ((hash << 15) | (hash >> 1)) + (u & 0xFF);
+        hash = ((hash << 15) | (hash >> 1)) + ((u >> 8) & 0xFF);
+    }
+    return hash;
+}
+
+// Calcula el checksum de un conjunto de entradas exFAT (32 * conteo bytes)
+static uint16_t exfat_calcular_checksum_set(const uint8_t *datos, int conteo_entradas) {
+    uint16_t csum = 0;
+    int total = conteo_entradas * 32;
+    for (int i = 0; i < total; i++) {
+        if (i == 2 || i == 3) continue; // Saltar campo checksum en la entrada 0x85
+        csum = ((csum << 15) | (csum >> 1)) + datos[i];
+    }
+    return csum;
+}
+
+// Asigna un cluster libre en la partición exFAT
+static uint32_t exfat_asignar_cluster_libre(void) {
+    if (!g_vol_exfat.montado) return 0;
+
+    // Escanear la FAT de exFAT si existe
+    uint32_t lba_fat_inicio = g_vol_exfat.lba_inicio_particion + g_vol_exfat.lba_fat;
+    for (uint32_t s = 0; s < 64; s++) {
+        uint32_t lba_sec = lba_fat_inicio + s;
+        if (usb_msc_leer_sectores(g_vol_exfat.unidad_msc, lba_sec, 1, g_exfat_sector_buf) != 0) {
+            return 0;
+        }
+
+        uint32_t *entradas = (uint32_t *)g_exfat_sector_buf;
+        for (int i = 0; i < 128; i++) {
+            uint32_t clus = (s * 128) + (uint32_t)i;
+            if (clus < 2) continue;
+
+            if (entradas[i] == 0) {
+                entradas[i] = 0xFFFFFFFF; // EOC
+                if (usb_msc_escribir_sectores(g_vol_exfat.unidad_msc, lba_sec, 1, g_exfat_sector_buf) != 0) {
+                    return 0;
+                }
+                return clus;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// Inserta un conjunto de entradas (0x85, 0xC0, 0xC1) en el directorio raíz
+static int exfat_insertar_entrada_directorio(uint32_t cluster_dir, const char *nombre, uint8_t es_dir, uint32_t cluster_inicio, uint32_t tamano) {
+    if (exfat_leer_cluster(cluster_dir, g_exfat_cluster_buf) != 0) return -1;
+
+    uint32_t entradas_por_cluster = g_vol_exfat.bytes_por_cluster / 32;
+    int ranura_inicio = -1;
+
+    // Buscar 3 ranuras consecutivas disponibles (< 0x80 o 0x00)
+    for (uint32_t i = 0; i + 2 < entradas_por_cluster; i++) {
+        uint8_t t0 = g_exfat_cluster_buf[i * 32];
+        uint8_t t1 = g_exfat_cluster_buf[(i + 1) * 32];
+        uint8_t t2 = g_exfat_cluster_buf[(i + 2) * 32];
+
+        if ((t0 < 0x80 || t0 == 0x00) && (t1 < 0x80 || t1 == 0x00) && (t2 < 0x80 || t2 == 0x00)) {
+            ranura_inicio = (int)i;
+            break;
+        }
+    }
+
+    if (ranura_inicio < 0) return -2; // No hay espacio suficiente en el cluster raíz
+
+    uint8_t *set_ptr = &g_exfat_cluster_buf[ranura_inicio * 32];
+    for (int k = 0; k < 96; k++) set_ptr[k] = 0;
+
+    int nom_len = 0;
+    while (nombre[nom_len] && nom_len < 15) nom_len++;
+
+    // 1. Entrada 0x85 (File/Directory)
+    struct exfat_entrada_archivo *e_file = (struct exfat_entrada_archivo *)&set_ptr[0];
+    e_file->tipo_entrada = EXFAT_TIPO_ARCHIVO;
+    e_file->conteo_secundarias = 2;
+    e_file->atributos = es_dir ? EXFAT_ATTR_DIRECTORY : EXFAT_ATTR_ARCHIVE;
+
+    // 2. Entrada 0xC0 (Stream Extension)
+    struct exfat_entrada_flujo *e_stream = (struct exfat_entrada_flujo *)&set_ptr[32];
+    e_stream->tipo_entrada = EXFAT_TIPO_FLUJO;
+    e_stream->banderas = EXFAT_FLUJO_NO_FAT;
+    e_stream->longitud_nombre = (uint8_t)nom_len;
+    e_stream->hash_nombre = exfat_hash_nombre_str(nombre);
+    e_stream->primer_cluster = cluster_inicio;
+    e_stream->longitud_valida = tamano;
+    e_stream->longitud_datos = tamano;
+
+    // 3. Entrada 0xC1 (File Name)
+    struct exfat_entrada_nombre *e_name = (struct exfat_entrada_nombre *)&set_ptr[64];
+    e_name->tipo_entrada = EXFAT_TIPO_NOMBRE;
+    for (int k = 0; k < nom_len; k++) {
+        e_name->nombre_utf16[k] = (uint16_t)(uint8_t)nombre[k];
+    }
+
+    // Calcular y guardar Checksum
+    e_file->checksum = exfat_calcular_checksum_set(set_ptr, 3);
+
+    // Escribir cluster de directorio modificado a disco
+    return exfat_escribir_cluster(cluster_dir, g_exfat_cluster_buf);
+}
+
+int exfat_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano) {
+    if (!nombre || *nombre == '\0') return -1;
+    if (!g_vol_exfat.montado) {
+        if (exfat_montar(0) != 0) return -2;
+    }
+
+    // 1. Asignar cluster de datos si tamano > 0
+    uint32_t cluster_datos = 0;
+    if (tamano > 0) {
+        cluster_datos = exfat_asignar_cluster_libre();
+        if (cluster_datos == 0) {
+            consola_imprimir_linea_color("  [!] Error: No hay clusters libres en exFAT.", COLOR_AVISO_EXFAT);
+            return -3;
+        }
+
+        for (uint32_t i = 0; i < sizeof(g_exfat_cluster_buf); i++) g_exfat_cluster_buf[i] = 0;
+        uint32_t a_copiar = (tamano < g_vol_exfat.bytes_por_cluster) ? tamano : g_vol_exfat.bytes_por_cluster;
+        if (datos) {
+            for (uint32_t i = 0; i < a_copiar; i++) g_exfat_cluster_buf[i] = datos[i];
+        }
+
+        if (exfat_escribir_cluster(cluster_datos, g_exfat_cluster_buf) != 0) return -4;
+    }
+
+    // 2. Insertar entradas en directorio raíz
+    if (exfat_insertar_entrada_directorio(g_vol_exfat.cluster_raiz, nombre, 0, cluster_datos, tamano) != 0) {
+        return -5;
+    }
+
+    consola_imprimir("==> [exFAT] Archivo creado con éxito: '");
+    consola_imprimir(nombre);
+    consola_imprimir("' (Cluster: ");
+    consola_imprimir_dec(cluster_datos);
+    consola_imprimir_linea(")");
+    return 0;
+}
+
+int exfat_crear_directorio(const char *nombre) {
+    if (!nombre || *nombre == '\0') return -1;
+    if (!g_vol_exfat.montado) {
+        if (exfat_montar(0) != 0) return -2;
+    }
+
+    uint32_t cluster_dir = exfat_asignar_cluster_libre();
+    if (cluster_dir == 0) return -3;
+
+    // Limpiar cluster del nuevo directorio
+    for (uint32_t i = 0; i < sizeof(g_exfat_cluster_buf); i++) g_exfat_cluster_buf[i] = 0;
+    if (exfat_escribir_cluster(cluster_dir, g_exfat_cluster_buf) != 0) return -4;
+
+    if (exfat_insertar_entrada_directorio(g_vol_exfat.cluster_raiz, nombre, 1, cluster_dir, 0) != 0) {
+        return -5;
+    }
+
+    consola_imprimir("==> [exFAT] Directorio creado con éxito: '");
+    consola_imprimir(nombre);
+    consola_imprimir("' (Cluster: ");
+    consola_imprimir_dec(cluster_dir);
+    consola_imprimir_linea(")");
+    return 0;
+}
+

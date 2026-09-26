@@ -117,4 +117,8 @@ int  fat32_listar_directorio(const char *ruta);
 // Lee y muestra en pantalla un archivo de texto plano ('cat')
 int  fat32_leer_archivo_texto(const char *ruta);
 
+// Escritura en FAT32
+int  fat32_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);
+int  fat32_crear_directorio(const char *nombre);
+
 #endif // CONTROLADORES_FAT32_H

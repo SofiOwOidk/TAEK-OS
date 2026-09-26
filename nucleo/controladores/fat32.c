@@ -659,3 +659,207 @@ int fat32_leer_archivo_texto(const char *nombre_buscado) {
     consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
     return 0;
 }
+
+// Convierte un nombre de archivo estándar a formato 8.3 en mayúsculas (11 bytes sin punto)
+static void fat32_convertir_a_raw_83(const char *origen, char destino[11]) {
+    for (int i = 0; i < 11; i++) destino[i] = ' ';
+    if (!origen) return;
+
+    int pos_punto = -1;
+    for (int i = 0; origen[i]; i++) {
+        if (origen[i] == '.') {
+            pos_punto = i;
+            break;
+        }
+    }
+
+    // Parte del nombre (hasta 8 caracteres)
+    int fin_nombre = (pos_punto >= 0) ? pos_punto : 8;
+    for (int i = 0; i < fin_nombre && origen[i]; i++) {
+        if (i >= 8) break;
+        char c = origen[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        destino[i] = c;
+    }
+
+    // Extensión (hasta 3 caracteres)
+    if (pos_punto >= 0) {
+        int idx_ext = pos_punto + 1;
+        for (int i = 0; i < 3 && origen[idx_ext + i]; i++) {
+            char c = origen[idx_ext + i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            destino[8 + i] = c;
+        }
+    }
+}
+
+// Asigna un cluster libre escaneando la FAT y marcándolo con EOC (0x0FFFFFFF)
+static uint32_t fat32_asignar_cluster_libre(void) {
+    if (!g_volumen.montado) return 0;
+
+    for (uint32_t s = 0; s < g_volumen.sectores_por_fat && s < 256; s++) {
+        uint32_t lba_fat_sec = g_volumen.lba_fat + s;
+        if (usb_msc_leer_sectores(g_volumen.unidad_msc, lba_fat_sec, 1, g_fat_sector_buf) != 0) {
+            return 0;
+        }
+
+        uint32_t *entradas = (uint32_t *)g_fat_sector_buf;
+        for (int i = 0; i < 128; i++) {
+            uint32_t cluster_idx = (s * 128) + (uint32_t)i;
+            if (cluster_idx < 2) continue; // Reservados
+
+            if ((entradas[i] & 0x0FFFFFFFU) == 0) {
+                // ¡Cluster libre encontrado!
+                entradas[i] = 0x0FFFFFFFU; // Marcar Fin de Cadena (EOC)
+
+                // Escribir sector de vuelta en FAT1
+                if (usb_msc_escribir_sectores(g_volumen.unidad_msc, lba_fat_sec, 1, g_fat_sector_buf) != 0) {
+                    return 0;
+                }
+                // Si hay FAT2 de respaldo, sincronizarla también
+                uint32_t lba_fat2_sec = lba_fat_sec + g_volumen.sectores_por_fat;
+                usb_msc_escribir_sectores(g_volumen.unidad_msc, lba_fat2_sec, 1, g_fat_sector_buf);
+
+                return cluster_idx;
+            }
+        }
+    }
+
+    return 0; // Disco lleno
+}
+
+// Inserta una entrada de directorio de 32 bytes en el cluster de directorio dado
+static int fat32_insertar_entrada_directorio(uint32_t cluster_dir, const char nombre_83[11], uint8_t atributos, uint32_t cluster_inicio, uint32_t tamano) {
+    uint32_t clus = cluster_dir;
+
+    while (clus >= 2) {
+        uint32_t lba_base = fat32_cluster_a_lba(&g_volumen, clus);
+
+        for (uint8_t s = 0; s < g_volumen.sectores_por_cluster; s++) {
+            uint32_t lba_sec = lba_base + s;
+            if (usb_msc_leer_sectores(g_volumen.unidad_msc, lba_sec, 1, g_sector_buf) != 0) {
+                return -1;
+            }
+
+            for (int e = 0; e < 16; e++) {
+                uint32_t off = e * 32;
+                uint8_t primer_byte = g_sector_buf[off];
+
+                if (primer_byte == 0x00 || primer_byte == 0xE5) {
+                    // Ranura libre encontrada
+                    struct fat32_entrada_dir *entry = (struct fat32_entrada_dir *)&g_sector_buf[off];
+                    for (int k = 0; k < 32; k++) ((uint8_t *)entry)[k] = 0;
+
+                    for (int k = 0; k < 11; k++) entry->nombre[k] = nombre_83[k];
+                    entry->atributos = atributos;
+                    entry->cluster_alto = (uint16_t)((cluster_inicio >> 16) & 0xFFFF);
+                    entry->cluster_bajo = (uint16_t)(cluster_inicio & 0xFFFF);
+                    entry->tamano_archivo = tamano;
+
+                    // Escribir sector modificado a disco
+                    return usb_msc_escribir_sectores(g_volumen.unidad_msc, lba_sec, 1, g_sector_buf);
+                }
+            }
+        }
+
+        clus = fat32_siguiente_cluster(&g_volumen, clus);
+    }
+
+    return -2; // No hay ranuras libres
+}
+
+int fat32_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano) {
+    if (!nombre || *nombre == '\0') return -1;
+    if (!g_volumen.montado) {
+        if (fat32_montar(0) != 0) return -2;
+    }
+
+    char nombre_83[11];
+    fat32_convertir_a_raw_83(nombre, nombre_83);
+
+    // 1. Asignar cluster de datos si tamano > 0
+    uint32_t cluster_datos = 0;
+    if (tamano > 0) {
+        cluster_datos = fat32_asignar_cluster_libre();
+        if (cluster_datos == 0) {
+            consola_imprimir_linea_color("  [!] Error: No hay clusters libres en FAT32.", COLOR_ERROR_DEFAULT);
+            return -3;
+        }
+
+        // Limpiar búfer y escribir datos al LBA del cluster
+        for (uint32_t i = 0; i < sizeof(g_cluster_buf); i++) g_cluster_buf[i] = 0;
+        uint32_t a_copiar = (tamano < g_volumen.bytes_por_cluster) ? tamano : g_volumen.bytes_por_cluster;
+        if (datos) {
+            for (uint32_t i = 0; i < a_copiar; i++) g_cluster_buf[i] = datos[i];
+        }
+
+        uint32_t lba = fat32_cluster_a_lba(&g_volumen, cluster_datos);
+        if (usb_msc_escribir_sectores(g_volumen.unidad_msc, lba, g_volumen.sectores_por_cluster, g_cluster_buf) != 0) {
+            return -4;
+        }
+    }
+
+    // 2. Insertar entrada en el directorio raíz
+    int res = fat32_insertar_entrada_directorio(g_volumen.cluster_raiz, nombre_83, FAT32_ATTR_ARCHIVE, cluster_datos, tamano);
+    if (res != 0) return -5;
+
+    consola_imprimir("==> [FAT32] Archivo creado con éxito: '");
+    consola_imprimir(nombre);
+    consola_imprimir("' (Cluster: ");
+    consola_imprimir_dec(cluster_datos);
+    consola_imprimir_linea(")");
+    return 0;
+}
+
+int fat32_crear_directorio(const char *nombre) {
+    if (!nombre || *nombre == '\0') return -1;
+    if (!g_volumen.montado) {
+        if (fat32_montar(0) != 0) return -2;
+    }
+
+    char nombre_83[11];
+    fat32_convertir_a_raw_83(nombre, nombre_83);
+
+    // 1. Asignar cluster para el nuevo directorio
+    uint32_t cluster_dir = fat32_asignar_cluster_libre();
+    if (cluster_dir == 0) return -3;
+
+    // 2. Limpiar cluster y configurar '.' y '..'
+    for (uint32_t i = 0; i < sizeof(g_cluster_buf); i++) g_cluster_buf[i] = 0;
+
+    // '.'
+    struct fat32_entrada_dir *e_punto = (struct fat32_entrada_dir *)&g_cluster_buf[0];
+    for (int i = 0; i < 11; i++) e_punto->nombre[i] = ' ';
+    e_punto->nombre[0] = '.';
+    e_punto->atributos = FAT32_ATTR_DIRECTORY;
+    e_punto->cluster_alto = (uint16_t)((cluster_dir >> 16) & 0xFFFF);
+    e_punto->cluster_bajo = (uint16_t)(cluster_dir & 0xFFFF);
+
+    // '..'
+    struct fat32_entrada_dir *e_dospuntos = (struct fat32_entrada_dir *)&g_cluster_buf[32];
+    for (int i = 0; i < 11; i++) e_dospuntos->nombre[i] = ' ';
+    e_dospuntos->nombre[0] = '.';
+    e_dospuntos->nombre[1] = '.';
+    e_dospuntos->atributos = FAT32_ATTR_DIRECTORY;
+    // Apunta al directorio raíz
+    e_dospuntos->cluster_alto = (uint16_t)((g_volumen.cluster_raiz >> 16) & 0xFFFF);
+    e_dospuntos->cluster_bajo = (uint16_t)(g_volumen.cluster_raiz & 0xFFFF);
+
+    // Escribir cluster de directorio en disco
+    uint32_t lba = fat32_cluster_a_lba(&g_volumen, cluster_dir);
+    if (usb_msc_escribir_sectores(g_volumen.unidad_msc, lba, g_volumen.sectores_por_cluster, g_cluster_buf) != 0) {
+        return -4;
+    }
+
+    // 3. Insertar entrada en el directorio raíz
+    int res = fat32_insertar_entrada_directorio(g_volumen.cluster_raiz, nombre_83, FAT32_ATTR_DIRECTORY, cluster_dir, 0);
+    if (res != 0) return -5;
+
+    consola_imprimir("==> [FAT32] Directorio creado con éxito: '");
+    consola_imprimir(nombre);
+    consola_imprimir("' (Cluster: ");
+    consola_imprimir_dec(cluster_dir);
+    consola_imprimir_linea(")");
+    return 0;
+}
+

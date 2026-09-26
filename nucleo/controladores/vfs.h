@@ -13,13 +13,14 @@ enum vfs_tipo_fs {
     VFS_FS_NINGUNO = 0,
     VFS_FS_FAT32   = 1,
     VFS_FS_EXFAT   = 2,
-    VFS_FS_NTFS    = 3
+    VFS_FS_NTFS    = 3,
+    VFS_FS_EXT4    = 4
 };
 
 // Inicializa el subsistema VFS
 void vfs_iniciar(void);
 
-// Detecta el formato (FAT32, exFAT o NTFS) y monta el controlador correspondiente
+// Detecta el formato (FAT32, exFAT, NTFS o ext4) y monta el controlador correspondiente
 int  vfs_montar(uint8_t unidad_msc);
 
 // Desmonta el volumen actualmente activo
@@ -31,7 +32,7 @@ int  vfs_esta_montado(void);
 // Retorna el tipo de sistema de archivos activo
 enum vfs_tipo_fs vfs_obtener_tipo_fs(void);
 
-// Retorna el nombre legible del sistema de archivos ("FAT32", "exFAT", "NTFS", "Ninguno")
+// Retorna el nombre legible del sistema de archivos ("FAT32", "exFAT", "NTFS", "ext4", "Ninguno")
 const char *vfs_obtener_nombre_fs(void);
 
 // Ejecuta la exploración jerárquica 'tree' sobre el sistema de archivos activo
@@ -42,5 +43,11 @@ int  vfs_listar_directorio(const char *ruta);
 
 // Lee y despliega el contenido de un archivo de texto ('cat' / 'leer')
 int  vfs_leer_archivo_texto(const char *ruta);
+
+// Crea un nuevo archivo con el contenido especificado ('touch' / 'escribir')
+int  vfs_crear_archivo(const char *nombre, const char *contenido);
+
+// Crea un nuevo directorio ('mkdir')
+int  vfs_crear_directorio(const char *nombre);
 
 #endif // CONTROLADORES_VFS_H

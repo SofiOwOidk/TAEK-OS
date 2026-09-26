@@ -54,6 +54,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/fat32.c \
             nucleo/controladores/exfat.c \
             nucleo/controladores/ntfs.c \
+            nucleo/controladores/ext4.c \
             nucleo/controladores/vfs.c \
             nucleo/controladores/terminal.c
 

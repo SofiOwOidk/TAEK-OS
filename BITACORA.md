@@ -1727,6 +1727,68 @@
 
 ---
 
+### [2026-09-25 19:30] — Hito 51: Controlador Linux ext4 (Lectura/Escritura), Motor de Escritura SCSI WRITE 10 y Escritura en FAT32/exFAT
+* **Objetivo:** Implementar soporte completo de Ring 0 en C para el sistema de archivos nativo de Linux (**ext4**), habilitar la capacidad de escritura en silicio mediante el comando SCSI `WRITE 10` (`0x2A`) en `usb_msc.c`, incorporar funciones atómicas de creación de archivos y carpetas en **FAT32** y **exFAT**, e integrar los comandos interactivos `touch`, `mkdir` y `escribir` / `echo >` en la terminal.
+* **Componentes Implementados:**
+  1. **Motor de Escritura en Silicio USB MSC (`usb_msc.c` y `usb_msc.h`):**
+     - Implementación de `usb_msc_escribir_sectores()`:
+     - Construcción del Command Descriptor Block (CDB) para `SCSI_CMD_WRITE_10` (`0x2A`) con LBA de 32 bits y conteo de sectores de 16 bits.
+     - Manejo de la fase de datos BOT (Bulk-Only Transport) con transferencia DMA hacia el endpoint Bulk OUT (`dev->ep_out_dci`) y validación de estado exitoso en el CSW recibido por Bulk IN.
+  2. **Controlador Linux ext4 (`ext4.c` y `ext4.h`):**
+     - Detección de partición MBR o Superfloppy y parseo del Superbloque ext4 en offset 1024 bytes (verificación de firma mágica `0xEF53`).
+     - Cálculo dinámico de tamaño de bloque ($1024 \ll \text{s\_log\_block\_size}$), bloques por grupo e inodos por grupo.
+     - Lectura y decodificación de la tabla de descriptores de grupos de bloques (GDT) de 32 y 64 bits.
+     - Localización e indexación de inodos en Ring 0 (resolución de Inodo 2 para la raíz `/`).
+     - Decodificador de árboles de extents (`ext4_extent_cabecera` con firma mágica `0xF30A`), con resolución de hojas (`eh_depth == 0`) e índices (`eh_depth == 1`) hacia bloques físicos LBA.
+     - Parser de entradas de directorio estándar `struct ext4_dir_entry_2` (inodo, longitud de registro, longitud de nombre, tipo de archivo y nombre).
+     - Recorrido jerárquico recursivo `ext4_ejecutar_tree()` con conectores visuales (`+--`, `\--`, `|`).
+     - Visualizador tabular `ext4_listar_directorio()` con tipo (`<DIR>`, `FILE`), tamaño, inodo y nombre.
+     - Lector de archivos de texto `ext4_leer_archivo_texto()` para el comando `cat`.
+     - **Motor de Escritura ext4:**
+       - Asignador atómico de inodo libre en bitmap de grupo 0 (`ext4_asignar_inodo_libre`).
+       - Asignador atómico de bloque libre en bitmap de bloques (`ext4_asignar_bloque_libre`).
+       - Inserción y particionado dinámico de entradas de directorio en el bloque raíz (`ext4_insertar_entrada_directorio`).
+       - Creación atómica de archivos (`ext4_crear_archivo`) e inicialización de carpetas (`ext4_crear_directorio`) con entradas `.` y `..`.
+  3. **Escritura en FAT32 (`fat32.c` y `fat32.h`):**
+     - `fat32_crear_archivo()` y `fat32_crear_directorio()`:
+     - Búsqueda y asignación de cluster libre en la FAT (`0x00000000`), marcado con `0x0FFFFFFF` (EOC) y sincronización con disco en FAT1 y FAT2 de respaldo.
+     - Escritura de datos en el cluster LBA vía `usb_msc_escribir_sectores()`.
+     - Inserción de entrada de directorio de 32 bytes en el cluster raíz (nombre 8.3 formateado en mayúsculas, atributos `0x20` / `0x10`, cluster inicial y tamaño).
+  4. **Escritura en exFAT (`exfat.c` y `exfat.h`):**
+     - `exfat_crear_archivo()` y `exfat_crear_directorio()`:
+     - Asignación de cluster libre y grabación de datos vía `usb_msc_escribir_sectores()`.
+     - Construcción del conjunto de 3 entradas contiguas de directorio (96 bytes): entrada primaria de archivo `0x85`, extensión de flujo `0xC0` (`NoFatChain = 1` contiguo) y nombre UTF-16LE `0xC1`.
+     - Cálculo del checksum rotativo oficial de exFAT y sincronización en disco.
+  5. **Capa VFS Multiformato (`vfs.c` y `vfs.h`):**
+     - Integración de `VFS_FS_EXT4` en `enum vfs_tipo_fs`.
+     - Autodetección de ext4 junto a NTFS, exFAT y FAT32.
+     - Enrutamiento unificado de `vfs_crear_archivo()` y `vfs_crear_directorio()`.
+  6. **Comandos Interactivos de Terminal (`terminal.c`):**
+     - `touch <archivo>`: Crea un archivo vacío en el sistema de archivos activo.
+     - `mkdir <carpeta>`: Crea un nuevo subdirectorio.
+     - `escribir <archivo> <texto>`: Escribe texto plano en un archivo nuevo o existente.
+     - `echo <texto> > <archivo>`: Soporte para sintaxis de redirección bash/sh.
+     - Subcomandos integrados en `disco`: `disco touch`, `disco mkdir`, `disco escribir`.
+     - Menú de `ayuda` actualizado.
+  7. **Entorno de Pruebas Seguro Anti-BSOD (`run.ps1`):**
+     - Soporte para `-Fs ext4` y protocolo estricto de generación de imágenes en `/tmp/` nativo de WSL con `sync` antes de copiar a `build/`.
+* **Pruebas y Verificación:**
+  - Compilación en WSL: `make` exitoso (**0 errores, 0 advertencias**).
+  - Autoprueba en vivo en QEMU con imagen de 64 MB ext4:
+    - Detección de volumen ext4: `==> [ VFS ] Sistema de archivos detectado y montado: ext4`.
+    - Lectura de `leeme.txt` (44 B) vía árbol de extents `0xF30A` exitosa: `"Hola desde Linux ext4 en Ring 0 de TAEK OS!"`.
+    - Creación en vivo de carpeta `carpeta_taek` e inserción en directorio raíz exitosa.
+    - Creación en vivo de archivo `saludo_ring0.txt` (47 B) vía SCSI `WRITE 10` y asignación de inodo/bloque exitosa.
+    - Visualización en árbol `tree`: 4 directorios, 2 archivos (Total: 91 B).
+    - Lectura de comprobación con `cat`: `"Escritura SCSI WRITE 10 verificada en Anillo 0!"`.
+  - Estabilidad del host Windows: **100% estable, 0 fallos de pantalla azul, 0 contenciones de cerrojos.**
+* **Artefactos y Compilación:**
+  - Imagen principal: `build/taek-os.iso` (57,006,080 bytes).
+  - Imagen fechada: `build/taek-os-2026-09-25_19-29-25.iso` (57,006,080 bytes).
+  - Todo el código preservado localmente de forma estricta (sin push a GitHub conforme a la directiva del usuario).
+
+---
+
 ## 🛠️ Registro de Errores y Lecciones Aprendidas (Post-Mortem)
 
 ### [2026-09-25 18:59] — Incidente de Bloqueo de E/S en Host Windows (BugCheck 0x1E / STATUS_IN_PAGE_ERROR)

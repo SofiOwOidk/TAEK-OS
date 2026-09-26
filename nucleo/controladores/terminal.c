@@ -1964,6 +1964,42 @@ static void ejecutar_comando_disco(const char *arg) {
         return;
     }
 
+    if (arg && (str_comienza_con(arg, "touch ") || str_comienza_con(arg, "crear "))) {
+        const char *archivo = str_saltar_espacios(arg + (str_comienza_con(arg, "touch ") ? 6 : 6));
+        vfs_crear_archivo(archivo, "");
+        return;
+    }
+
+    if (arg && str_comienza_con(arg, "mkdir ")) {
+        const char *carpeta = str_saltar_espacios(arg + 6);
+        vfs_crear_directorio(carpeta);
+        return;
+    }
+
+    if (arg && str_comienza_con(arg, "escribir ")) {
+        const char *resto = str_saltar_espacios(arg + 9);
+        char archivo[64];
+        int idx = 0;
+        while (*resto && *resto != ' ' && idx < 63) {
+            archivo[idx++] = *resto++;
+        }
+        archivo[idx] = '\0';
+        resto = str_saltar_espacios(resto);
+        if (*resto == '"') {
+            resto++;
+            char contenido[256];
+            int c_idx = 0;
+            while (*resto && *resto != '"' && c_idx < 255) {
+                contenido[c_idx++] = *resto++;
+            }
+            contenido[c_idx] = '\0';
+            vfs_crear_archivo(archivo, contenido);
+        } else {
+            vfs_crear_archivo(archivo, resto);
+        }
+        return;
+    }
+
     if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
         const char *p_lba = arg + 4;
         p_lba = str_saltar_espacios(p_lba);
@@ -2364,11 +2400,17 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  disco          ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Almacenamiento USB Mass Storage y lectura SCSI ('disco leer <lba>').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  tree / arbol   ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Despliega el árbol visual de directorios y archivos (FAT32, exFAT, NTFS).", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Despliega el árbol visual de directorios y archivos (FAT32, exFAT, NTFS, ext4).", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  ls / dir       ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Lista los archivos y carpetas del sistema de archivos detectado.");
         consola_imprimir_color("  cat <archivo>  ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Imprime el contenido de un archivo de texto del pendrive.");
+        consola_imprimir_color("  touch <archivo>", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Crea un archivo vacío en el sistema de archivos (FAT32, exFAT, ext4).", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  mkdir <carpeta>", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Crea una carpeta o subdirectorio (FAT32, exFAT, ext4).", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  escribir <arch>", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Escribe texto en un archivo ('escribir saludo.txt Hola Mundo').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
@@ -2820,6 +2862,75 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "ver ")) archivo = str_saltar_espacios(linea + 4);
         vfs_leer_archivo_texto(archivo);
         return;
+    }
+
+    // COMANDO: touch <archivo>
+    if (str_comienza_con(linea, "touch ")) {
+        const char *archivo = str_saltar_espacios(linea + 6);
+        vfs_crear_archivo(archivo, "");
+        return;
+    }
+
+    // COMANDO: mkdir <carpeta>
+    if (str_comienza_con(linea, "mkdir ")) {
+        const char *carpeta = str_saltar_espacios(linea + 6);
+        vfs_crear_directorio(carpeta);
+        return;
+    }
+
+    // COMANDO: escribir <archivo> <texto>
+    if (str_comienza_con(linea, "escribir ")) {
+        const char *resto = str_saltar_espacios(linea + 9);
+        char archivo[64];
+        int idx = 0;
+        while (*resto && *resto != ' ' && idx < 63) {
+            archivo[idx++] = *resto++;
+        }
+        archivo[idx] = '\0';
+        resto = str_saltar_espacios(resto);
+        if (*resto == '"') {
+            resto++;
+            char contenido[256];
+            int c_idx = 0;
+            while (*resto && *resto != '"' && c_idx < 255) {
+                contenido[c_idx++] = *resto++;
+            }
+            contenido[c_idx] = '\0';
+            vfs_crear_archivo(archivo, contenido);
+        } else {
+            vfs_crear_archivo(archivo, resto);
+        }
+        return;
+    }
+
+    // COMANDO: echo <texto> > <archivo>
+    if (str_comienza_con(linea, "echo ") || str_comienza_con(linea, "eco ")) {
+        const char *p = str_saltar_espacios(linea + (str_comienza_con(linea, "echo ") ? 5 : 4));
+        const char *redir = NULL;
+        for (int k = 0; p[k]; k++) {
+            if (p[k] == '>') {
+                redir = &p[k];
+                break;
+            }
+        }
+        if (redir) {
+            char texto[256];
+            int t_len = (int)(redir - p);
+            while (t_len > 0 && (p[t_len - 1] == ' ' || p[t_len - 1] == '\t')) t_len--;
+            int start_idx = 0;
+            if (p[0] == '"' && t_len > 1 && p[t_len - 1] == '"') {
+                start_idx = 1;
+                t_len -= 2;
+            }
+            int dst_i = 0;
+            for (int k = 0; k < t_len && dst_i < 255; k++) {
+                texto[dst_i++] = p[start_idx + k];
+            }
+            texto[dst_i] = '\0';
+            const char *archivo = str_saltar_espacios(redir + 1);
+            vfs_crear_archivo(archivo, texto);
+            return;
+        }
     }
 
     // COMANDO: apagar

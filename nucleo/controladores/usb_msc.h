@@ -87,6 +87,9 @@ void usb_msc_desregistrar_dispositivo(uint8_t slot_id);
 // Lee uno o más sectores físicos (LBA) desde la unidad USB especificada
 int  usb_msc_leer_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, void *buffer_destino);
 
+// Escribe uno o más sectores físicos (LBA) hacia la unidad USB especificada (SCSI WRITE 10)
+int  usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, const void *buffer_origen);
+
 // Retorna la cantidad de unidades USB Mass Storage detectadas y operativas
 int  usb_msc_obtener_cantidad(void);
 

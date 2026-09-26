@@ -114,4 +114,8 @@ int  exfat_ejecutar_tree(const char *ruta_inicial);
 int  exfat_listar_directorio(const char *ruta);
 int  exfat_leer_archivo_texto(const char *ruta);
 
+// Escritura en exFAT
+int  exfat_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);
+int  exfat_crear_directorio(const char *nombre);
+
 #endif // CONTROLADORES_EXFAT_H
