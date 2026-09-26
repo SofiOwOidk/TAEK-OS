@@ -35,5 +35,6 @@ typedef void (*manejador_irq_fn)(struct marco_interrupcion *marco);
 void idt_iniciar(void);
 void idt_registrar_manejador(uint8_t vector, manejador_irq_fn manejador);
 void despachador_interrupciones(struct marco_interrupcion *marco);
+void idt_corromper_para_harakiri(void);
 
 #endif // ARQUITECTURA_X86_64_IDT_H

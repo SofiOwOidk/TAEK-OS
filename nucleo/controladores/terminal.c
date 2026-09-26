@@ -5,7 +5,7 @@
 #include "audio_ac97.h"
 #include "audio_hda.h"
 #include "animacion_cangrejo.h"
-#include "video/h264/reproductor.h"
+#include "multimedia/reproductor/reproductor.h"
 #include "gpu.h"
 #include "../compatibilidad/linux.h"
 #include "../compatibilidad/nv_os_interface.h"
@@ -15,6 +15,7 @@
 #include "../base/huevo.h"
 #include "../base/energia.h"
 #include "../base/tiempo.h"
+#include "../base/version.h"
 #include "../base/memoria.h"
 #include "../base/dma.h"
 #include "../base/paginacion.h"
@@ -29,9 +30,13 @@
 #include "vfs.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
+#include "../arquitectura/x86_64/triple_fault.h"
 
 extern const uint8_t _binary_audio_arranque_bin_start[];
 extern const uint8_t _binary_audio_arranque_bin_end[];
+
+extern const uint8_t _binary_cangrejo_audio_bin_start[];
+extern const uint8_t _binary_cangrejo_audio_bin_end[];
 
 extern const uint8_t _binary_duelo_audio_bin_start[];
 extern const uint8_t _binary_duelo_audio_bin_end[];
@@ -45,6 +50,115 @@ static void esperar_con_audio_bucle(int ms, const uint8_t *audio, uint32_t tam) 
         esperar_milisegundos(paso);
         ms -= paso;
     }
+}
+
+// Carga mixta acotada: audio DMA y framebuffer siguen activos mientras se
+// intercalan asignaciones PMM/heap/DMA, lecturas MSC y eventos HID/hotplug.
+static void ejecutar_stress_basico(void) {
+    enum { RONDAS = 64, BLOQUES = 8, TAM_DMA = 8192 };
+    uint64_t paginas[BLOQUES], dma_phys[BLOQUES];
+    uint8_t *heap[BLOQUES], *dma[BLOQUES];
+    uint8_t sector[512] __attribute__((aligned(16)));
+    uint32_t lecturas = 0, fallos_io = 0, rondas = 0;
+    int error_memoria = 0;
+    int hda_iniciado = 0, ac97_iniciado = 0;
+    int hda_previo = audio_hda_esta_operativo() && audio_hda_esta_reproduciendo();
+    int ac97_previo = !hda_previo && audio_ac97_esta_reproduciendo();
+    uint64_t hda_dma_antes = audio_hda_obtener_estado()->bytes_dma_totales;
+    uint32_t hda_bcis_antes = audio_hda_obtener_estado()->eventos_bcis;
+    uint64_t raton_reportes_antes = xhci_obtener_estado()->reportes_raton_recibidos;
+    uint32_t audio_bytes = (uint32_t)(_binary_audio_arranque_bin_end - _binary_audio_arranque_bin_start);
+    if (audio_hda_esta_operativo())
+        hda_iniciado = audio_hda_reproducir_pcm_bucle(_binary_audio_arranque_bin_start, audio_bytes) == 0;
+    else if (!ac97_previo)
+        ac97_iniciado = audio_ac97_reproducir_pcm_bucle(_binary_audio_arranque_bin_start, audio_bytes) == 0;
+    if (hda_iniciado) {
+        hda_dma_antes = audio_hda_obtener_estado()->bytes_dma_totales;
+        hda_bcis_antes = audio_hda_obtener_estado()->eventos_bcis;
+    }
+
+    for (uint32_t r = 0; r < RONDAS; r++) {
+        memset(paginas, 0, sizeof(paginas));
+        memset(dma_phys, 0, sizeof(dma_phys));
+        memset(heap, 0, sizeof(heap));
+        memset(dma, 0, sizeof(dma));
+        for (uint32_t i = 0; i < BLOQUES; i++) {
+            paginas[i] = pmm_asignar_pagina_fisica();
+            heap[i] = (uint8_t *)asignar_memoria(128 + i * 37);
+            dma[i] = (uint8_t *)dma_asignar_bufer_contiguo(TAM_DMA, 4096, &dma_phys[i]);
+            if (!paginas[i] || !heap[i] || !dma[i]) { error_memoria = 1; break; }
+            uint8_t patron = (uint8_t)(r + i + 1);
+            memset((void *)(paginas[i] + memoria_obtener_hhdm_offset()), patron, 4096);
+            memset(heap[i], patron, 128 + i * 37);
+            memset(dma[i], patron, TAM_DMA);
+        }
+
+        if (!error_memoria) {
+            xhci_sondeo();
+            xhci_escanear_cambios_puertos(0);
+            for (uint8_t id = 0; id < USB_MSC_MAX_DISPOSITIVOS; id++) {
+                const struct usb_msc_dispositivo *dev = usb_msc_obtener_dispositivo(id);
+                if (dev && dev->activo && dev->listo) {
+                    if (usb_msc_leer_sectores(id, r % dev->sectores_totales, 1, sector) == 0)
+                        lecturas++;
+                    else fallos_io++;
+                    break;
+                }
+            }
+            audio_hda_actualizar();
+            audio_ac97_actualizar();
+            esperar_milisegundos(5);
+            if (pantalla_obtener_ancho() && pantalla_obtener_alto())
+                pantalla_dibujar_pixel((int)pantalla_obtener_ancho() - 1,
+                                       (int)pantalla_obtener_alto() - 1, (r & 1) ? 0xFFFFFF : 0);
+            for (uint32_t i = 0; i < BLOQUES; i++) {
+                uint8_t patron = (uint8_t)(r + i + 1);
+                uint8_t *pag = (uint8_t *)(paginas[i] + memoria_obtener_hhdm_offset());
+                if (pag[0] != patron || pag[4095] != patron ||
+                    heap[i][0] != patron || heap[i][127 + i * 37] != patron ||
+                    dma[i][0] != patron || dma[i][TAM_DMA - 1] != patron ||
+                    (uint64_t)(uintptr_t)dma[i] != dma_phys[i] + memoria_obtener_hhdm_offset())
+                    error_memoria = 1;
+            }
+        }
+        for (uint32_t i = 0; i < BLOQUES; i++) {
+            if (dma[i]) dma_liberar_bufer_contiguo(dma[i], dma_phys[i], TAM_DMA);
+            if (heap[i]) liberar_memoria(heap[i]);
+            if (paginas[i]) pmm_liberar_pagina_fisica(paginas[i]);
+        }
+        if (error_memoria || !memoria_verificar_integridad()) break;
+        rondas++;
+    }
+    audio_hda_actualizar();
+    uint64_t hda_dma_despues = audio_hda_obtener_estado()->bytes_dma_totales;
+    uint32_t hda_bcis_despues = audio_hda_obtener_estado()->eventos_bcis;
+    int fallo_audio = (hda_iniciado || hda_previo) && hda_dma_despues == hda_dma_antes;
+    if (hda_iniciado) audio_hda_detener();
+    if (ac97_iniciado) audio_ac97_detener();
+    consola_imprimir("[STRESS] Rondas: "); consola_imprimir_dec(rondas);
+    consola_imprimir(" | Lecturas MSC: "); consola_imprimir_dec(lecturas);
+    consola_imprimir(" | Fallos I/O: "); consola_imprimir_dec(fallos_io);
+    consola_imprimir(" | Audio: ");
+    consola_imprimir(hda_iniciado ? "HDA iniciado" :
+                     (hda_previo ? "HDA previo" :
+                     (ac97_iniciado ? "AC97 iniciado" :
+                     (ac97_previo ? "AC97 previo" : "ausente"))));
+    if (hda_iniciado || hda_previo) {
+        consola_imprimir(" | Avance HDA: ");
+        consola_imprimir_dec(hda_dma_despues - hda_dma_antes);
+        consola_imprimir(" B");
+        consola_imprimir(" | BCIS: ");
+        consola_imprimir_dec(hda_bcis_despues - hda_bcis_antes);
+    }
+    consola_imprimir(" | Ratones: ");
+    consola_imprimir_dec(xhci_obtener_estado()->ratones_activos);
+    consola_imprimir(" | Reportes raton: ");
+    consola_imprimir_dec(xhci_obtener_estado()->reportes_raton_recibidos - raton_reportes_antes);
+    consola_imprimir_linea("");
+    consola_imprimir_linea_color(error_memoria ? "[STRESS] FALLO de memoria" :
+                               (fallos_io ? "[STRESS] Fallos I/O observados" :
+                               (fallo_audio ? "[STRESS] HDA sin avance DMA" : "[STRESS] Completado")),
+                               error_memoria || fallos_io || fallo_audio ? COLOR_ERROR_DEFAULT : COLOR_EXITO_DEFAULT);
 }
 
 static int __attribute__((unused)) str_longitud(const char *s) {
@@ -78,6 +192,8 @@ static int str_igual_sin_caso(const char *s1, const char *s2) {
 }
 
 static int g_el_comando_desbloqueado = 0;
+// Modo de acción para el comando 'rm': 1 = Tier 1 (Limpio), 2 = Tier 2 (Harakiri), 3 = Tier 3 (Seppuku), 0 = Clásico
+static int g_rm_modo = 1;
 
 static uint32_t g_semilla_azar = 0x6A09E667;
 
@@ -100,6 +216,19 @@ static int str_comienza_con(const char *str, const char *prefijo) {
         i++;
     }
     return 1;
+}
+
+static int str_contiene(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return 0;
+    if (!*needle) return 1;
+    for (int i = 0; haystack[i]; i++) {
+        int j = 0;
+        while (haystack[i + j] && needle[j] && haystack[i + j] == needle[j]) {
+            j++;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
 }
 
 static const char *str_saltar_espacios(const char *s) {
@@ -159,10 +288,18 @@ static int64_t evaluar_expresion(const char *expr) {
 
 static void imprimir_banner(void) {
     consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Terminal de Control   ", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  TAEK OS ");
+    consola_imprimir(taek_obtener_version());
+    consola_imprimir(" (");
+    consola_imprimir(taek_obtener_hito());
+    consola_imprimir_linea_color(") - Terminal de Control (Ring 0)", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Compilación : ");
+    consola_imprimir_color(taek_obtener_fecha_compilacion(), COLOR_PROMPT_DEFAULT);
+    consola_imprimir(" ");
+    consola_imprimir_linea_color(taek_obtener_hora_compilacion(), COLOR_PROMPT_DEFAULT);
     consola_imprimir_color      ("  Sesión iniciada como usuario: ", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("sudo (Privilegios Máximos Ring 0)", COLOR_USUARIO_DEFAULT);
-    consola_imprimir_linea_color("  Escribe 'ayuda' para ver la lista de comandos disponibles.  ", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("  Escribe 'ayuda' o 'version' para ver comandos e información.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("==============================================================", COLOR_AVISO_DEFAULT);
     consola_imprimir_linea("");
 }
@@ -510,7 +647,7 @@ static void ejecutar_comando_lspci(const char *arg) {
 
                 // Diagnóstico según arquitectura de la GPU
                 if (dev->id_proveedor == 0x10DE) {
-                    consola_imprimir_linea_color("    [ NVIDIA GPU ] Silicio listo para mapeo MMIO y carga de firmware GSP.", COLOR_USUARIO_DEFAULT);
+                    consola_imprimir_linea_color("    [ NVIDIA GPU ] Detectada por PCI; GSP H18-H20 descontinuado.", COLOR_USUARIO_DEFAULT);
                 } else if (dev->id_proveedor == 0x8086) {
                     consola_imprimir_linea_color("    [ INTEL GPU ] Acelerador gráfico integrado listo.", COLOR_USUARIO_DEFAULT);
                 } else if (dev->id_proveedor == 0x1AF4) {
@@ -747,7 +884,7 @@ static void ejecutar_comando_gpu(const char *arg) {
 
     consola_imprimir("  Capa de Driver Kernel : ");
     if (gpu->id_proveedor == 0x10DE) {
-        consola_imprimir_linea_color("Shim Linux 'nvidia-open' / GSP Firmware Bridge (Fase 3)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("PCI/MMIO experimental; GSP H18-H20 descontinuado", COLOR_AVISO_DEFAULT);
     } else {
         consola_imprimir_linea_color("Controlador Nativo TAEK OS / Framebuffer Directo", COLOR_PROMPT_DEFAULT);
     }
@@ -851,7 +988,7 @@ static void ejecutar_comando_linux(const char *arg) {
     consola_imprimir_dec((uint64_t)devs_pci);
     consola_imprimir_linea(" (Estructuras 'struct pci_dev' adaptadas)");
     consola_imprimir("  Controladores Objetivos: ");
-    consola_imprimir_linea_color("NVIDIA Open GPU Kernel Modules (GSP Client) & VirtIO-GPU", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("Interfaces PCI/DMA experimentales; GSP descontinuado", COLOR_AVISO_DEFAULT);
     consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
     consola_imprimir_linea_color("Tip: Escribe 'linux probar' para verificar el puente y llamadas DMA.", COLOR_TEXTO_DEFAULT);
 }
@@ -888,357 +1025,25 @@ static void ejecutar_comando_dmesg(void) {
 
 static void ejecutar_comando_guia(const char *arg) {
     (void)arg;
-    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("   GUÍA OFICIAL DE TESTEO DE GPU DEDICADA EN HARDWARE REAL                      ", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("   Objetivo: Plataforma x86_64 + GPU PCIe Dedicada (Directo CPU)                 ", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea("");
-
-    consola_imprimir_linea_color("[ PASO 1: VERIFICAR DETECCIÓN FÍSICA EN EL BUS PCIE ]", COLOR_EXITO_DEFAULT);
-    consola_imprimir_linea_color("  Comando a ejecutar: lspci  o  pci gpu", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * En tu placa física con la GPU dedicada debes ver:");
-    consola_imprimir_linea("    - Vendor ID: 0x10DE (NVIDIA Corporation)");
-    consola_imprimir_linea("    - Device ID: 0x2F04 (GeForce RTX 5070 Ti Desktop)");
-    consola_imprimir_linea("    - Clase    : 0x0300 (VGA Compatible Controller)");
-    consola_imprimir_linea("  * Si en 'Modo de Operación' indica 'Hardware Real MoDT', tu tarjeta está");
-    consola_imprimir_linea("    correctamente alimentada y enlazada a las 16 líneas PCIe del procesador.");
-    consola_imprimir_linea("");
-
-    consola_imprimir_linea_color("[ PASO 2: INSPECCIONAR REGISTROS BAR0 MMIO Y BAR1 VRAM ]", COLOR_EXITO_DEFAULT);
-    consola_imprimir_linea_color("  Comando a ejecutar: gpu  o  gpu probar", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * BAR0 Físico: Espacio de control MMIO asignado por la BIOS UEFI (16 MiB).");
-    consola_imprimir_linea("  * BAR1 Físico: Apertura de memoria VRAM (16 GiB en direccionamiento de 64 bits).");
-    consola_imprimir_linea("  * Registro PMC_BOOT_0: Comprueba la lectura directa de silicio (0x190xxxxx para Blackwell).");
-    consola_imprimir_linea("");
-
-    consola_imprimir_linea_color("[ PASO 3: INSPECCIONAR EL SUBSISTEMA GSP ANTES DEL ARRANQUE ]", COLOR_EXITO_DEFAULT);
-    consola_imprimir_linea_color("  Comando a ejecutar: nvidia gsp", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * Comprobarás que el microcódigo GSP aún no está cargado.");
-    consola_imprimir_linea("  * Las colas CMD_Q y STAT_Q de 64 KiB en RAM física estarán inactivas.");
-    consola_imprimir_linea("");
-
-    consola_imprimir_linea_color("[ PASO 4: DISPARAR LA SECUENCIA DE ARRANQUE GPU DE 6 PASOS ]", COLOR_EXITO_DEFAULT);
-    consola_imprimir_linea_color("  Comando a ejecutar: nvidia inicializar", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * Observarás en vivo la telemetría del silicio paso a paso:");
-    consola_imprimir_linea("    1. Detección y validación en PCIe -> [OK]");
-    consola_imprimir_linea("    2. Asignación WPR de 16 MiB en DMA contiguo (Base física alineada a 64 KiB) -> [OK]");
-    consola_imprimir_linea("    3. Inicialización de colas circulares CMD/STAT y enlace Falcon Mailbox -> [OK]");
-    consola_imprimir_linea("    4. Handshake RPC inicial con coprocesador GSP (ABI v1.0) -> [OK]");
-    consola_imprimir_linea("    5. Consulta de topología y extracción de capacidades de silicio -> [OK]");
-    consola_imprimir_linea("    6. Transición formal al ESTADO OPERATIVO.");
-    consola_imprimir_linea("");
-
-    consola_imprimir_linea_color("[ PASO 5: VERIFICAR TELEMETRÍA Y CAPACIDADES ACTIVAS ]", COLOR_EXITO_DEFAULT);
-    consola_imprimir_linea_color("  Comando a ejecutar: nvidia", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * Verifica que el Estado Operativo marque: 'OPERATIVO (SILICIO BLACKWELL ACTIVO)' en verde.");
-    consola_imprimir_linea("  * VRAM Dedicada: 16 GiB GDDR7 (Bus 256 bits a 28 Gbps).");
-    consola_imprimir_linea("  * Cómputo: 70 SMs | 8,960 CUDA Cores | Tensor Cores Gen 4 | RT Cores Gen 5.");
-    consola_imprimir_linea("  * Frecuencias: 2,160 MHz Base / 2,520 MHz Boost.");
-    consola_imprimir_linea("");
-
-    consola_imprimir_linea_color("[ PASO 6: EJECUTAR EL AUTODIAGNÓSTICO INTEGRAL EXTREMO A EXTREMO ]", COLOR_EXITO_DEFAULT);
-    consola_imprimir_linea_color("  Comando a ejecutar: nvidia probar", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea("  * Audita los 5 puntos críticos de la arquitectura (Spinlocks, WPR DMA, RPC, Silicio y Caps).");
-    consola_imprimir_linea("  * Debe concluir con: '==> [ AUTODIAGNÓSTICO EXITOSO ] Coprocesador GSP y GPU Blackwell 100% Operativos.'");
-    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Si tienes un pendrive USB, grábale 'build/taek-os.iso' con Rufus o Ventoy y pruébalo.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Guía de validación física PCI/GPU", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea("1. 'lspci -v' y 'gpu' muestran BDF, IDs y BARs asignados.");
+    consola_imprimir_linea("2. 'gpu probar' sólo comprueba acceso MMIO; no valida aceleración ni GSP.");
+    consola_imprimir_linea("3. H18-H20 GSP están descontinuados. No ejecutar su inicialización.");
+    consola_imprimir_linea("4. Registrar salida serial y resultados de hardware en la bitácora.");
 }
-
 static void ejecutar_comando_nvidia(const char *arg) {
+    consola_imprimir_linea_color("NVIDIA H18-H20: descontinuado; GSP no validado", COLOR_AVISO_DEFAULT);
+    if (arg && arg[0]) {
+        consola_imprimir_linea("Los subcomandos GSP están deshabilitados. Usa 'gpu' para inspección PCI/MMIO.");
+        return;
+    }
     const struct nvidia_dispositivo *ndev = nvidia_core_obtener_dispositivo();
-
-    // SUBCOMANDO: nvidia inicializar / init / start / arrancar (Hito 20)
-    if (arg && (str_igual(arg, "inicializar") || str_igual(arg, "init") ||
-                str_igual(arg, "arrancar") || str_igual(arg, "boot"))) {
-        consola_imprimir_linea_color("========== SECUENCIA DE ARRANQUE GPU NVIDIA BLACKWELL (HITO 20) ==========", COLOR_AVISO_DEFAULT);
-
-        if (!ndev->presente) {
-            consola_imprimir_linea_color("  [AVISO] Silicio NVIDIA no detectado en bus PCIe.", COLOR_AVISO_DEFAULT);
-            consola_imprimir_linea("  Estás ejecutando en un entorno virtual sin GPU física NVIDIA (ej. QEMU).");
-            consola_imprimir_linea("  Para inicializar el silicio real, graba 'build/taek-os.iso' en un pendrive");
-            consola_imprimir_linea("  y bootea en un equipo x86_64 físico con GPU PCIe dedicada.");
-            return;
-        }
-
-        consola_imprimir_linea("Ejecutando secuencia de inicialización del silicio y firmware GSP...");
-
-        consola_imprimir("  Paso 1: Detección y verificación de silicio en bus PCIe... ");
-        consola_imprimir("[OK: ");
-        consola_imprimir(ndev->chip_name);
-        consola_imprimir_linea_color("]", COLOR_EXITO_DEFAULT);
-
-        consola_imprimir("  Paso 2: Carga de microcódigo oficial GSP y reserva WPR en DMA... ");
-        NV_STATUS st_fw = gsp_firmware_cargar((struct nvidia_dispositivo *)ndev);
-        if (st_fw == NV_OK) {
-            const gsp_firmware_descriptor_t *fw = gsp_firmware_obtener_info();
-            consola_imprimir("[OK: ");
-            consola_imprimir_dec(fw->tamano_wpr_heap / (1024 * 1024));
-            consola_imprimir_linea_color(" MiB WPR]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO EN FIRMWARE]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  Paso 3: Inicialización de colas circulares RPC y Mailbox Falcon... ");
-        NV_STATUS st_rpc = gsp_rpc_iniciar((struct nvidia_dispositivo *)ndev);
-        if (st_rpc == NV_OK) {
-            consola_imprimir_linea_color("[OK - CMD_Q Y STAT_Q LISTAS]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO EN COLAS RPC]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  Paso 4: Handshake de protocolo RPC (GSP_RPC_CMD_INITIALIZE)... ");
-        uint32_t abi_ver = 0;
-        uint32_t len_abi = sizeof(abi_ver);
-        NV_STATUS st_hand = gsp_rpc_enviar_sincrono(GSP_RPC_CMD_INITIALIZE, NULL, 0, &abi_ver, &len_abi);
-        if (st_hand == NV_OK) {
-            consola_imprimir("[OK - ABI v");
-            consola_imprimir_dec((uint64_t)(abi_ver >> 24));
-            consola_imprimir(".");
-            consola_imprimir_dec((uint64_t)((abi_ver >> 16) & 0xFF));
-            consola_imprimir_linea_color("]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO HANDSHAKE]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  Paso 5: Consulta de topología y capacidades silicio (GET_CAPS)... ");
-        NV_STATUS st_caps = nvidia_gpu_inicializar_completo();
-        if (st_caps == NV_OK) {
-            consola_imprimir_linea_color("[OK - CAPACIDADES RECIBIDAS]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO EN GET_CAPS]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  Paso 6: Transición de silicio a estado operativo... ");
-        consola_imprimir_linea_color("[OK - OPERATIVO]", COLOR_EXITO_DEFAULT);
-
-        consola_imprimir_linea("");
-        consola_imprimir_linea_color("==> [ ARRANQUE GPU COMPLETADO CON ÉXITO ]", COLOR_EXITO_DEFAULT);
-        consola_imprimir("  Silicio: ");
-        consola_imprimir_linea_color(ndev->caps.nombre_gpu, COLOR_USUARIO_DEFAULT);
-        consola_imprimir("  VRAM: ");
-        consola_imprimir_dec(ndev->caps.vram_total_bytes / (1024ULL * 1024ULL * 1024ULL));
-        consola_imprimir(" GiB GDDR7 (Bus: ");
-        consola_imprimir_dec((uint64_t)ndev->caps.vram_bus_width);
-        consola_imprimir_linea(" bits)");
-        consola_imprimir("  Cómputo: ");
-        consola_imprimir_dec((uint64_t)ndev->caps.sm_count);
-        consola_imprimir(" SMs | ");
-        consola_imprimir_dec((uint64_t)ndev->caps.cuda_cores);
-        consola_imprimir_linea(" CUDA Cores | RT Cores Gen 5");
-        consola_imprimir("  Reloj: ");
-        consola_imprimir_dec((uint64_t)ndev->caps.reloj_base_mhz);
-        consola_imprimir(" MHz Base / ");
-        consola_imprimir_dec((uint64_t)ndev->caps.reloj_boost_mhz);
-        consola_imprimir_linea(" MHz Boost");
+    if (!ndev || !ndev->presente) {
+        consola_imprimir_linea("No se detectó una GPU NVIDIA en PCI.");
         return;
     }
-
-    // SUBCOMANDO: nvidia gsp / firmware / rpc (Hitos 18 y 19)
-    if (arg && (str_igual(arg, "gsp") || str_igual(arg, "firmware") || str_igual(arg, "rpc"))) {
-        const gsp_firmware_descriptor_t *fw = gsp_firmware_obtener_info();
-        const gsp_boot_args_t *args = gsp_firmware_obtener_boot_args();
-        NvU32 rpc_env = 0, rpc_rec = 0, rpc_err = 0;
-        gsp_rpc_obtener_estadisticas(&rpc_env, &rpc_rec, &rpc_err);
-
-        consola_imprimir_linea_color("================ COPROCESADOR GSP & PROTOCOLO RPC (H18/H19) ================", COLOR_AVISO_DEFAULT);
-        consola_imprimir("  Microcódigo GSP        : ");
-        consola_imprimir_linea_color(fw->cargado_en_dma ? fw->nombre_firmware : "No cargado (Escribe 'nvidia inicializar')", COLOR_USUARIO_DEFAULT);
-        consola_imprimir("  Versión Driver NVIDIA  : ");
-        consola_imprimir_dec(fw->version_major ? fw->version_major : GSP_FIRMWARE_VERSION_MAJ);
-        consola_imprimir(".");
-        consola_imprimir_dec(fw->version_minor ? fw->version_minor : GSP_FIRMWARE_VERSION_MIN);
-        consola_imprimir_linea(" (Rama Oficial Production Ready)");
-
-        consola_imprimir("  Región Protegida WPR   : ");
-        if (args->wpr_base_phys != 0) {
-            consola_imprimir("0x");
-            terminal_imprimir_hex_fijo(args->wpr_base_phys, 16);
-            consola_imprimir(" (");
-            consola_imprimir_dec(args->wpr_size / (1024 * 1024));
-            consola_imprimir_linea_color(" MiB en DMA Contiguo) [PROTEGIDA]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("No configurada (Escribe 'nvidia inicializar')", COLOR_AVISO_DEFAULT);
-        }
-
-        consola_imprimir("  Cola Comandos (CMD_Q)  : ");
-        if (args->cmd_queue_phys != 0) {
-            consola_imprimir("0x");
-            terminal_imprimir_hex_fijo(args->cmd_queue_phys, 16);
-            consola_imprimir(" (64 KiB Circular en RAM)");
-        } else {
-            consola_imprimir("Inactiva");
-        }
-        consola_imprimir_linea("");
-
-        consola_imprimir("  Cola Estado   (STAT_Q) : ");
-        if (args->stat_queue_phys != 0) {
-            consola_imprimir("0x");
-            terminal_imprimir_hex_fijo(args->stat_queue_phys, 16);
-            consola_imprimir(" (64 KiB Circular en RAM)");
-        } else {
-            consola_imprimir("Inactiva");
-        }
-        consola_imprimir_linea("");
-
-        consola_imprimir("  Falcon Mailbox 0 / 1   : ");
-        consola_imprimir("MMIO 0x00110040 / 0x00110044 -> 0x");
-        terminal_imprimir_hex_fijo(args->cmd_queue_phys, 16);
-        consola_imprimir_linea("");
-
-        consola_imprimir("  Tráfico Mensajería RPC : ");
-        consola_imprimir_dec((uint64_t)rpc_env);
-        consola_imprimir(" enviados | ");
-        consola_imprimir_dec((uint64_t)rpc_rec);
-        consola_imprimir(" recibidos | ");
-        consola_imprimir_dec((uint64_t)rpc_err);
-        consola_imprimir_linea(" errores");
-
-        consola_imprimir_linea_color("=============================================================================", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color("Tip: Usa 'nvidia probar' para auditar el canal y la máquina de estados.", COLOR_TEXTO_DEFAULT);
-        return;
-    }
-
-    // MODO AUTODIAGNÓSTICO: nvidia probar / nvidia test
-    if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
-        consola_imprimir_linea_color("========== AUTODIAGNÓSTICO DEL SUBSISTEMA NVIDIA GSP (HITOS 18, 19 Y 20) ==========", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea("Verificando firmware loader, colas RPC, handshake e inicialización...");
-
-        consola_imprimir("  1. Sincronización interna del Resource Manager (Spinlocks)... ");
-        nv_spinlock_t core_lock;
-        nv_os_spinlock_init(&core_lock);
-        nv_os_spinlock_acquire(&core_lock);
-        nv_os_spinlock_release(&core_lock);
-        consola_imprimir_linea_color("[OK - SPINLOCKS DE SILICIO OK]", COLOR_EXITO_DEFAULT);
-
-        if (!ndev->presente) {
-            consola_imprimir_linea_color("  [AVISO] Silicio NVIDIA no detectado en bus PCI (Entorno QEMU).", COLOR_AVISO_DEFAULT);
-            consola_imprimir_linea_color("  [OK] Primitivas de concurrencia y búfer DMA listos para hospedar hardware real.", COLOR_PROMPT_DEFAULT);
-            consola_imprimir_linea("  Para auditar el silicio real: bootea build/taek-os.iso en la máquina MoDT.");
-            return;
-        }
-
-        consola_imprimir("  2. Cargador de Firmware GSP y Región WPR en DMA (Hito 18)... ");
-        int fw_diag = gsp_firmware_autodiagnostico((struct nvidia_dispositivo *)ndev);
-        if (fw_diag == 0) {
-            consola_imprimir_linea_color("[OK - FIRMWARE GSP AUTENTICADO]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO EN FIRMWARE GSP]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  3. Canal de Comunicación RPC y Colas Circulares (Hito 19)... ");
-        int rpc_diag = gsp_rpc_autodiagnostico((struct nvidia_dispositivo *)ndev);
-        if (rpc_diag == 0) {
-            consola_imprimir_linea_color("[OK - PROTOCOLO RPC 100% FUNCIONAL]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO EN CANAL RPC]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  4. Inicialización Completa de Silicio GPU Blackwell (Hito 20)... ");
-        NV_STATUS st_init = nvidia_gpu_inicializar_completo();
-        if (st_init == NV_OK && ndev->estado == NV_GPU_ESTADO_OPERATIVO) {
-            consola_imprimir_linea_color("[OK - ESTADO OPERATIVO ALCANZADO]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO AL INICIALIZAR GPU]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir("  5. Verificación de Capacidades Extraídas (VRAM y SMs)... ");
-        if (ndev->caps.vram_total_bytes > 0 && ndev->caps.sm_count > 0) {
-            consola_imprimir("[OK: 16 GiB GDDR7 / ");
-            consola_imprimir_dec(ndev->caps.sm_count);
-            consola_imprimir_linea_color(" SMs / 8960 CUDA Cores]", COLOR_EXITO_DEFAULT);
-        } else {
-            consola_imprimir_linea_color("[FALLO EN CAPACIDADES]", COLOR_ERROR_DEFAULT);
-            return;
-        }
-
-        consola_imprimir_linea("");
-        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO EXITOSO ] Coprocesador GSP y GPU Blackwell 100% Operativos.", COLOR_EXITO_DEFAULT);
-        return;
-    }
-
-    // REPORTE ESTÁNDAR: nvidia
-    consola_imprimir_linea_color("================ CONTROLADOR NVIDIA (RESOURCE MANAGER CORE) ================", COLOR_AVISO_DEFAULT);
-    consola_imprimir("  Aislamiento Arquitectónico: ");
-    consola_imprimir_linea_color("100% Aislado en 'nucleo/controladores/video/nvidia/'", COLOR_EXITO_DEFAULT);
-    consola_imprimir("  Dispositivo / Arquitectura: ");
-    consola_imprimir_linea_color(ndev->chip_name, COLOR_USUARIO_DEFAULT);
-    consola_imprimir("  Identificador PCI (Vendor): 0x");
-    terminal_imprimir_hex_fijo(ndev->vendor_id, 4);
-    consola_imprimir(" | Device: 0x");
-    terminal_imprimir_hex_fijo(ndev->device_id, 4);
-    consola_imprimir(" | ChipID: 0x");
-    terminal_imprimir_hex_fijo(ndev->chip_id, 8);
-    consola_imprimir_linea("");
-
-    consola_imprimir("  Estado Operativo GPU      : ");
-    if (ndev->estado == NV_GPU_ESTADO_OPERATIVO) {
-        consola_imprimir_linea_color(nvidia_gpu_estado_nombre(ndev->estado), COLOR_EXITO_DEFAULT);
-    } else {
-        consola_imprimir_color(nvidia_gpu_estado_nombre(ndev->estado), COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea_color(" (Escribe 'nvidia inicializar' para arrancar)", COLOR_TEXTO_DEFAULT);
-    }
-
-    consola_imprimir("  Modo de Operación         : ");
-    if (ndev->presente) {
-        consola_imprimir_linea_color("Hardware Real (PCIe Directo x16 a CPU)", COLOR_EXITO_DEFAULT);
-    } else {
-        consola_imprimir_linea_color("Emulación QEMU (Silicio NVIDIA ausente en bus PCI)", COLOR_AVISO_DEFAULT);
-    }
-
-    consola_imprimir("  Memoria VRAM Dedicada     : ");
-    if (ndev->estado == NV_GPU_ESTADO_OPERATIVO && ndev->caps.vram_total_bytes > 0) {
-        consola_imprimir_dec(ndev->caps.vram_total_bytes / (1024ULL * 1024ULL * 1024ULL));
-        consola_imprimir(" GiB GDDR7 (Bus ");
-        consola_imprimir_dec((uint64_t)ndev->caps.vram_bus_width);
-        consola_imprimir_linea_color(" bits / 28 Gbps)", COLOR_EXITO_DEFAULT);
-    } else if (ndev->presente) {
-        consola_imprimir("BAR1 Fís: 0x");
-        terminal_imprimir_hex_fijo(ndev->bar1_phys, 16);
-        consola_imprimir_linea(" (16 GiB GDDR7)");
-    } else {
-        consola_imprimir_linea_color("No detectada (Requiere hardware físico)", COLOR_TEXTO_DEFAULT);
-    }
-
-    consola_imprimir("  Núcleos y Cómputo         : ");
-    if (ndev->estado == NV_GPU_ESTADO_OPERATIVO && ndev->caps.sm_count > 0) {
-        consola_imprimir_dec((uint64_t)ndev->caps.sm_count);
-        consola_imprimir(" SMs | ");
-        consola_imprimir_dec((uint64_t)ndev->caps.cuda_cores);
-        consola_imprimir_linea(" CUDA Cores | 4th Gen Tensor | 5th Gen RT");
-    } else if (ndev->presente) {
-        consola_imprimir_linea("Pendiente de extracción vía GSP GET_CAPS");
-    } else {
-        consola_imprimir_linea_color("No disponibles (GPU ausente)", COLOR_TEXTO_DEFAULT);
-    }
-
-    consola_imprimir("  Frecuencias de Reloj      : ");
-    if (ndev->estado == NV_GPU_ESTADO_OPERATIVO && ndev->caps.reloj_base_mhz > 0) {
-        consola_imprimir_dec((uint64_t)ndev->caps.reloj_base_mhz);
-        consola_imprimir(" MHz Base / ");
-        consola_imprimir_dec((uint64_t)ndev->caps.reloj_boost_mhz);
-        consola_imprimir_linea(" MHz Boost");
-    } else if (ndev->presente) {
-        consola_imprimir_linea("Pendiente de extracción vía GSP");
-    } else {
-        consola_imprimir_linea_color("No disponibles", COLOR_TEXTO_DEFAULT);
-    }
-
-    consola_imprimir("  Capa de Interfaz (Bridge) : ");
-    consola_imprimir_linea_color("nv_os_interface -> TAEK Linux Shim -> VMM/PMM Soberano", COLOR_PROMPT_DEFAULT);
-
-    consola_imprimir_linea_color("============================================================================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Usa 'nvidia inicializar' para ejecutar la secuencia de arranque GSP.", COLOR_TEXTO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Usa 'nvidia gsp' para ver el estado de colas circulares y Mailbox.", COLOR_TEXTO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Usa 'nvidia probar' para auditar todo el pipeline de silicio y RPC.", COLOR_TEXTO_DEFAULT);
+    ejecutar_comando_gpu(NULL);
 }
-
 static void ejecutar_comando_apic(const char *arg) {
     const struct estado_apic *apic = apic_obtener_estado();
 
@@ -2002,6 +1807,53 @@ static void ejecutar_comando_disco(const char *arg) {
         return;
     }
 
+    if (arg && (str_comienza_con(arg, "montar") || str_comienza_con(arg, "mount"))) {
+        const char *p = str_saltar_espacios(arg + (str_comienza_con(arg, "montar") ? 6 : 5));
+        uint8_t u = 0;
+        if (*p >= '0' && *p <= '9') u = (uint8_t)(*p - '0');
+        consola_imprimir_color("==> [ VFS ] Intentando montar DISCO #", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_dec(u);
+        consola_imprimir_linea("...");
+        if (vfs_montar(u) == 0) {
+            consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec(u);
+            consola_imprimir(" montado exitosamente como: ");
+            consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+            vfs_listar_directorio(NULL);
+        } else {
+            consola_imprimir_color("  [ERROR] No se detectó un sistema de archivos soportado (FAT32, exFAT, NTFS o ext4) en DISCO #", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec(u);
+            consola_imprimir_linea(".");
+        }
+        return;
+    }
+
+    if (arg && (str_igual(arg, "desmontar") || str_igual(arg, "umount") || str_igual(arg, "unmount"))) {
+        vfs_desmontar();
+        consola_imprimir_linea_color("==> [ VFS ] Unidad desmontada.", COLOR_AVISO_DEFAULT);
+        return;
+    }
+
+    if (arg && *arg >= '0' && *arg <= '9' && (*(arg + 1) == '\0' || *(arg + 1) == ' ')) {
+        uint8_t u = (uint8_t)(*arg - '0');
+        consola_imprimir_color("==> [ VFS ] Cambiando a DISCO #", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_dec(u);
+        consola_imprimir_linea("...");
+        if (vfs_montar(u) == 0) {
+            consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec(u);
+            consola_imprimir(" activo (");
+            consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("). Contenido:");
+            vfs_listar_directorio(NULL);
+        } else {
+            consola_imprimir_color("  [ERROR] No se encontró sistema de archivos soportado en DISCO #", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec(u);
+            consola_imprimir_linea(".");
+        }
+        return;
+    }
+
     if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
         const char *p_lba = arg + 4;
         p_lba = str_saltar_espacios(p_lba);
@@ -2020,22 +1872,33 @@ static void ejecutar_comando_disco(const char *arg) {
             return;
         }
 
-        uint32_t lba = 0;
+        uint32_t val1 = 0, val2 = 0;
+        int tiene_val1 = 0, tiene_val2 = 0;
+
         if (*p_lba != '\0') {
-            if (p_lba[0] == '0' && (p_lba[1] == 'x' || p_lba[1] == 'X')) {
-                p_lba += 2;
-                while ((*p_lba >= '0' && *p_lba <= '9') || (*p_lba >= 'a' && *p_lba <= 'f') || (*p_lba >= 'A' && *p_lba <= 'F')) {
-                    char c = *p_lba++;
-                    int val = (c >= '0' && c <= '9') ? (c - '0') : ((c >= 'a' && c <= 'f') ? (c - 'a' + 10) : (c - 'A' + 10));
-                    lba = (lba << 4) | (uint32_t)val;
-                }
-            } else {
+            while (*p_lba >= '0' && *p_lba <= '9') {
+                val1 = val1 * 10 + (*p_lba++ - '0');
+                tiene_val1 = 1;
+            }
+            p_lba = str_saltar_espacios(p_lba);
+            if (*p_lba != '\0') {
                 while (*p_lba >= '0' && *p_lba <= '9') {
-                    lba = lba * 10 + (*p_lba++ - '0');
+                    val2 = val2 * 10 + (*p_lba++ - '0');
+                    tiene_val2 = 1;
                 }
             }
         }
-        ejecutar_lectura_usb_msc(0, lba);
+
+        uint8_t u_target = vfs_obtener_unidad_activa();
+        uint32_t lba_target = 0;
+        if (tiene_val2) {
+            u_target = (uint8_t)val1;
+            lba_target = val2;
+        } else if (tiene_val1) {
+            lba_target = val1;
+        }
+
+        ejecutar_lectura_usb_msc(u_target, lba_target);
         return;
     }
 
@@ -2060,7 +1923,13 @@ static void ejecutar_comando_disco(const char *arg) {
                 consola_imprimir_color(msc->producto, COLOR_EXITO_DEFAULT);
                 consola_imprimir(" [Rev ");
                 consola_imprimir(msc->revision);
-                consola_imprimir_linea("]");
+                consola_imprimir("]");
+                if (vfs_esta_montado() && vfs_obtener_unidad_activa() == i) {
+                    consola_imprimir_color(" ==> [MONTADO: ", COLOR_AVISO_DEFAULT);
+                    consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_EXITO_DEFAULT);
+                    consola_imprimir_color("]", COLOR_AVISO_DEFAULT);
+                }
+                consola_imprimir_linea("");
 
                 consola_imprimir("    Estado SCSI       : ");
                 if (msc->listo) {
@@ -2100,8 +1969,9 @@ static void ejecutar_comando_disco(const char *arg) {
         }
     }
     consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea_color("Tip: Escribe 'disco leer 0' para inspeccionar el sector de arranque MBR.", COLOR_TEXTO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Escribe 'disco leer 1' para inspeccionar la cabecera GPT.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'disco montar 1' (o 'disco 1') para montar el DISCO #1.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'disco leer 1 0' para inspeccionar el sector MBR del DISCO #1.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'ls' o 'tree' para explorar archivos en la unidad activa.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
 }
 
@@ -2350,12 +2220,113 @@ static void procesar_comando(const char *linea_cruda) {
         linea = str_saltar_espacios(linea + 5);
     }
 
-    // MEME CLÁSICO: sudo rm -rf / o sudo rm -f o rm -rf
+    // COMANDO: rm_modo / rmconfig / rm-modo
+    if (str_igual(linea, "rm_modo") || str_comienza_con(linea, "rm_modo ") ||
+        str_igual(linea, "rm-modo") || str_comienza_con(linea, "rm-modo ") ||
+        str_igual(linea, "rmconfig") || str_comienza_con(linea, "rmconfig ")) {
+        const char *arg = "";
+        if (str_comienza_con(linea, "rm_modo ")) arg = str_saltar_espacios(linea + 8);
+        else if (str_comienza_con(linea, "rm-modo ")) arg = str_saltar_espacios(linea + 8);
+        else if (str_comienza_con(linea, "rmconfig ")) arg = str_saltar_espacios(linea + 9);
+
+        if (*arg == '\0' || str_igual(arg, "ayuda") || str_igual(arg, "help")) {
+            consola_imprimir_linea_color("--- CONFIGURACIÓN DEL COMANDO RM ---", COLOR_AVISO_DEFAULT);
+            consola_imprimir("  Modo activo actual : ");
+            if (g_rm_modo == 1) consola_imprimir_linea_color("Tier 1 - Triple Fault Limpio (IDTR=0 + INT3)", COLOR_EXITO_DEFAULT);
+            else if (g_rm_modo == 2) consola_imprimir_linea_color("Tier 2 - Harakiri (IDT/TSS/stack destruidos + UD2)", COLOR_AVISO_DEFAULT);
+            else if (g_rm_modo == 3) consola_imprimir_linea_color("Tier 3 - Seppuku (CR3 Sacrificial aislado + UD2)", COLOR_ERROR_DEFAULT);
+            else consola_imprimir_linea_color("Modo Clásico (Simulación de software vía El Huevo)", COLOR_TEXTO_DEFAULT);
+
+            consola_imprimir_linea("");
+            consola_imprimir_linea_color("  Opciones para modificar el actuar de 'rm':", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_color("    rm_modo 1        ", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea(": Configura 'rm' para detonar Tier 1 (Triple Fault Limpio y Determinista).");
+            consola_imprimir_color("    rm_modo 2        ", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea(": Configura 'rm' para detonar Tier 2 (Harakiri: destrucción de excepciones).");
+            consola_imprimir_color("    rm_modo 3        ", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea(": Configura 'rm' para detonar Tier 3 (Seppuku: aislamiento de paginación virtual).");
+            consola_imprimir_color("    rm_modo 0        ", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea(": Restaura 'rm' al Modo Clásico (software simulado).");
+            return;
+        }
+
+        if (str_igual(arg, "1") || str_igual_sin_caso(arg, "tier1") || str_igual_sin_caso(arg, "tier 1")) {
+            g_rm_modo = 1;
+            consola_imprimir_linea_color("[ OK ] Modo de 'rm' actualizado a Tier 1 (Triple Fault Limpio y Determinista).", COLOR_EXITO_DEFAULT);
+            return;
+        } else if (str_igual(arg, "2") || str_igual_sin_caso(arg, "tier2") || str_igual_sin_caso(arg, "tier 2") || str_igual_sin_caso(arg, "harakiri")) {
+            g_rm_modo = 2;
+            consola_imprimir_linea_color("[ OK ] Modo de 'rm' actualizado a Tier 2 (Harakiri).", COLOR_EXITO_DEFAULT);
+            return;
+        } else if (str_igual(arg, "3") || str_igual_sin_caso(arg, "tier3") || str_igual_sin_caso(arg, "tier 3") || str_igual_sin_caso(arg, "seppuku") || str_igual_sin_caso(arg, "seppuki")) {
+            g_rm_modo = 3;
+            consola_imprimir_linea_color("[ OK ] Modo de 'rm' actualizado a Tier 3 (Seppuku).", COLOR_EXITO_DEFAULT);
+            return;
+        } else if (str_igual(arg, "0") || str_igual_sin_caso(arg, "clasico") || str_igual_sin_caso(arg, "fake")) {
+            g_rm_modo = 0;
+            consola_imprimir_linea_color("[ OK ] Modo de 'rm' restaurado a Modo Clásico Simulado.", COLOR_EXITO_DEFAULT);
+            return;
+        } else {
+            consola_imprimir_linea_color("[ ERROR ] Opción desconocida. Usa: rm_modo <1|2|3|0>", COLOR_ERROR_DEFAULT);
+            return;
+        }
+    }
+
+    // COMANDOS DE TRIPLE FAULT ARQUITECTÓNICO:
+    // 1. TIER 1: provocar triple fault / triplefault / tf
+    if (str_igual_sin_caso(linea, "provocar triple fault") || str_igual_sin_caso(linea, "triple fault") ||
+        str_igual_sin_caso(linea, "triplefault") || str_igual_sin_caso(linea, "tf") ||
+        str_igual_sin_caso(linea, "triple_fault")) {
+        triple_fault_ejecutar(TRIPLE_FAULT_TIER1_LIMPIO);
+        return;
+    }
+
+    // 2. TIER 2: harakiri / hara-kiri
+    if (str_igual_sin_caso(linea, "harakiri") || str_igual_sin_caso(linea, "hara-kiri") ||
+        str_igual_sin_caso(linea, "hara kiri")) {
+        triple_fault_ejecutar(TRIPLE_FAULT_TIER2_HARAKIRI);
+        return;
+    }
+
+    // 3. TIER 3: seppuku / seppuki
+    if (str_igual_sin_caso(linea, "seppuku") || str_igual_sin_caso(linea, "seppuki") ||
+        str_igual_sin_caso(linea, "sepuku")) {
+        triple_fault_ejecutar(TRIPLE_FAULT_TIER3_SEPPUKU);
+        return;
+    }
+
+    // MEME CLÁSICO / DESTRUCTOR REAL: sudo rm -rf / o sudo rm -f o rm -rf
     if (str_comienza_con(linea, "rm ") || str_igual(linea, "rm") || str_comienza_con(linea, "rmdir")) {
+        int tier_objetivo = g_rm_modo;
+
+        // Banderas opcionales en línea de comando: rm -1, rm -2, rm -3
+        if (str_contiene(linea, "-1") || str_contiene(linea, "--tier1")) {
+            tier_objetivo = 1;
+        } else if (str_contiene(linea, "-2") || str_contiene(linea, "--tier2") || str_contiene(linea, "harakiri")) {
+            tier_objetivo = 2;
+        } else if (str_contiene(linea, "-3") || str_contiene(linea, "--tier3") || str_contiene(linea, "seppuku") || str_contiene(linea, "seppuki")) {
+            tier_objetivo = 3;
+        } else if (str_contiene(linea, "--clasico") || str_contiene(linea, "--fake")) {
+            tier_objetivo = 0;
+        }
+
         consola_imprimir_linea("");
         consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea_color("  [ ADVERTENCIA DE SUDO ] ¡Borrando todo el sistema operativo!", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea_color("  [ ADVERTENCIA DE SUDO ] rm: eliminando '/' recursivamente... ", COLOR_ERROR_DEFAULT);
+
+        if (tier_objetivo >= 1 && tier_objetivo <= 3) {
+            consola_imprimir("  [ ADVERTENCIA DE SUDO ] Detonando TRIPLE FAULT REAL: ");
+            consola_imprimir_linea_color(triple_fault_obtener_nombre_tier((triple_fault_tier_t)tier_objetivo), COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("  [ ADVERTENCIA DE SUDO ] ¡El universo colapsa! ¡Verificando Hipervisor VMX!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
+            consola_imprimir_linea("");
+
+            esperar_milisegundos(1500);
+            triple_fault_ejecutar((triple_fault_tier_t)tier_objetivo);
+            return;
+        }
+
         consola_imprimir_linea_color("  [ ADVERTENCIA DE SUDO ] ¡El universo colapsa! ¡El Huevo muere!", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea_color("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea("");
@@ -2377,6 +2348,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Muestra la integridad y salud de El Huevo.");
         consola_imprimir_color("  info           ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Información de CPU, Hipervisor VMX y Framebuffer.");
+        consola_imprimir_color("  version / ver  ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Muestra versión, hito, fecha y hora de compilación.");
         consola_imprimir_color("  memoria        ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reporte de RAM, PMM, Heap kmalloc y canarios ('memoria probar').");
         consola_imprimir_color("  paginacion     ", COLOR_PROMPT_DEFAULT);
@@ -2388,11 +2361,12 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  linux / shim   ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Capa puente de compatibilidad con drivers de Linux ('linux probar').");
         consola_imprimir_color("  nvidia         ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": GPU Blackwell, firmware GSP y colas RPC ('nvidia inicializar', 'nvidia gsp', 'nvidia probar').");
+        consola_imprimir_linea(": Inventario PCI de NVIDIA; GSP H18-H20 descontinuado.");
         consola_imprimir_color("  apic / irq     ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Controlador Local APIC, x2APIC e interrupciones MSI ('apic probar').");
         consola_imprimir_color("  dma            ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Gestor de memoria DMA contigua y coherencia de caché ('dma probar').");
+        consola_imprimir_linea(": Carga combinada HDA/AC97 + framebuffer + MSC + HID + PMM/heap/DMA ('stress').");
         consola_imprimir_color("  iommu          ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Controlador Intel VT-d, remapeo DRHD y regiones RMRR ('iommu probar').");
         consola_imprimir_color("  teclado        ", COLOR_EXITO_DEFAULT);
@@ -2415,12 +2389,22 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea_color(": Escribe texto en un archivo ('escribir saludo.txt Hola Mundo').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
-        consola_imprimir_color("  musica         ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Reproduce la sintonía 'Qué bonito es Israel Damonte'.");
+        consola_imprimir_color("  audio [opción] ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Audio DMA ('audio corto', 'audio cangrejo', 'audio intro', 'audio bucle', 'audio estado', 'audio detener').");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la animación de Don Cangrejo explotando.");
         consola_imprimir_color("  h264 [opción]  ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Reproductor H.264 por CPU (experimental); h264 muestra su ayuda.");
+        consola_imprimir_linea(": Reproductor H.264 por CPU ('h264 360p', 'h264 1080p', 'h264 prueba').");
+        consola_imprimir_color("  aac [opción]   ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Auditoría y decodificación de audio AAC ('aac 360p', 'aac 1080p').");
+        consola_imprimir_color("  provocar triple fault", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color(": [TIER 1] Triple fault limpio y determinista (IDTR nulo + INT3).", COLOR_ERROR_DEFAULT);
+        consola_imprimir_color("  harakiri             ", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color(": [TIER 2] Harakiri: Destruye IDT, TSS/IST y stack + UD2.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_color("  seppuku              ", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color(": [TIER 3] Seppuku: CR3 sacrificial sin IDT/stack/heap + UD2.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_color("  rm_modo [1|2|3|0]    ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Configura la acción de 'rm' / 'sudo rm -rf /' (actual: Tier 1).");
         consola_imprimir_color("  calc <expr>    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Evalúa operaciones aritméticas (ej: calc 42 * 2 + 10).");
         consola_imprimir_color("  quiensoy       ", COLOR_PROMPT_DEFAULT);
@@ -2438,7 +2422,7 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  apagar         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Apaga el ordenador de forma limpia vía ACPI.");
         consola_imprimir_color("  sudo rm -rf /  ", COLOR_ERROR_DEFAULT);
-        consola_imprimir_linea_color(": [PELIGRO] No lo intentes si valoras tu existencia.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color(": [PELIGRO] Detona Triple Fault de hardware según el modo configurado.", COLOR_ERROR_DEFAULT);
         return;
     }
 
@@ -2646,14 +2630,23 @@ static void procesar_comando(const char *linea_cruda) {
     if (str_igual(linea, "info") || str_igual(linea, "sistema")) {
         consola_imprimir_linea_color("--- INFORMACIÓN DEL SISTEMA ---", COLOR_AVISO_DEFAULT);
         consola_imprimir("  Sistema Operativo : ");
-        consola_imprimir_linea_color("TAEK OS v0.1 (TelAvivEpsteinKirkOS)", COLOR_USUARIO_DEFAULT);
+        consola_imprimir_linea_color("TAEK OS (TelAvivEpsteinKirkOS)", COLOR_USUARIO_DEFAULT);
+        consola_imprimir("  Versión Release   : ");
+        consola_imprimir_color(taek_obtener_version(), COLOR_PROMPT_DEFAULT);
+        consola_imprimir(" (");
+        consola_imprimir_color(taek_obtener_hito(), COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea(")");
+        consola_imprimir("  Compilación       : ");
+        consola_imprimir_color(taek_obtener_fecha_compilacion(), COLOR_AVISO_DEFAULT);
+        consola_imprimir(" ");
+        consola_imprimir_linea_color(taek_obtener_hora_compilacion(), COLOR_AVISO_DEFAULT);
         consola_imprimir("  Arquitectura      : ");
         consola_imprimir_linea("x86_64 Long Mode (Intel Core / AMD64 Compatible)");
         consola_imprimir("  Hipervisor VMX    : ");
         if (vmx_esta_activo()) {
-            consola_imprimir_linea_color("ACTIVO en Ring -1 (VMX Root Operation)", COLOR_EXITO_DEFAULT);
+            consola_imprimir_linea_color("VMXON activo; VMCS/guest/VM-exit pendientes", COLOR_AVISO_DEFAULT);
         } else {
-            consola_imprimir_linea_color("Guardián Ring 0 Activo", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("VMX no activo; IDT/TSS en Ring 0", COLOR_AVISO_DEFAULT);
         }
         consola_imprimir("  Resolución Pantalla: ");
         consola_imprimir_dec(pantalla_obtener_ancho());
@@ -2673,6 +2666,24 @@ static void procesar_comando(const char *linea_cruda) {
         } else {
             consola_imprimir_linea_color("Inactivo / No detectado (Modo Mudo)", COLOR_AVISO_DEFAULT);
         }
+        return;
+    }
+
+    // COMANDO: version / ver
+    if (str_igual(linea, "version") || str_igual(linea, "ver")) {
+        consola_imprimir_linea_color("--- VERSIÓN Y COMPILACIÓN DE TAEK OS ---", COLOR_AVISO_DEFAULT);
+        consola_imprimir("  Sistema Operativo : ");
+        consola_imprimir_linea_color("TAEK OS (TelAvivEpsteinKirkOS)", COLOR_USUARIO_DEFAULT);
+        consola_imprimir("  Versión Release   : ");
+        consola_imprimir_linea_color(taek_obtener_version(), COLOR_PROMPT_DEFAULT);
+        consola_imprimir("  Hito de Desarrollo: ");
+        consola_imprimir_linea_color(taek_obtener_hito(), COLOR_EXITO_DEFAULT);
+        consola_imprimir("  Fecha Compilación : ");
+        consola_imprimir_linea_color(taek_obtener_fecha_compilacion(), COLOR_AVISO_DEFAULT);
+        consola_imprimir("  Hora Compilación  : ");
+        consola_imprimir_linea_color(taek_obtener_hora_compilacion(), COLOR_AVISO_DEFAULT);
+        consola_imprimir("  Arquitectura      : ");
+        consola_imprimir_linea("x86_64 UEFI Freestanding (Ring 0 / Ring -1)");
         return;
     }
 
@@ -2785,8 +2796,87 @@ static void procesar_comando(const char *linea_cruda) {
     }
 
     // COMANDO: musica / audio
-    if (str_igual(linea, "musica") || str_igual(linea, "audio")) {
-        consola_imprimir_linea_color("==> Reproduciendo sintonía 'Qué bonito es Israel Damonte'...", COLOR_PROMPT_DEFAULT);
+    if (str_igual(linea, "stress")) {
+        ejecutar_stress_basico();
+        return;
+    }
+
+    // COMANDO: musica / audio
+    if (str_igual(linea, "musica") || str_comienza_con(linea, "musica ") ||
+        str_igual(linea, "audio") || str_comienza_con(linea, "audio ")) {
+        const char *arg = "";
+        if (str_comienza_con(linea, "musica ")) arg = str_saltar_espacios(linea + 7);
+        else if (str_comienza_con(linea, "audio ")) arg = str_saltar_espacios(linea + 6);
+
+        if (str_igual(arg, "detener") || str_igual(arg, "stop")) {
+            audio_ac97_detener();
+            consola_imprimir_linea_color("==> Reproducción de audio detenida.", COLOR_AVISO_DEFAULT);
+            return;
+        }
+
+        if (str_igual(arg, "estado") || str_igual(arg, "status")) {
+            consola_imprimir_linea_color("--- ESTADO DEL SUBSISTEMA DE AUDIO ---", COLOR_AVISO_DEFAULT);
+            if (audio_es_intel_hda()) {
+                const struct estado_hda *e = audio_hda_obtener_estado();
+                consola_imprimir("  Controlador       : Intel HDA [0x");
+                consola_imprimir_hex(e->id_proveedor);
+                consola_imprimir(":0x");
+                consola_imprimir_hex(e->id_dispositivo);
+                consola_imprimir_linea("]");
+                consola_imprimir("  Estado DMA        : ");
+                consola_imprimir_linea(e->reproduciendo ? "REPRODUCIENDO" : "DETENIDO / INACTIVO");
+                consola_imprimir("  Bytes en cola     : ");
+                consola_imprimir_dec((uint32_t)e->bytes_en_cola);
+                consola_imprimir_linea(" bytes");
+                consola_imprimir("  Bytes DMA Totales : ");
+                consola_imprimir_dec((uint32_t)e->bytes_dma_totales);
+                consola_imprimir_linea(" bytes");
+                consola_imprimir("  Bytes Reproducidos: ");
+                consola_imprimir_dec(e->bytes_reproducidos);
+                consola_imprimir(" / ");
+                consola_imprimir_dec(e->bytes_totales);
+                consola_imprimir_linea(" bytes");
+                consola_imprimir("  Eventos BCIS      : ");
+                consola_imprimir_dec(e->eventos_bcis);
+                consola_imprimir_linea("");
+                consola_imprimir("  Errores de Stream : ");
+                consola_imprimir_dec(e->errores_stream);
+                consola_imprimir_linea("");
+            } else if (audio_esta_iniciado()) {
+                consola_imprimir_linea("  Controlador       : Intel AC97 (Modo Legacy)");
+                consola_imprimir("  Estado            : ");
+                consola_imprimir_linea(audio_ac97_esta_reproduciendo() ? "REPRODUCIENDO" : "DETENIDO");
+            } else {
+                consola_imprimir_linea("  Controlador       : Inactivo / No detectado");
+            }
+            return;
+        }
+
+        if (str_igual(arg, "corto")) {
+            uint32_t tam_corto = 40000; // < 64 KiB (< 1 vuelta del anillo)
+            consola_imprimir_linea_color("==> Probando audio CORTO (40.000 bytes, < 1 vuelta del anillo)...", COLOR_PROMPT_DEFAULT);
+            audio_ac97_reproducir_pcm(_binary_audio_arranque_bin_start, tam_corto);
+            return;
+        }
+
+        if (str_igual(arg, "cangrejo") || str_igual(arg, "medio")) {
+            uint32_t tam_cangrejo = (uint32_t)(_binary_cangrejo_audio_bin_end - _binary_cangrejo_audio_bin_start);
+            consola_imprimir("==> Probando audio Don Cangrejo (");
+            consola_imprimir_dec(tam_cangrejo);
+            consola_imprimir_linea_color(" bytes, > 2 vueltas del anillo)...", COLOR_PROMPT_DEFAULT);
+            audio_ac97_reproducir_pcm(_binary_cangrejo_audio_bin_start, tam_cangrejo);
+            return;
+        }
+
+        if (str_igual(arg, "bucle")) {
+            uint32_t tam = (uint32_t)(_binary_audio_arranque_bin_end - _binary_audio_arranque_bin_start);
+            consola_imprimir_linea_color("==> Reproduciendo sintonía en BUCLE continuo...", COLOR_PROMPT_DEFAULT);
+            audio_ac97_reproducir_pcm_bucle(_binary_audio_arranque_bin_start, tam);
+            return;
+        }
+
+        // Por defecto: la introducción completa (1.261.568 bytes, 7,152 s)
+        consola_imprimir_linea_color("==> Reproduciendo sintonía de introducción (7,152 s)...", COLOR_PROMPT_DEFAULT);
         uint32_t tam = (uint32_t)(_binary_audio_arranque_bin_end - _binary_audio_arranque_bin_start);
         audio_ac97_reproducir_pcm(_binary_audio_arranque_bin_start, tam);
         return;
@@ -2794,6 +2884,16 @@ static void procesar_comando(const char *linea_cruda) {
 
     if (str_igual(linea, "h264") || str_comienza_con(linea, "h264 ")) {
         video_h264_comando(str_igual(linea, "h264") ? "" : str_saltar_espacios(linea + 5));
+        return;
+    }
+
+    if (str_igual(linea, "aac") || str_comienza_con(linea, "aac ")) {
+        audio_aac_comando(str_igual(linea, "aac") ? "" : str_saltar_espacios(linea + 4));
+        return;
+    }
+
+    if (str_igual(linea, "video 360p") || str_igual(linea, "video 1080p")) {
+        video_h264_comando(str_saltar_espacios(linea + 6));
         return;
     }
 
@@ -2846,6 +2946,13 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: montar <id> / mount <id> / desmontar / umount
+    if (str_comienza_con(linea, "montar") || str_comienza_con(linea, "mount") ||
+        str_comienza_con(linea, "desmontar") || str_comienza_con(linea, "umount") || str_comienza_con(linea, "unmount")) {
+        ejecutar_comando_disco(linea);
+        return;
+    }
+
     // COMANDO: disco / storage / pendrive
     if (str_comienza_con(linea, "disco") || str_comienza_con(linea, "storage") || str_comienza_con(linea, "pendrive")) {
         const char *arg = NULL;
@@ -2870,6 +2977,32 @@ static void procesar_comando(const char *linea_cruda) {
         const char *arg = NULL;
         if (str_comienza_con(linea, "ls ")) arg = str_saltar_espacios(linea + 3);
         else if (str_comienza_con(linea, "dir ")) arg = str_saltar_espacios(linea + 4);
+
+        // Si el usuario escribió "ls disco 1", "dir disco 1" o "ls 1"
+        if (arg && (str_comienza_con(arg, "disco ") || (*arg >= '0' && *arg <= '9' && (*(arg + 1) == '\0' || *(arg + 1) == ' ')))) {
+            const char *p_u = arg;
+            if (str_comienza_con(arg, "disco ")) p_u = str_saltar_espacios(arg + 6);
+            if (*p_u >= '0' && *p_u <= '9') {
+                uint8_t u = (uint8_t)(*p_u - '0');
+                consola_imprimir_color("==> [ VFS ] Seleccionando DISCO #", COLOR_PROMPT_DEFAULT);
+                consola_imprimir_dec(u);
+                consola_imprimir_linea("...");
+                if (vfs_montar(u) == 0) {
+                    consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
+                    consola_imprimir_dec(u);
+                    consola_imprimir(" montado (");
+                    consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+                    consola_imprimir_linea("):");
+                    vfs_listar_directorio(NULL);
+                    return;
+                } else {
+                    consola_imprimir_color("  [ERROR] No se pudo montar DISCO #", COLOR_ERROR_DEFAULT);
+                    consola_imprimir_dec(u);
+                    consola_imprimir_linea(".");
+                    return;
+                }
+            }
+        }
         vfs_listar_directorio(arg);
         return;
     }
@@ -2987,7 +3120,7 @@ void terminal_ejecutar(void) {
     if (ndev && ndev->presente) {
         consola_imprimir_color("GPU: ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_color(ndev->chip_name, COLOR_EXITO_DEFAULT);
-        consola_imprimir(" (Blackwell GB20x) | VRAM: 16 GiB GDDR7\n");
+        consola_imprimir(" (detección PCI; GSP descontinuado)\n");
     } else {
         consola_imprimir_linea("Canal de GPU listo en espacio Ring 0.");
     }
@@ -2997,17 +3130,33 @@ void terminal_ejecutar(void) {
     ejecutar_autodiagnostico_teclado();
     consola_imprimir_linea("");
 
-    // 3. Si hay almacenamiento USB detectado, autoprueba de lectura de Sector 0 (MBR) y árbol VFS (FAT32/exFAT/NTFS)
-    if (usb_msc_obtener_cantidad() > 0) {
-        consola_imprimir_linea_color("==> [ ALMACENAMIENTO USB DETECTADO ] Verificando Sector 0 (MBR)...", COLOR_EXITO_DEFAULT);
-        ejecutar_lectura_usb_msc(0, 0);
-        consola_imprimir_linea("");
-        if (vfs_montar(0) == 0) {
-            consola_imprimir_color("==> [ VFS ] Sistema de archivos detectado y montado: ", COLOR_EXITO_DEFAULT);
-            consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
-            vfs_ejecutar_tree(NULL);
-            consola_imprimir_linea("");
-            vfs_leer_archivo_texto("leeme.txt");
+    // 3. Si hay almacenamiento USB detectado, escanear unidades y montar la primera unidad con sistema de archivos soportado
+    int total_msc = usb_msc_obtener_cantidad();
+    if (total_msc > 0) {
+        consola_imprimir_linea_color("==> [ ALMACENAMIENTO USB ] Escaneando unidades disponibles...", COLOR_AVISO_DEFAULT);
+        int unidad_montada = -1;
+        for (int u = 0; u < total_msc; u++) {
+            const struct usb_msc_dispositivo *msc = usb_msc_obtener_dispositivo(u);
+            if (!msc || !msc->activo || !msc->listo) continue;
+
+            if (vfs_montar((uint8_t)u) == 0) {
+                unidad_montada = u;
+                consola_imprimir_color("==> [ VFS ] Sistema de archivos detectado y montado en DISCO #", COLOR_EXITO_DEFAULT);
+                consola_imprimir_dec(u);
+                consola_imprimir(" (");
+                consola_imprimir(msc->fabricante);
+                consola_imprimir(" ");
+                consola_imprimir(msc->producto);
+                consola_imprimir("): ");
+                consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+                vfs_ejecutar_tree(NULL);
+                consola_imprimir_linea("");
+                break;
+            }
+        }
+        if (unidad_montada < 0) {
+            consola_imprimir_linea_color("  [AVISO] No se detectó un sistema de archivos soportado en el inicio automático.", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("          Escribe 'disco' para ver las unidades o 'disco montar <id>' para montar.");
             consola_imprimir_linea("");
         }
     }

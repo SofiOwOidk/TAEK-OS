@@ -18,5 +18,6 @@ struct puntero_gdt {
 } __attribute__((packed));
 
 void gdt_iniciar(void);
+void gdt_destruir_tss_e_ist(void);
 
 #endif // ARQUITECTURA_X86_64_GDT_H

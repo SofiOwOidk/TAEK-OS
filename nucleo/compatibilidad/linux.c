@@ -99,17 +99,8 @@ void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *dma_handle, unsigne
     uint64_t phys = 0;
     void *virt = dma_asignar_bufer_contiguo(size, alineacion, &phys);
 
-    if (!virt) {
-        // Fallback al PMM si la arena DMA no está disponible o está colmada
-        size_t num_paginas = (size + 4095) / 4096;
-        phys = pmm_asignar_pagina_fisica();
-        if (phys == 0) return NULL;
-        for (size_t i = 1; i < num_paginas; i++) {
-            pmm_asignar_pagina_fisica();
-        }
-        uint64_t hhdm = memoria_obtener_hhdm_offset();
-        virt = (void *)(hhdm + phys);
-    }
+    // El PMM entrega páginas independientes: jamás presentarlas como DMA contiguo.
+    if (!virt) return NULL;
 
     *dma_handle = (dma_addr_t)phys;
 

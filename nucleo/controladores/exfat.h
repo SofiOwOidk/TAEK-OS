@@ -91,6 +91,7 @@ struct __attribute__((packed)) exfat_entrada_nombre {
 // Descriptor del volumen exFAT montado
 struct exfat_volumen {
     int      montado;
+    int      escritura_habilitada;
     uint8_t  unidad_msc;
     uint32_t lba_inicio_particion;
     uint32_t lba_fat;
@@ -100,6 +101,8 @@ struct exfat_volumen {
     uint32_t bytes_por_cluster;
     uint32_t cluster_raiz;
     uint32_t total_clusters;
+    uint32_t cluster_bitmap;
+    uint64_t longitud_bitmap;
     char     etiqueta[32];
 };
 

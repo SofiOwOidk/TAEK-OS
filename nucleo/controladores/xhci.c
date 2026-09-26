@@ -178,6 +178,13 @@ static struct erst_entrada_xhci *g_erst = NULL;
 static uint64_t                  g_erst_fisica = 0;
 static uint32_t                  g_event_idx = 0;
 static uint8_t                   g_event_cycle = 1;
+struct xhci_evento_pendiente {
+    struct trb_xhci trb;
+    uint8_t listo;
+};
+static struct xhci_evento_pendiente g_evento_comando;
+static struct xhci_evento_pendiente g_eventos_transfer[XHCI_MAX_SLOTS + 1][32];
+static uint8_t g_cambio_puerto_pendiente;
 
 // Transfer Ring para EP0 dedicado por cada ranura (Slot 1..XHCI_MAX_SLOTS)
 static volatile struct trb_xhci *g_slot_ep0_ring[XHCI_MAX_SLOTS + 1] = {0};
@@ -195,6 +202,7 @@ struct xhci_ep_teclado {
     uint8_t  ep_intervalo;  // Intervalo en ms
     uint8_t  iface_num;     // Número de interfaz USB
     uint8_t  es_boot;       // Interfaz HID Boot Keyboard (subclase/protocolo 1/1)
+    uint8_t  es_raton;      // Interfaz HID Boot Mouse (subclase/protocolo 1/2)
     int      activo;
 
     // Anillo de transferencia DMA (Transfer Ring)
@@ -211,6 +219,22 @@ struct xhci_ep_teclado {
 };
 
 static struct xhci_ep_teclado g_teclado_eps[XHCI_MAX_TECLADO_EPS];
+
+static void xhci_recontar_hid(void) {
+    uint8_t teclados[XHCI_MAX_SLOTS + 1] = {0};
+    uint8_t ratones[XHCI_MAX_SLOTS + 1] = {0};
+    int n_teclados = 0, n_ratones = 0;
+    for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
+        const struct xhci_ep_teclado *ep = &g_teclado_eps[e];
+        if (!ep->activo || !ep->slot_id || ep->slot_id > XHCI_MAX_SLOTS) continue;
+        if (ep->es_raton) {
+            if (!ratones[ep->slot_id]++) n_ratones++;
+        } else if (!teclados[ep->slot_id]++) n_teclados++;
+    }
+    g_estado.teclados_activos = n_teclados;
+    g_estado.teclado_detectado = n_teclados > 0;
+    g_estado.ratones_activos = n_ratones;
+}
 
 // Estructura para gestión de Endpoints Bulk de almacenamiento masivo (USB MSC)
 #define XHCI_MAX_BULK_EPS 8
@@ -331,6 +355,81 @@ static inline void xhci_tocar_timbre(uint8_t slot, uint32_t ep_o_cmd) {
 
 static inline void xhci_sincronizar_evento_actual(void) {
     dma_sincronizar_dispositivo_a_cpu((const void *)&g_event_ring[g_event_idx], sizeof(g_event_ring[g_event_idx]));
+}
+
+static void xhci_procesar_evento_hid(const struct trb_xhci *evt);
+
+// Único lugar que extrae un TRB y avanza ERDP. Los consumidores reciben copias.
+static int xhci_extraer_evento(struct trb_xhci *salida) {
+    if (!g_event_ring || !salida) return 0;
+    xhci_sincronizar_evento_actual();
+    volatile struct trb_xhci *actual = &g_event_ring[g_event_idx];
+    if ((actual->control & 1U) != g_event_cycle) return 0;
+    uint8_t tipo = (actual->control >> 10) & 0x3F;
+    if (tipo == TRB_TIPO_CMD_COMP_EVT && g_evento_comando.listo) return 0;
+    if (tipo == TRB_TIPO_TRANSFER_EVT) {
+        uint8_t slot = (actual->control >> 24) & 0xFF;
+        uint8_t dci = (actual->control >> 16) & 0x1F;
+        int es_hid = 0;
+        for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++)
+            if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id == slot &&
+                g_teclado_eps[e].ep_dci == dci) { es_hid = 1; break; }
+        if (!es_hid && slot > 0 && slot <= XHCI_MAX_SLOTS &&
+            g_eventos_transfer[slot][dci].listo) return 0;
+    }
+    salida->parametro = actual->parametro;
+    salida->estado = actual->estado;
+    salida->control = actual->control;
+    if (++g_event_idx == XHCI_TAM_ANILLO) {
+        g_event_idx = 0;
+        g_event_cycle = !g_event_cycle;
+        g_evt_ring_wraparounds++;
+    }
+    uint64_t erdp = g_event_ring_fisica + (uint64_t)g_event_idx * sizeof(struct trb_xhci);
+    mmio_escribir64(g_rts_base + 0x20 + 0x18, erdp | (1U << 3));
+    mmio_escribir32(g_rts_base + 0x20, 0x03);
+    return 1;
+}
+
+static void xhci_bombear_eventos(void) {
+    struct trb_xhci evt;
+    for (uint32_t i = 0; i < XHCI_TAM_ANILLO && xhci_extraer_evento(&evt); i++) {
+        uint8_t tipo = (evt.control >> 10) & 0x3F;
+        uint8_t slot = (evt.control >> 24) & 0xFF;
+        uint8_t dci = (evt.control >> 16) & 0x1F;
+        uint8_t cc = (evt.estado >> 24) & 0xFF;
+        g_estado.ultimo_evento_trb_tipo = tipo;
+        g_estado.paquetes_recibidos++;
+        if (tipo == TRB_TIPO_CMD_COMP_EVT) {
+            g_evento_comando.trb = evt;
+            g_evento_comando.listo = 1;
+        } else if (tipo == TRB_TIPO_TRANSFER_EVT) {
+            g_estado.eventos_transferencia++;
+            g_estado.ultimo_codigo_transfer = cc;
+            g_estado.ultimo_dci_transfer = dci;
+            if (cc != 1 && cc != 13) g_estado.fallos_transferencia++;
+            int es_hid = 0;
+            for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
+                if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id == slot &&
+                    g_teclado_eps[e].ep_dci == dci) { es_hid = 1; break; }
+            }
+            if (es_hid) {
+                xhci_procesar_evento_hid(&evt);
+            } else if (slot > 0 && slot <= XHCI_MAX_SLOTS && dci < 32) {
+                struct xhci_evento_pendiente *b = &g_eventos_transfer[slot][dci];
+                b->trb = evt;
+                b->listo = 1;
+            } else {
+                serial_imprimir_linea("[xHCI] Evento de transferencia con slot/DCI inválido.");
+            }
+        } else if (tipo == 34) { // Port Status Change Event
+            g_cambio_puerto_pendiente = 1;
+        } else {
+            serial_imprimir("[xHCI] Evento no gestionado, tipo=");
+            serial_imprimir_dec(tipo);
+            serial_imprimir_linea("");
+        }
+    }
 }
 
 // Volcado crudo hexadecimal y checksum de Input Context (para auditoría offline byte a byte)
@@ -713,9 +812,9 @@ static int xhci_enviar_comando(uint64_t param, uint32_t status, uint32_t control
     // No se puede publicar trabajo en un anillo si un aborto anterior no
     // consiguió detener el Command Ring.
     if (!g_cmd_ring_disponible) return -2;
+    g_evento_comando.listo = 0;
 
     uint64_t tsc_inicio = rdtsc();
-    uint64_t ms_inicio = tiempo_obtener_milisegundos();
 
     uint32_t trb_ctrl = control | (g_cmd_cycle ? 1 : 0);
     uint8_t trb_tipo = (trb_ctrl >> 10) & 0x3F;
@@ -741,6 +840,7 @@ static int xhci_enviar_comando(uint64_t param, uint32_t status, uint32_t control
     serial_imprimir_linea("");
 
     // Colocar TRB en el anillo de comandos
+    uint64_t esperado_cmd_trb = g_cmd_ring_fisica + (uint64_t)g_cmd_idx * sizeof(struct trb_xhci);
     volatile struct trb_xhci *trb = &g_cmd_ring[g_cmd_idx];
     trb->parametro = param;
     trb->estado    = status;
@@ -776,99 +876,20 @@ static int xhci_enviar_comando(uint64_t param, uint32_t status, uint32_t control
     // Tocar timbre del host controller (slot 0, comando 0)
     xhci_tocar_timbre(0, 0);
 
-    // Esperar el evento de finalización en el anillo de eventos
+    // El dispatcher conserva los eventos de otros endpoints durante la espera.
     int timeout = 5000;
     while (timeout > 0) {
-        xhci_sincronizar_evento_actual();
-        volatile struct trb_xhci *evt = &g_event_ring[g_event_idx];
-        uint8_t ciclo_leido = evt->control & 1;
-        uint8_t ciclo_esperado = g_event_cycle;
-
-        if (ciclo_leido == ciclo_esperado) {
-            uint64_t tsc_fin = rdtsc();
-            uint64_t ms_fin = tiempo_obtener_milisegundos();
-            uint32_t delta_ms = (uint32_t)(ms_fin - ms_inicio);
-            uint64_t delta_ciclos = tsc_fin - tsc_inicio;
-            uint32_t usbsts_post = mmio_leer32(g_op_base + REG_OP_USBSTS);
-
-            uint8_t tipo = (evt->control >> 10) & 0x3F;
-            uint8_t codigo_comp = (evt->estado >> 24) & 0xFF;
-            uint8_t evt_slot = (evt->control >> 24) & 0xFF;
-
-            serial_imprimir("  [xHCI EVT RECIBIDO] Evt[");
-            serial_imprimir_dec(g_event_idx);
-            serial_imprimir("]: Tipo=");
-            serial_imprimir_dec(tipo);
-            serial_imprimir(" CC=");
-            serial_imprimir_dec(codigo_comp);
-            serial_imprimir(" Slot=");
-            serial_imprimir_dec(evt_slot);
-            serial_imprimir(" CycLeido=");
-            serial_imprimir_dec(ciclo_leido);
-            serial_imprimir(" CycEsp=");
-            serial_imprimir_dec(ciclo_esperado);
-            serial_imprimir(" (dt=");
-            serial_imprimir_dec(delta_ms);
-            serial_imprimir(" ms, ciclos=");
-            serial_imprimir_hex(delta_ciclos);
-            serial_imprimir(" USBSTS_post=");
-            serial_imprimir_hex(usbsts_post);
-            serial_imprimir_linea(")");
-
-            if (tipo == TRB_TIPO_CMD_COMP_EVT) {
-                if (out_evt) *out_evt = *evt;
-
-                // Avanzar puntero de dequeue
-                g_event_idx++;
-                if (g_event_idx >= XHCI_TAM_ANILLO) {
-                    g_event_idx = 0;
-                    g_event_cycle = !g_event_cycle;
-                    g_evt_ring_wraparounds++;
-                    serial_imprimir("  [xHCI EVT] Wraparound Anillo Eventos=");
-                    serial_imprimir_dec(g_evt_ring_wraparounds);
-                    serial_imprimir_linea("");
-                }
-
-                uint64_t erdp_pre = mmio_leer64(g_rts_base + 0x20 + 0x18);
-                uint64_t nuevo_erdp = g_event_ring_fisica + ((uint64_t)g_event_idx * sizeof(struct trb_xhci));
-                mmio_escribir64(g_rts_base + 0x20 + 0x18, nuevo_erdp | (1U << 3)); // EHB = 1
-                uint64_t erdp_post = mmio_leer64(g_rts_base + 0x20 + 0x18);
-                mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03); // Limpiar IP en IMAN
-
-                serial_imprimir("  [xHCI ERDP] Pre=");
-                serial_imprimir_hex(erdp_pre);
-                serial_imprimir(" (EHB=");
-                serial_imprimir_dec((uint32_t)((erdp_pre >> 3) & 1));
-                serial_imprimir(") -> Escrito=");
-                serial_imprimir_hex(nuevo_erdp | 8);
-                serial_imprimir(" -> Post=");
-                serial_imprimir_hex(erdp_post);
-                serial_imprimir(" (EHB=");
-                serial_imprimir_dec((uint32_t)((erdp_post >> 3) & 1));
-                serial_imprimir_linea(")");
-
-                return (codigo_comp == 1) ? 0 : (int)codigo_comp;
+        xhci_bombear_eventos();
+        if (g_evento_comando.listo) {
+            struct trb_xhci evt = g_evento_comando.trb;
+            g_evento_comando.listo = 0;
+            if (evt.parametro != esperado_cmd_trb) {
+                serial_imprimir_linea("[xHCI] Finalización de comando atrasada; ignorada.");
+                continue;
             }
-
-            // Consumir eventos intermedios (ej: Port Status Change) para no trabar el anillo de eventos
-            g_event_idx++;
-            if (g_event_idx >= XHCI_TAM_ANILLO) {
-                g_event_idx = 0;
-                g_event_cycle = !g_event_cycle;
-                g_evt_ring_wraparounds++;
-            }
-            uint64_t erdp_pre = mmio_leer64(g_rts_base + 0x20 + 0x18);
-            uint64_t nuevo_erdp = g_event_ring_fisica + ((uint64_t)g_event_idx * sizeof(struct trb_xhci));
-            mmio_escribir64(g_rts_base + 0x20 + 0x18, nuevo_erdp | (1U << 3));
-            uint64_t erdp_post = mmio_leer64(g_rts_base + 0x20 + 0x18);
-            mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03);
-
-            serial_imprimir("  [xHCI ERDP INTERMEDIO] Pre=");
-            serial_imprimir_hex(erdp_pre);
-            serial_imprimir(" Post=");
-            serial_imprimir_hex(erdp_post);
-            serial_imprimir_linea("");
-            continue;
+            if (out_evt) *out_evt = evt;
+            uint8_t codigo = (evt.estado >> 24) & 0xFF;
+            return codigo == 1 ? 0 : (int)codigo;
         }
         esperar_milisegundos(1);
         timeout--;
@@ -985,32 +1006,8 @@ static int xhci_enviar_comando(uint64_t param, uint32_t status, uint32_t control
         return -1;
     }
 
-    // Consumir el evento Command Aborted / Command Ring Stopped si llegó al Event Ring
-    xhci_sincronizar_evento_actual();
-    while ((g_event_ring[g_event_idx].control & 1) == g_event_cycle) {
-        volatile struct trb_xhci *e = &g_event_ring[g_event_idx];
-        uint8_t t = (e->control >> 10) & 0x3F;
-        uint8_t cc = (e->estado >> 24) & 0xFF;
-        serial_imprimir("  [xHCI ABORT EVENTO] Tipo: ");
-        serial_imprimir_dec(t);
-        serial_imprimir(" Codigo: ");
-        serial_imprimir_dec(cc);
-        serial_imprimir_linea("");
-
-        g_event_idx++;
-        if (g_event_idx >= XHCI_TAM_ANILLO) {
-            g_event_idx = 0;
-            g_event_cycle = !g_event_cycle;
-            g_evt_ring_wraparounds++;
-        }
-        uint64_t nuevo_erdp = g_event_ring_fisica + (g_event_idx * sizeof(struct trb_xhci));
-        mmio_escribir64(g_rts_base + 0x20 + 0x18, nuevo_erdp | (1U << 3));
-        mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03);
-        xhci_sincronizar_evento_actual();
-        if (t == TRB_TIPO_CMD_COMP_EVT && (cc == 24 || cc == 26)) {
-            break;
-        }
-    }
+    xhci_bombear_eventos();
+    g_evento_comando.listo = 0;
 
     // El CRCR requiere su puntero de anillo alineado a 64 bytes. No puede
     // apuntarse a g_cmd_idx (un TRB mide 16 bytes): hacerlo pone bits de
@@ -1048,38 +1045,11 @@ static int xhci_enviar_comando(uint64_t param, uint32_t status, uint32_t control
 }
 
 // --- SONDEO ACTIVO Y LECTURA DE TECLADO ---
-void xhci_sondeo(void) {
-    if (!g_estado.inicializado) return;
-
-    // Escanear cambios físicos en puertos raíz (Hotplug reactivo)
-    // Se ejecuta de inmediato si el controlador reporta Port Change Detect (PCD) en USBSTS,
-    // o periódicamente cada 200 ms como red de seguridad sin sobrecarga.
-    static uint64_t g_ultimo_escaneo_puertos = 0;
-    uint64_t ahora = tiempo_obtener_milisegundos();
-    uint32_t usbsts = mmio_leer32(g_op_base + REG_OP_USBSTS);
-    if ((usbsts & USBSTS_PCD) || (ahora - g_ultimo_escaneo_puertos >= 200)) {
-        g_ultimo_escaneo_puertos = ahora;
-        if (usbsts & USBSTS_PCD) {
-            mmio_escribir32(g_op_base + REG_OP_USBSTS, USBSTS_PCD);
-        }
-        xhci_escanear_cambios_puertos(1);
-    }
-
-    // Verificar si hay eventos pendientes en el Event Ring
-    while (1) {
-        xhci_sincronizar_evento_actual();
-        volatile struct trb_xhci *evt = &g_event_ring[g_event_idx];
-        uint8_t ciclo = evt->control & 1;
-        if (ciclo != g_event_cycle) break;
-
-        uint8_t tipo = (evt->control >> 10) & 0x3F;
-        uint8_t slot_id = (evt->control >> 24) & 0xFF;
-
-        uint8_t ep_dci = (evt->control >> 16) & 0x1F;
-        uint8_t codigo = (evt->estado >> 24) & 0xFF;
-
-        g_estado.ultimo_evento_trb_tipo = tipo;
-        g_estado.paquetes_recibidos++;
+static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
+    uint8_t tipo = (evt->control >> 10) & 0x3F;
+    uint8_t slot_id = (evt->control >> 24) & 0xFF;
+    uint8_t ep_dci = (evt->control >> 16) & 0x1F;
+    uint8_t codigo = (evt->estado >> 24) & 0xFF;
         if (tipo == TRB_TIPO_TRANSFER_EVT) {
             g_estado.eventos_transferencia++;
             g_estado.ultimo_codigo_transfer = codigo;
@@ -1139,8 +1109,17 @@ void xhci_sondeo(void) {
                 uint8_t mod = 0;
                 int shift = 0;
 
+                // Mouse HID Boot: botones, desplazamiento X/Y con signo y rueda opcional.
+                if (ep->es_raton) {
+                    if (tam_recibido >= 3) {
+                        g_estado.reportes_raton_recibidos++;
+                        g_estado.botones_raton = buf[0];
+                        g_estado.movimiento_raton_x += (int8_t)buf[1];
+                        g_estado.movimiento_raton_y += (int8_t)buf[2];
+                    }
+                }
                 // CASO A: Endpoint Boot estándar (prioridad absoluta para no confundir modificadores con Report IDs)
-                if (ep->es_boot) {
+                else if (ep->es_boot) {
                     mod = buf[0];
                     shift = (mod & 0x02) || (mod & 0x20);
 
@@ -1322,17 +1301,29 @@ void xhci_sondeo(void) {
             }
         }
 
-        // Avanzar puntero de dequeue del Event Ring
-        g_event_idx++;
-        if (g_event_idx >= XHCI_TAM_ANILLO) {
-            g_event_idx = 0;
-            g_event_cycle = !g_event_cycle;
-            g_evt_ring_wraparounds++;
-        }
+}
 
-        uint64_t erdp = g_event_ring_fisica + (g_event_idx * sizeof(struct trb_xhci));
-        mmio_escribir64(g_rts_base + 0x20 + 0x18, erdp | (1U << 3));
-        mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03);
+void xhci_sondeo(void) {
+    if (!g_estado.inicializado) return;
+
+    // Escanear cambios físicos en puertos raíz (Hotplug reactivo)
+    // Se ejecuta de inmediato si el controlador reporta Port Change Detect (PCD) en USBSTS,
+    // o periódicamente cada 200 ms como red de seguridad sin sobrecarga.
+    static uint64_t g_ultimo_escaneo_puertos = 0;
+    uint64_t ahora = tiempo_obtener_milisegundos();
+    uint32_t usbsts = mmio_leer32(g_op_base + REG_OP_USBSTS);
+    if ((usbsts & USBSTS_PCD) || (ahora - g_ultimo_escaneo_puertos >= 200)) {
+        g_ultimo_escaneo_puertos = ahora;
+        if (usbsts & USBSTS_PCD) {
+            mmio_escribir32(g_op_base + REG_OP_USBSTS, USBSTS_PCD);
+        }
+        xhci_escanear_cambios_puertos(1);
+    }
+
+    xhci_bombear_eventos();
+    if (g_cambio_puerto_pendiente) {
+        g_cambio_puerto_pendiente = 0;
+        xhci_escanear_cambios_puertos(1);
     }
 }
 
@@ -1464,50 +1455,24 @@ static int xhci_transferencia_control(uint8_t slot_id, uint8_t tipo_peticion, ui
     g_slot_ep0_cycle[slot_id] = ep0_cycle;
     dma_sincronizar_cpu_a_dispositivo((const void *)ep0_ring, XHCI_TAM_ANILLO * sizeof(*ep0_ring));
 
+    g_eventos_transfer[slot_id][1].listo = 0;
     // Tocar timbre de EP0 (Target = DCI 1 = EP0)
     xhci_tocar_timbre(slot_id, 1);
 
-    // Esperar el evento de transferencia completada (timeout extendido a 2000 ms)
     int timeout = 2000;
     while (timeout > 0) {
-        xhci_sincronizar_evento_actual();
-        volatile struct trb_xhci *evt = &g_event_ring[g_event_idx];
-        uint8_t ciclo_evt = evt->control & 1;
-
-        if (ciclo_evt == g_event_cycle) {
-            uint8_t tipo = (evt->control >> 10) & 0x3F;
-            uint8_t codigo = (evt->estado >> 24) & 0xFF;
-            uint8_t evt_slot = (evt->control >> 24) & 0xFF;
-            uint8_t evt_ep   = (evt->control >> 16) & 0x1F;
-
-            // Avanzar dequeue
-            g_event_idx++;
-            if (g_event_idx >= XHCI_TAM_ANILLO) {
-                g_event_idx = 0;
-                g_event_cycle = !g_event_cycle;
-                g_evt_ring_wraparounds++;
+        xhci_bombear_eventos();
+        struct xhci_evento_pendiente *b = &g_eventos_transfer[slot_id][1];
+        if (b->listo) {
+            uint8_t codigo = (b->trb.estado >> 24) & 0xFF;
+            b->listo = 0;
+            g_estado.ultimo_codigo_control = codigo;
+            if (codigo == 1 || codigo == 13) {
+                if (datos && longitud > 0) dma_sincronizar_dispositivo_a_cpu(datos, longitud);
+                return 0;
             }
-            uint64_t erdp = g_event_ring_fisica + (g_event_idx * sizeof(struct trb_xhci));
-            mmio_escribir64(g_rts_base + 0x20 + 0x18, erdp | (1U << 3));
-            mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03);
-
-            if (tipo == TRB_TIPO_TRANSFER_EVT && evt_slot == slot_id && evt_ep == 1) {
-                g_estado.ultimo_codigo_control = codigo;
-                // Éxito = código 1 (Success) o 13 (Short Packet = OK para descriptores)
-                if (codigo == 1 || codigo == 13) {
-                    if (datos && longitud > 0) {
-                        dma_sincronizar_dispositivo_a_cpu(datos, longitud);
-                    }
-                    return 0;
-                }
-                serial_imprimir("  [xHCI] Transferencia de control completada con código: ");
-                serial_imprimir_dec(codigo);
-                serial_imprimir_linea("");
-                g_estado.fallos_control++;
-                return (int)codigo;
-            }
-            // Evento intermedio o de otro endpoint/dispositivo, ignorar y seguir esperando
-            continue;
+            g_estado.fallos_control++;
+            return (int)codigo;
         }
         esperar_milisegundos(1);
         timeout--;
@@ -1563,46 +1528,23 @@ int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint6
     dma_sincronizar_cpu_a_dispositivo((const void *)bep->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
     __asm__ volatile ("mfence" ::: "memory");
 
+    g_eventos_transfer[slot_id][ep_dci].listo = 0;
     // Tocar el timbre del endpoint correspondiente (Target = ep_dci)
     xhci_tocar_timbre(slot_id, ep_dci);
 
-    // Esperar evento en el Event Ring
     int timeout = (timeout_ms > 0) ? timeout_ms : 2000;
     while (timeout > 0) {
-        xhci_sincronizar_evento_actual();
-        volatile struct trb_xhci *evt = &g_event_ring[g_event_idx];
-        uint8_t ciclo_evt = evt->control & 1;
-
-        if (ciclo_evt == g_event_cycle) {
-            uint8_t tipo     = (evt->control >> 10) & 0x3F;
-            uint8_t codigo   = (evt->estado >> 24) & 0xFF;
-            uint8_t evt_slot = (evt->control >> 24) & 0xFF;
-            uint8_t evt_ep   = (evt->control >> 16) & 0x1F;
-
-            // Avanzar dequeue en el Event Ring
-            g_event_idx++;
-            if (g_event_idx >= XHCI_TAM_ANILLO) {
-                g_event_idx = 0;
-                g_event_cycle = !g_event_cycle;
-                g_evt_ring_wraparounds++;
+        xhci_bombear_eventos();
+        struct xhci_evento_pendiente *b = &g_eventos_transfer[slot_id][ep_dci];
+        if (b->listo) {
+            uint8_t codigo = (b->trb.estado >> 24) & 0xFF;
+            b->listo = 0;
+            if (codigo == 1 || codigo == 13) {
+                if (es_in && buffer && longitud > 0)
+                    dma_sincronizar_dispositivo_a_cpu(buffer, longitud);
+                return 0;
             }
-            uint64_t erdp = g_event_ring_fisica + (g_event_idx * sizeof(struct trb_xhci));
-            mmio_escribir64(g_rts_base + 0x20 + 0x18, erdp | (1U << 3));
-            mmio_escribir32(g_rts_base + 0x20 + 0x00, 0x03);
-
-            if (tipo == TRB_TIPO_TRANSFER_EVT && evt_slot == slot_id && evt_ep == ep_dci) {
-                if (codigo == 1 || codigo == 13) { // 1 = Success, 13 = Short Packet
-                    if (es_in && buffer && longitud > 0) {
-                        dma_sincronizar_dispositivo_a_cpu(buffer, longitud);
-                    }
-                    return 0; // ¡Éxito!
-                }
-                serial_imprimir("  [xHCI] Transferencia Bulk fallo con codigo: ");
-                serial_imprimir_dec(codigo);
-                serial_imprimir_linea("");
-                return -(int)codigo;
-            }
-            continue;
+            return -(int)codigo;
         }
         esperar_milisegundos(1);
         timeout--;
@@ -1942,6 +1884,7 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     int iface_actual_num = -1;
     int iface_actual_es_hid = 0;
     int iface_actual_es_boot = 0;
+    int iface_actual_es_raton = 0;
     int iface_actual_es_msc = 0;
 
     struct xhci_ep_teclado *eps_este_dispositivo[4] = {0};
@@ -1975,26 +1918,26 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
             serial_imprimir(" Protocolo=");
             serial_imprimir_dec(if_protocol);
 
-            // Aceptamos interfaces HID de teclado (Clase 3) o Mass Storage (Clase 8)
-            if (if_class == 3 && if_protocol != 2) {
+            // Aceptamos HID teclado/ratón y Mass Storage.
+            if (if_class == 3) {
                 iface_actual_es_hid = 1;
                 iface_actual_es_boot = (if_subclass == 1 && if_protocol == 1);
+                iface_actual_es_raton = (if_subclass == 1 && if_protocol == 2);
                 iface_actual_es_msc = 0;
-                serial_imprimir_linea(" [HID Teclado Aceptada]");
+                serial_imprimir_linea(iface_actual_es_raton ? " [HID Ratón Aceptado]" :
+                                      " [HID Teclado Aceptado]");
             } else if (if_class == 8) { // Mass Storage Class (MSC)
                 iface_actual_es_hid = 0;
                 iface_actual_es_boot = 0;
+                iface_actual_es_raton = 0;
                 iface_actual_es_msc = 1;
                 serial_imprimir_linea(" [USB Mass Storage (MSC) Aceptada]");
             } else {
                 iface_actual_es_hid = 0;
                 iface_actual_es_boot = 0;
+                iface_actual_es_raton = 0;
                 iface_actual_es_msc = 0;
-                if (if_class == 3 && if_protocol == 2) {
-                    serial_imprimir_linea(" [HID Ratón Omitido]");
-                } else {
-                    serial_imprimir_linea(" [Ignorada]");
-                }
+                serial_imprimir_linea(" [Ignorada]");
             }
         } else if (dtype == 5 && len >= 7 && iface_actual_es_hid) { // Endpoint Descriptor HID
             uint8_t ep_addr = desc_buf[offset + 2];
@@ -2036,6 +1979,7 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
                         ep->ep_intervalo = ep_intervalo;
                         ep->iface_num = (uint8_t)iface_actual_num;
                         ep->es_boot = iface_actual_es_boot;
+                        ep->es_raton = iface_actual_es_raton;
                         ep->activo = 0;
                         ep->idx = 0;
                         ep->cycle = 1;
@@ -2097,8 +2041,8 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     }
 
     if (num_eps_este_dispositivo == 0 && !es_dispositivo_msc) {
-        consola_imprimir_linea_color("    -> No es teclado HID ni memoria USB (liberando slot)", COLOR_PROMPT_DEFAULT);
-        serial_imprimir_linea("  [xHCI] No se encontraron endpoints de teclado HID ni MSC compatibles. Omitiendo.");
+        consola_imprimir_linea_color("    -> No hay endpoint HID/MSC compatible (liberando slot)", COLOR_PROMPT_DEFAULT);
+        serial_imprimir_linea("  [xHCI] No se encontraron endpoints HID ni MSC compatibles. Omitiendo.");
         xhci_liberar_slot(slot_id, in_ctx, in_ctx_fisica, dev_ctx, dev_ctx_fisica, desc_buf, desc_buf_fisica);
         return;
     }
@@ -2369,7 +2313,7 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
             }
             if (interfaz_ya_configurada) continue;
 
-            if (eps_este_dispositivo[e]->es_boot) {
+            if (eps_este_dispositivo[e]->es_boot || eps_este_dispositivo[e]->es_raton) {
                 // SET_PROTOCOL(Boot = 0)
                 int res_p = xhci_transferencia_control(slot_id, 0x21, 0x0B, 0x0000, (uint16_t)iface, 0, NULL, 0);
                 serial_imprimir("  [xHCI] SET_PROTOCOL(Boot=0) Iface=");
@@ -2435,33 +2379,29 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
             xhci_tocar_timbre(slot_id, ep->ep_dci);
         }
 
-        g_estado.teclado_detectado = 1;
-        g_estado.teclado_slot_id = slot_id;
-        g_estado.teclado_ep_dci  = eps_este_dispositivo[0]->ep_dci;
-        g_estado.teclado_num_eps = (uint8_t)num_eps_este_dispositivo;
-        g_estado.teclado_puerto  = puerto_idx;
-        g_estado.teclado_id_proveedor = dev_desc->id_proveedor;
-        g_estado.teclado_id_producto  = dev_desc->id_producto;
-        g_estado.etapa_enumeracion = 8;
-
-        // Calcular cuántos dispositivos de teclado distintos están activos concurrentemente
-        int total_teclados = 0;
-        uint8_t slots_contados[XHCI_MAX_SLOTS + 1] = {0};
-        for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
-            if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id > 0) {
-                if (!slots_contados[g_teclado_eps[e].slot_id]) {
-                    slots_contados[g_teclado_eps[e].slot_id] = 1;
-                    total_teclados++;
-                }
-            }
+        int primer_teclado = -1;
+        for (int e = 0; e < num_eps_este_dispositivo; e++)
+            if (!eps_este_dispositivo[e]->es_raton) { primer_teclado = e; break; }
+        if (primer_teclado >= 0) {
+            g_estado.teclado_slot_id = slot_id;
+            g_estado.teclado_ep_dci  = eps_este_dispositivo[primer_teclado]->ep_dci;
+            g_estado.teclado_num_eps = (uint8_t)num_eps_este_dispositivo;
+            g_estado.teclado_puerto  = puerto_idx;
+            g_estado.teclado_id_proveedor = dev_desc->id_proveedor;
+            g_estado.teclado_id_producto  = dev_desc->id_producto;
         }
-        g_estado.teclados_activos = total_teclados;
+        g_estado.etapa_enumeracion = 8;
+        xhci_recontar_hid();
 
-        consola_imprimir("    ==> ¡Teclado USB Configurado y Operativo [OK]! (");
+        consola_imprimir(primer_teclado >= 0 ?
+                         "    ==> ¡Teclado USB Configurado y Operativo [OK]! (" :
+                         "    ==> ¡Ratón USB Configurado y Operativo [OK]! (");
         consola_imprimir_dec(num_eps_este_dispositivo);
         consola_imprimir_linea_color(" Endpoints)", COLOR_EXITO_DEFAULT);
 
-        serial_imprimir("  [xHCI EXITOSO] ¡Teclado USB en Slot ");
+        serial_imprimir(primer_teclado >= 0 ?
+                        "  [xHCI EXITOSO] ¡Teclado USB en Slot " :
+                        "  [xHCI EXITOSO] ¡Ratón USB en Slot ");
         serial_imprimir_dec(slot_id);
         serial_imprimir(" (Puerto ");
         serial_imprimir_dec(puerto_idx);
@@ -2642,6 +2582,10 @@ int xhci_iniciar(void) {
     uint32_t hcsparams1 = mmio_leer32(g_mmio_base + REG_HCSPARAMS1);
     g_estado.max_slots   = hcsparams1 & 0xFF;
     g_estado.max_puertos = (hcsparams1 >> 24) & 0xFF;
+    if (g_estado.max_puertos > XHCI_MAX_PUERTOS) {
+        serial_imprimir_linea("[xHCI] Controlador supera la tabla de puertos; limitando sondeo.");
+        g_estado.max_puertos = XHCI_MAX_PUERTOS;
+    }
 
     uint32_t hcsparams2 = mmio_leer32(g_mmio_base + REG_HCSPARAMS2);
     uint32_t max_scratch_hi = (hcsparams2 >> 21) & 0x1F;
@@ -3122,18 +3066,7 @@ int xhci_escanear_cambios_puertos(int verbose) {
                 g_slot_vid[slot_id] = 0;
                 g_slot_pid[slot_id] = 0;
 
-                int num_teclados = 0;
-                uint8_t slots_vistos[XHCI_MAX_SLOTS + 1] = {0};
-                for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
-                    if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id > 0) {
-                        if (!slots_vistos[g_teclado_eps[e].slot_id]) {
-                            slots_vistos[g_teclado_eps[e].slot_id] = 1;
-                            num_teclados++;
-                        }
-                    }
-                }
-                g_estado.teclados_activos = num_teclados;
-                g_estado.teclado_detectado = (num_teclados > 0);
+                xhci_recontar_hid();
                 if (g_estado.teclado_slot_id == slot_id) {
                     g_estado.teclado_slot_id = 0;
                     g_estado.teclado_puerto = 0;
@@ -3192,18 +3125,7 @@ int xhci_forzar_reset_puerto(uint8_t puerto) {
         g_slot_vid[slot_id] = 0;
         g_slot_pid[slot_id] = 0;
 
-        int num_teclados = 0;
-        uint8_t slots_vistos[XHCI_MAX_SLOTS + 1] = {0};
-        for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
-            if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id > 0) {
-                if (!slots_vistos[g_teclado_eps[e].slot_id]) {
-                    slots_vistos[g_teclado_eps[e].slot_id] = 1;
-                    num_teclados++;
-                }
-            }
-        }
-        g_estado.teclados_activos = num_teclados;
-        g_estado.teclado_detectado = (num_teclados > 0);
+        xhci_recontar_hid();
         if (g_estado.teclado_slot_id == slot_id) {
             g_estado.teclado_slot_id = 0;
             g_estado.teclado_puerto = 0;

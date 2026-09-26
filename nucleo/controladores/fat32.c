@@ -153,20 +153,72 @@ int fat32_montar(uint8_t unidad_msc) {
                                 ((uint32_t)g_sector_buf[p_off + 14] << 16) |
                                 ((uint32_t)g_sector_buf[p_off + 15] << 24);
 
-            if (cant_sec > 0 && inicio_lba > 0) {
-                // Particiones comunes de FAT32: 0x0B (FAT32 CHS), 0x0C (FAT32 LBA)
-                // O probar cualquier partición que contenga cabecera FAT32 en su VBR
-                if (tipo == 0x0B || tipo == 0x0C || tipo == 0x07 || tipo == 0xEE || tipo == 0x83) {
-                    lba_particion = inicio_lba;
-                    particion_encontrada = 1;
-                    break;
+            if (cant_sec > 0 && inicio_lba > 0 && tipo != 0 && tipo != 0xEE) {
+                static uint8_t sector_prueba[512];
+                if (usb_msc_leer_sectores(unidad_msc, inicio_lba, 1, sector_prueba) == 0) {
+                    if ((sector_prueba[82] == 'F' && sector_prueba[83] == 'A' && sector_prueba[84] == 'T' &&
+                         sector_prueba[85] == '3' && sector_prueba[86] == '2') ||
+                        (sector_prueba[510] == 0x55 && sector_prueba[511] == 0xAA &&
+                         *(uint16_t *)&sector_prueba[11] >= 512 && sector_prueba[13] > 0 &&
+                         *(uint16_t *)&sector_prueba[14] > 0 && sector_prueba[16] > 0 &&
+                         *(uint32_t *)&sector_prueba[36] > 0)) {
+                        lba_particion = inicio_lba;
+                        particion_encontrada = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Caso C: Partición GPT (GUID Partition Table)
+        if (!particion_encontrada) {
+            static uint8_t gpt_buf[512];
+            if (usb_msc_leer_sectores(unidad_msc, 1, 1, gpt_buf) == 0 &&
+                memcmp(gpt_buf, "EFI PART", 8) == 0) {
+                uint64_t part_lba = *(uint64_t *)&gpt_buf[72];
+                uint32_t num_parts = *(uint32_t *)&gpt_buf[80];
+                uint32_t part_size = *(uint32_t *)&gpt_buf[84];
+                if (part_size != 128) part_size = 128;
+                if (part_lba == 0) part_lba = 2;
+                if (num_parts > 32) num_parts = 32;
+
+                uint32_t sec_actual = 0xFFFFFFFF;
+                for (uint32_t p = 0; p < num_parts; p++) {
+                    uint32_t sec = (uint32_t)part_lba + (p * part_size) / 512;
+                    uint32_t off = (p * part_size) % 512;
+                    if (sec != sec_actual) {
+                        if (usb_msc_leer_sectores(unidad_msc, sec, 1, gpt_buf) != 0) break;
+                        sec_actual = sec;
+                    }
+                    int guid_valido = 0;
+                    for (int g = 0; g < 16; g++) {
+                        if (gpt_buf[off + g] != 0) { guid_valido = 1; break; }
+                    }
+                    if (!guid_valido) continue;
+
+                    uint64_t inicio = *(uint64_t *)&gpt_buf[off + 32];
+                    if (inicio > 0 && inicio <= UINT32_MAX) {
+                        static uint8_t sector_prueba[512];
+                        if (usb_msc_leer_sectores(unidad_msc, (uint32_t)inicio, 1, sector_prueba) == 0) {
+                            if ((sector_prueba[82] == 'F' && sector_prueba[83] == 'A' && sector_prueba[84] == 'T' &&
+                                 sector_prueba[85] == '3' && sector_prueba[86] == '2') ||
+                                (sector_prueba[510] == 0x55 && sector_prueba[511] == 0xAA &&
+                                 *(uint16_t *)&sector_prueba[11] >= 512 && sector_prueba[13] > 0 &&
+                                 *(uint16_t *)&sector_prueba[14] > 0 && sector_prueba[16] > 0 &&
+                                 *(uint32_t *)&sector_prueba[36] > 0)) {
+                                lba_particion = (uint32_t)inicio;
+                                particion_encontrada = 1;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     if (!particion_encontrada) {
-        serial_imprimir_linea("[FAT32 ERROR] No se localizó ninguna partición compatible en el MBR.");
+        serial_imprimir_linea("[FAT32 ERROR] No se localizó ninguna partición compatible en el MBR o GPT.");
         return -5;
     }
 
@@ -210,6 +262,7 @@ int fat32_montar(uint8_t unidad_msc) {
     g_volumen.bytes_por_cluster = (uint32_t)sec_per_clus * (uint32_t)bytes_sec;
     g_volumen.sectores_por_fat = sec_fat;
     g_volumen.cluster_raiz = root_clus;
+    g_volumen.sector_fs_info = bpb->sector_fs_info;
 
     g_volumen.lba_fat = lba_particion + (uint32_t)sec_resv;
     g_volumen.lba_datos = g_volumen.lba_fat + ((uint32_t)num_fats * sec_fat);
@@ -720,6 +773,25 @@ static uint32_t fat32_asignar_cluster_libre(void) {
                 uint32_t lba_fat2_sec = lba_fat_sec + g_volumen.sectores_por_fat;
                 usb_msc_escribir_sectores(g_volumen.unidad_msc, lba_fat2_sec, 1, g_fat_sector_buf);
 
+                // Actualizar sector FSInfo si está presente
+                if (g_volumen.sector_fs_info != 0 && g_volumen.sector_fs_info != 0xFFFF) {
+                    uint32_t lba_fsinfo = g_volumen.lba_inicio_particion + g_volumen.sector_fs_info;
+                    uint8_t fsinfo_buf[512];
+                    if (usb_msc_leer_sectores(g_volumen.unidad_msc, lba_fsinfo, 1, fsinfo_buf) == 0) {
+                        uint32_t sig1 = *(uint32_t *)&fsinfo_buf[0];
+                        uint32_t sig2 = *(uint32_t *)&fsinfo_buf[484];
+                        if (sig1 == 0x41615252 && sig2 == 0x61417272) {
+                            uint32_t *free_clus = (uint32_t *)&fsinfo_buf[488];
+                            uint32_t *next_free = (uint32_t *)&fsinfo_buf[492];
+                            if (*free_clus != 0xFFFFFFFF && *free_clus > 0) {
+                                (*free_clus)--;
+                            }
+                            *next_free = cluster_idx + 1;
+                            usb_msc_escribir_sectores(g_volumen.unidad_msc, lba_fsinfo, 1, fsinfo_buf);
+                        }
+                    }
+                }
+
                 return cluster_idx;
             }
         }
@@ -841,9 +913,9 @@ int fat32_crear_directorio(const char *nombre) {
     e_dospuntos->nombre[0] = '.';
     e_dospuntos->nombre[1] = '.';
     e_dospuntos->atributos = FAT32_ATTR_DIRECTORY;
-    // Apunta al directorio raíz
-    e_dospuntos->cluster_alto = (uint16_t)((g_volumen.cluster_raiz >> 16) & 0xFFFF);
-    e_dospuntos->cluster_bajo = (uint16_t)(g_volumen.cluster_raiz & 0xFFFF);
+    // Conforme a la especificación oficial FAT32: si el padre es el directorio raíz, el cluster de '..' debe ser 0
+    e_dospuntos->cluster_alto = 0;
+    e_dospuntos->cluster_bajo = 0;
 
     // Escribir cluster de directorio en disco
     uint32_t lba = fat32_cluster_a_lba(&g_volumen, cluster_dir);

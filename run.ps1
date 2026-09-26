@@ -38,7 +38,7 @@ $img  = "$directorioActual\build\taek-os.img"
 $argsQemu = @(
     "-drive", "if=pflash,format=raw,readonly=on,file=$ovmf",
     "-drive", "file=$img,format=raw",
-    "-m", "512M",
+    "-m", "1024M",
     "-M", "q35",
     "-audiodev", "dsound,id=snd0"
 )

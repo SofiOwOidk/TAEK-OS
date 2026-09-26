@@ -173,6 +173,7 @@ struct ext4_volumen {
     uint32_t lba_inicio_particion;
     uint32_t tamano_bloque;           // Típicamente 4096 o 1024 bytes
     uint32_t sectores_por_bloque;     // tamano_bloque / 512
+    uint32_t total_bloques;
     uint32_t bloques_por_grupo;
     uint32_t inodos_por_grupo;
     uint16_t tamano_inodo;            // Típicamente 256 bytes

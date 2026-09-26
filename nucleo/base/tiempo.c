@@ -65,6 +65,13 @@ uint64_t tiempo_obtener_milisegundos(void) {
     return rdtsc_interno() / g_ciclos_por_ms;
 }
 
+uint64_t tiempo_ciclos_por_ms(void) {
+    if (g_ciclos_por_ms == 0) {
+        tiempo_iniciar();
+    }
+    return g_ciclos_por_ms;
+}
+
 void esperar_microsegundos(uint32_t us) {
     if (g_ciclos_por_ms == 0) {
         tiempo_iniciar();

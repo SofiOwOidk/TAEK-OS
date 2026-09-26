@@ -4,6 +4,7 @@
 #include "../arquitectura/x86_64/serial.h"
 
 #define MAX_PALABRAS_BITMAP 128 // 128 * 64 bits = 8,192 páginas (32 MiB @ 4 KiB)
+#define MAX_PAGINAS_DMA (MAX_PALABRAS_BITMAP * 64)
 
 static uint64_t g_dma_base_fisica = 0;
 static uint64_t g_dma_tamano_bytes = 0;
@@ -14,6 +15,9 @@ static uint32_t g_dma_max_tamano_kb = 0;
 static int      g_dma_iniciado = 0;
 
 static uint64_t g_dma_bitmap[MAX_PALABRAS_BITMAP];
+// Sólo el primer frame de cada asignación contiene su tamaño solicitado.
+// Permite rechazar free parcial, tamaño equivocado y double free.
+static uint32_t g_dma_tamano_asignacion[MAX_PAGINAS_DMA];
 
 static inline int bitmap_probar_bit(uint32_t bit) {
     if (bit >= g_dma_total_paginas) return 1;
@@ -58,6 +62,7 @@ int dma_iniciar(void) {
     for (int i = 0; i < MAX_PALABRAS_BITMAP; i++) {
         g_dma_bitmap[i] = 0;
     }
+    memset(g_dma_tamano_asignacion, 0, sizeof(g_dma_tamano_asignacion));
 
     g_dma_paginas_ocupadas = 0;
     g_dma_asignaciones_activas = 0;
@@ -77,15 +82,15 @@ int dma_iniciar(void) {
 
 void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *dir_fisica) {
     if (!g_dma_iniciado) dma_iniciar();
-    if (bytes == 0 || !dir_fisica || g_dma_total_paginas == 0) return NULL;
+    if (bytes == 0 || !dir_fisica || g_dma_total_paginas == 0 ||
+        bytes > g_dma_tamano_bytes || bytes > UINT64_MAX - (TAMANO_PAGINA - 1)) return NULL;
 
     if (alineacion < TAMANO_PAGINA) alineacion = TAMANO_PAGINA;
 
     uint32_t pags_necesarias = (uint32_t)((bytes + TAMANO_PAGINA - 1) / TAMANO_PAGINA);
-    uint32_t paso_alineacion = (uint32_t)(alineacion / TAMANO_PAGINA);
-    if (paso_alineacion == 0) paso_alineacion = 1;
-
-    for (uint32_t i = 0; i + pags_necesarias <= g_dma_total_paginas; i += paso_alineacion) {
+    for (uint32_t i = 0; i + pags_necesarias <= g_dma_total_paginas; i++) {
+        uint64_t phys_candidato = g_dma_base_fisica + (uint64_t)i * TAMANO_PAGINA;
+        if (phys_candidato % alineacion != 0) continue;
         int bloque_libre = 1;
         for (uint32_t j = 0; j < pags_necesarias; j++) {
             if (bitmap_probar_bit(i + j)) {
@@ -101,6 +106,7 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
 
             g_dma_paginas_ocupadas += pags_necesarias;
             g_dma_asignaciones_activas++;
+            g_dma_tamano_asignacion[i] = (uint32_t)bytes;
 
             uint32_t tam_kb = (pags_necesarias * 4096) / 1024;
             if (tam_kb > g_dma_max_tamano_kb) {
@@ -124,15 +130,33 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
 }
 
 void dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes) {
-    (void)dir_virtual;
-    if (bytes == 0 || g_dma_total_paginas == 0) return;
-
-    if (dir_fisica < g_dma_base_fisica || dir_fisica >= (g_dma_base_fisica + g_dma_tamano_bytes)) {
+    if (bytes == 0 || !dir_virtual || g_dma_total_paginas == 0 ||
+        dir_fisica < g_dma_base_fisica || dir_fisica >= (g_dma_base_fisica + g_dma_tamano_bytes) ||
+        ((dir_fisica - g_dma_base_fisica) % TAMANO_PAGINA) != 0 ||
+        dir_virtual != (void *)(dir_fisica + memoria_obtener_hhdm_offset())) {
+        serial_imprimir_linea("[DMA FATAL] Liberación fuera del arena o puntero incoherente.");
         return;
     }
 
     uint32_t inicio_bit = (uint32_t)((dir_fisica - g_dma_base_fisica) / TAMANO_PAGINA);
+    if (bytes > g_dma_tamano_bytes || bytes > UINT64_MAX - (TAMANO_PAGINA - 1) ||
+        inicio_bit >= g_dma_total_paginas ||
+        g_dma_tamano_asignacion[inicio_bit] != bytes) {
+        serial_imprimir_linea("[DMA FATAL] Double free o tamaño de asignación incorrecto.");
+        return;
+    }
     uint32_t pags = (uint32_t)((bytes + TAMANO_PAGINA - 1) / TAMANO_PAGINA);
+    if (pags > g_dma_total_paginas - inicio_bit) {
+        serial_imprimir_linea("[DMA FATAL] Liberación excede el arena.");
+        return;
+    }
+    for (uint32_t j = 0; j < pags; j++) {
+        if (!bitmap_probar_bit(inicio_bit + j)) {
+            serial_imprimir_linea("[DMA FATAL] Liberación duplicada o tamaño incorrecto.");
+            return;
+        }
+    }
+    g_dma_tamano_asignacion[inicio_bit] = 0;
 
     for (uint32_t j = 0; j < pags; j++) {
         if ((inicio_bit + j) < g_dma_total_paginas) {

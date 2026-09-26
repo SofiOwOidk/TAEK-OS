@@ -29,6 +29,9 @@ void vfs_desmontar(void);
 // Consulta si hay un sistema de archivos montado
 int  vfs_esta_montado(void);
 
+// Retorna la unidad USB MSC actualmente activa en VFS
+uint8_t vfs_obtener_unidad_activa(void);
+
 // Retorna el tipo de sistema de archivos activo
 enum vfs_tipo_fs vfs_obtener_tipo_fs(void);
 

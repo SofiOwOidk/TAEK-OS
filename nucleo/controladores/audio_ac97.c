@@ -68,8 +68,16 @@ int audio_ac97_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel
     // Fijar volumen PCM Out a 0 dB (sin mute)
     escribir_puerto_w(g_nambar + 0x18, 0x0000);
 
-    // Fijar frecuencia de muestreo a 44100 Hz (Front DAC Rate)
+    // 44,1 kHz sólo es válido si el códec anuncia y acepta VRA.
+    if (!(leer_puerto_w(g_nambar + 0x28) & 0x0001)) {
+        serial_imprimir_linea("[AC97] Códec sin VRA; PCM de 44,1 kHz no soportado.");
+        return -1;
+    }
+    uint16_t ext_ctrl = leer_puerto_w(g_nambar + 0x2A);
+    escribir_puerto_w(g_nambar + 0x2A, ext_ctrl | 0x0001);
+    if (!(leer_puerto_w(g_nambar + 0x2A) & 0x0001)) return -1;
     escribir_puerto_w(g_nambar + 0x2C, 44100);
+    if (leer_puerto_w(g_nambar + 0x2C) != 44100) return -1;
 
     g_iniciado = 1;
     return 0;
@@ -220,6 +228,33 @@ int audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
 int audio_ac97_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes) {
     if (g_usar_hda) return audio_hda_reproducir_pcm_bucle(datos_pcm, tamano_bytes);
     return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 1);
+}
+
+int audio_ac97_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+    if (!g_iniciado || !datos_pcm || tamano_bytes == 0) return -1;
+    if (g_usar_hda) return audio_hda_encolar_pcm(datos_pcm, tamano_bytes);
+
+    // Fallback AC97: streaming continuo con buffer estático
+    return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
+}
+
+uint64_t audio_ac97_obtener_tiempo_ms(void) {
+    if (!g_iniciado) return 0;
+    if (g_usar_hda) return audio_hda_obtener_tiempo_ms();
+    return ((uint64_t)g_audio_cursor * 1000ULL) / (44100ULL * 4ULL);
+}
+
+void audio_ac97_reiniciar_reloj(void) {
+    if (g_usar_hda) {
+        audio_hda_reiniciar_reloj();
+        return;
+    }
+    g_audio_cursor = 0;
+}
+
+uint32_t audio_ac97_obtener_vaciados(void) {
+    if (g_usar_hda) return audio_hda_obtener_vaciados();
+    return 0;
 }
 
 int audio_ac97_esta_reproduciendo(void) {

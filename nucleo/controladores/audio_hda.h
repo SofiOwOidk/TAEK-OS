@@ -35,6 +35,11 @@ struct estado_hda {
     uint16_t codecs_detectados;
     int      reproduciendo;
     uint32_t bytes_reproducidos;
+    uint64_t bytes_dma_totales; // Contador monotónico de posición DMA observada
+    uint64_t bytes_en_cola;     // Bytes de la fuente ya copiados al ring
+    uint32_t eventos_bcis;     // Finalizaciones BDL observadas y reconocidas
+    uint32_t errores_stream;   // FIFO/Descriptor errors observados
+    uint32_t vaciados_audio;   // Underruns de búfer observados
     uint32_t bytes_totales;
 };
 
@@ -48,6 +53,18 @@ int  audio_hda_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes);
 
 // Inicia la reproducción en bucle continuo de un búfer PCM
 int  audio_hda_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes);
+
+// Encola datos PCM (44.1 kHz, 16 bits estéreo) en la cola persistente para streaming A/V continuo
+int  audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes);
+
+// Obtiene el tiempo de audio transcurrido según el DMA de hardware en milisegundos
+uint64_t audio_hda_obtener_tiempo_ms(void);
+
+// Reinicia el reloj de reproducción de audio y los contadores asociados
+void audio_hda_reiniciar_reloj(void);
+
+// Obtiene el número total de vaciados (underruns) ocurridos durante el streaming
+uint32_t audio_hda_obtener_vaciados(void);
 
 // Actualiza el estado de reproducción y alimenta el búfer DMA si es necesario
 void audio_hda_actualizar(void);

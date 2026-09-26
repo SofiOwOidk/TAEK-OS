@@ -53,6 +53,7 @@ static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
                                        void *datos, uint32_t datos_len, int es_in) {
     if (!g_msc_inicializado || !dev || !dev->activo) return -1;
     if (!g_cbw || !g_csw || !g_msc_dma_buffer) return -2;
+    if (cdb_len == 0 || cdb_len > 16 || datos_len > 65536 || (datos_len && !datos)) return -3;
 
     uint32_t etiqueta = g_etiqueta_actual++;
 
@@ -247,7 +248,13 @@ int usb_msc_registrar_dispositivo(uint8_t slot_id, uint8_t puerto_idx,
                             ((uint32_t)cap_buf[6] << 8)  |
                             ((uint32_t)cap_buf[7]);
 
-        if (blk_size == 0) blk_size = 512;
+        // Las capas de FS usan búferes de 512 B. Rechazar 4Kn antes de exponer I/O.
+        if (blk_size != 512 || max_lba == 0xFFFFFFFFU) {
+            serial_imprimir("  [USB MSC] Geometría no soportada: sector=");
+            serial_imprimir_dec(blk_size);
+            serial_imprimir_linea("; unidad deshabilitada para I/O.");
+            return idx;
+        }
         dev->sectores_totales = max_lba + 1;
         dev->tamano_sector = blk_size;
         dev->capacidad_bytes = (uint64_t)dev->sectores_totales * (uint64_t)dev->tamano_sector;
@@ -299,6 +306,8 @@ int usb_msc_leer_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, vo
     struct usb_msc_dispositivo *dev = &g_msc_dispositivos[id_unidad];
     if (!dev->activo || !dev->listo) return -2;
     if (cantidad == 0) return 0;
+    if (!buffer_destino || dev->tamano_sector != 512 ||
+        (uint64_t)lba + cantidad > dev->sectores_totales) return -4;
 
     uint32_t tamano_total = (uint32_t)cantidad * dev->tamano_sector;
     if (tamano_total > 65536) return -3; // Límite de búfer DMA por operación
@@ -324,6 +333,8 @@ int usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad
     struct usb_msc_dispositivo *dev = &g_msc_dispositivos[id_unidad];
     if (!dev->activo || !dev->listo) return -2;
     if (cantidad == 0) return 0;
+    if (!buffer_origen || dev->tamano_sector != 512 ||
+        (uint64_t)lba + cantidad > dev->sectores_totales) return -4;
 
     uint32_t tamano_total = (uint32_t)cantidad * dev->tamano_sector;
     if (tamano_total > 65536) return -3; // Límite de búfer DMA

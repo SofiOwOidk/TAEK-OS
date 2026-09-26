@@ -32,6 +32,44 @@ static uint64_t g_paginas_totales = 0;
 static uint64_t g_paginas_libres = 0;
 static uint64_t g_paginas_en_uso = 0;
 
+// Estado por marco utilizable: 0 reservado, 1 libre, 2 asignado por PMM.
+// Los marcos de heap/DMA se mantienen reservados fuera de la pila PMM.
+#define PMM_MAX_RANGOS 128
+struct pmm_rango_estado {
+    uint64_t inicio;
+    uint64_t paginas;
+    uint8_t *estado;
+};
+static struct pmm_rango_estado g_pmm_rangos[PMM_MAX_RANGOS];
+static uint32_t g_pmm_num_rangos = 0;
+static int g_pmm_estado_listo = 0;
+
+static int pmm_estado_de(uint64_t phys, uint8_t **byte, uint8_t *desplazamiento) {
+    for (uint32_t i = 0; i < g_pmm_num_rangos; i++) {
+        const struct pmm_rango_estado *r = &g_pmm_rangos[i];
+        if (phys >= r->inicio && (phys - r->inicio) / TAMANO_PAGINA < r->paginas) {
+            uint64_t idx = (phys - r->inicio) / TAMANO_PAGINA;
+            *byte = &r->estado[idx / 4];
+            *desplazamiento = (uint8_t)((idx % 4) * 2);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int pmm_estado_leer(uint64_t phys) {
+    uint8_t *byte, desplazamiento;
+    if (pmm_estado_de(phys, &byte, &desplazamiento) != 0) return -1;
+    return (*byte >> desplazamiento) & 3;
+}
+
+static void pmm_estado_escribir(uint64_t phys, uint8_t valor) {
+    uint8_t *byte, desplazamiento;
+    if (pmm_estado_de(phys, &byte, &desplazamiento) != 0) return;
+    *byte = (uint8_t)((*byte & ~(3U << desplazamiento)) |
+                      ((valor & 3U) << desplazamiento));
+}
+
 // Estructura de Bloque de Heap del Kernel
 typedef struct bloque_heap {
     uint64_t canario_inicio;     // CANARIO_BLOQUE_INICIO (0x7AEECC05ULL)
@@ -115,6 +153,13 @@ uint64_t pmm_asignar_pagina_fisica(void) {
 
     uint64_t phys = g_pila_marcos_libres;
     uint64_t *frame_virt = (uint64_t *)FISICA_A_VIRTUAL(phys);
+    if (g_pmm_estado_listo) {
+        if (pmm_estado_leer(phys) != 1) {
+            huevo_quebrar("PMM: pila de marcos corrupta", phys, 0, 0);
+            return 0;
+        }
+        pmm_estado_escribir(phys, 2);
+    }
 
     // Desapilar el marco libre
     g_pila_marcos_libres = *frame_virt;
@@ -136,7 +181,15 @@ void *pmm_asignar_pagina_virtual(void) {
 
 void pmm_liberar_pagina_fisica(uint64_t phys) {
     if (phys == 0 || (phys & 0xFFFULL) != 0) {
+        huevo_quebrar("PMM: dirección de liberación inválida", phys, 0, 0);
         return;
+    }
+    if (g_pmm_estado_listo) {
+        if (pmm_estado_leer(phys) != 2) {
+            huevo_quebrar("PMM: double free o página reservada", phys, 0, 0);
+            return;
+        }
+        pmm_estado_escribir(phys, 1);
     }
 
     uint64_t *frame_virt = (uint64_t *)FISICA_A_VIRTUAL(phys);
@@ -447,9 +500,13 @@ void memoria_iniciar(void) {
 
     for (uint64_t i = 0; i < cantidad_entradas; i++) {
         struct limine_memmap_entry *e = mapa->entries[i];
-        if (e->type == LIMINE_MEMMAP_USABLE && e->length >= (arena_heap_tamano + 0x100000) && e->base >= 0x100000) {
-            arena_heap_fisica = (e->base + 0xFFFULL) & ~0xFFFULL;
-            break;
+        if (e->type == LIMINE_MEMMAP_USABLE && e->base >= 0x100000) {
+            uint64_t candidato = (e->base + 0xFFFULL) & ~0xFFFULL;
+            if (candidato >= e->base && candidato <= e->base + e->length &&
+                arena_heap_tamano <= e->base + e->length - candidato) {
+                arena_heap_fisica = candidato;
+                break;
+            }
         }
     }
 
@@ -464,8 +521,8 @@ void memoria_iniciar(void) {
 
         // Si solapa con la arena del heap, buscar inmediatamente después
         if (arena_heap_fisica != 0 &&
-            base_candidata >= arena_heap_fisica &&
-            base_candidata < (arena_heap_fisica + arena_heap_tamano)) {
+            base_candidata < arena_heap_fisica + arena_heap_tamano &&
+            arena_heap_fisica < base_candidata + arena_dma_tamano) {
             base_candidata = ((arena_heap_fisica + arena_heap_tamano) + 0x1FFFFFULL) & ~0x1FFFFFULL;
         }
 
@@ -525,6 +582,41 @@ void memoria_iniciar(void) {
         }
     }
 
+    // Construir el mapa después del heap: así sus metadatos no se asignan
+    // recursivamente desde el PMM antes de conocer los marcos libres.
+    for (uint64_t i = 0; i < cantidad_entradas; i++) {
+        struct limine_memmap_entry *e = mapa->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE) continue;
+        uint64_t inicio = (e->base + 0xFFFULL) & ~0xFFFULL;
+        uint64_t fin = (e->base + e->length) & ~0xFFFULL;
+        if (fin <= inicio) continue;
+        if (g_pmm_num_rangos == PMM_MAX_RANGOS) {
+            huevo_quebrar("PMM: demasiados rangos físicos", i, 0, 0);
+            return;
+        }
+        struct pmm_rango_estado *r = &g_pmm_rangos[g_pmm_num_rangos++];
+        r->inicio = inicio;
+        r->paginas = (fin - inicio) / TAMANO_PAGINA;
+        r->estado = (uint8_t *)asignar_memoria_cero((r->paginas + 3) / 4);
+        if (!r->estado) {
+            huevo_quebrar("PMM: sin memoria para estados de marcos", inicio, 0, 0);
+            return;
+        }
+    }
+    uint64_t marco = g_pila_marcos_libres;
+    for (uint64_t i = 0; marco && i < g_paginas_libres; i++) {
+        if (pmm_estado_leer(marco) != 0) {
+            huevo_quebrar("PMM: pila inicial corrupta", marco, 0, 0);
+            return;
+        }
+        pmm_estado_escribir(marco, 1);
+        marco = *(uint64_t *)FISICA_A_VIRTUAL(marco);
+    }
+    if (marco) {
+        huevo_quebrar("PMM: ciclo en pila inicial", marco, 0, 0);
+        return;
+    }
+    g_pmm_estado_listo = 1;
     g_memoria_inicializada = 1;
 
     serial_imprimir("[RAM Total: ");

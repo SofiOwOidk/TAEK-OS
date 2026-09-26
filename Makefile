@@ -2,7 +2,8 @@ CC      = clang
 LD      = ld.lld
 NASM    = nasm
 
-FECHA_BUILD = $(shell date +'%Y-%m-%d %H:%M:%S')
+FECHA_BUILD = $(shell date +'%Y-%m-%d')
+HORA_BUILD  = $(shell date +'%H:%M:%S')
 
 CFLAGS  = -target x86_64-unknown-none-elf \
           -std=c11 \
@@ -15,7 +16,12 @@ CFLAGS  = -target x86_64-unknown-none-elf \
           -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
           -mcmodel=kernel \
           -DCOMPILACION_FECHA="\"$(FECHA_BUILD)\"" \
-          -I./nucleo -I.
+          -DCOMPILACION_HORA="\"$(HORA_BUILD)\"" \
+          -I./nucleo -I. \
+          -I./nucleo/controladores/multimedia/mp4 \
+          -I./nucleo/controladores/multimedia/h264 \
+          -I./nucleo/controladores/multimedia/aac \
+          -I./nucleo/controladores/multimedia/reproductor
 
 LDFLAGS = -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 -T linker.ld
 
@@ -29,10 +35,12 @@ C_SRCS    = nucleo/principal.c \
             nucleo/arquitectura/x86_64/apic.c \
             nucleo/arquitectura/x86_64/pci.c \
             nucleo/arquitectura/x86_64/vmx.c \
+            nucleo/arquitectura/x86_64/triple_fault.c \
             nucleo/base/huevo.c \
             nucleo/base/energia.c \
             nucleo/base/utf8.c \
             nucleo/base/tiempo.c \
+            nucleo/base/version.c \
             nucleo/base/memoria.c \
             nucleo/base/dma.c \
             nucleo/base/paginacion.c \
@@ -58,8 +66,11 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/vfs.c \
             nucleo/controladores/terminal.c
 
-C_SRCS   += $(wildcard nucleo/controladores/video/h264/*.c)
-H264_HEADERS = $(wildcard nucleo/controladores/video/h264/*.h)
+C_SRCS   += $(wildcard nucleo/controladores/multimedia/mp4/*.c) \
+            $(wildcard nucleo/controladores/multimedia/h264/*.c) \
+            $(wildcard nucleo/controladores/multimedia/aac/*.c) \
+            $(wildcard nucleo/controladores/multimedia/reproductor/*.c)
+MULTIMEDIA_HEADERS = $(wildcard nucleo/controladores/multimedia/*/*.h)
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
 
@@ -126,6 +137,9 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+.PHONY: forzar_version
+$(BUILD_DIR)/nucleo/base/version.o: forzar_version
+
 $(BUILD_DIR)/%.o: %.s
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 $< -o $@
@@ -136,7 +150,8 @@ $(KERNEL): $(OBJS) linker.ld
 
 $(IMG): $(KERNEL) boot/limine.conf
 	@echo "==> Generando / Actualizando Imagen de Arranque UEFI FAT32 (128 MB)..."
-	@if [ ! -f $(IMG) ]; then \
+	@if [ ! -f $(IMG) ] || [ $$(stat -c %s $(IMG) 2>/dev/null || echo 0) -gt 200000000 ] || [ $$(stat -c %s $(IMG) 2>/dev/null || echo 0) -lt 120000000 ]; then \
+		rm -f $(IMG) && \
 		dd if=/dev/zero of=$(IMG) bs=1M count=128 status=none && \
 		mformat -i $(IMG) -F :: && \
 		mmd -i $(IMG) ::/EFI && \
@@ -148,6 +163,10 @@ $(IMG): $(KERNEL) boot/limine.conf
 	@mcopy -o -i $(IMG) boot/limine.conf ::/boot/limine/limine.conf
 	@mcopy -o -i $(IMG) boot/limine.conf ::/limine.conf
 	@mcopy -o -i $(IMG) $(KERNEL) ::/boot/nucleo.elf
+	@if [ -f "Recursos Asets/Video 360p.mp4" ]; then \
+		echo "==> Copiando Video 360p.mp4 a la imagen $(IMG)..."; \
+		mcopy -o -i $(IMG) "Recursos Asets/Video 360p.mp4" ::/boot/video_360p.mp4; \
+	fi
 	@echo "==> Imagen $(IMG) lista y sincronizada!"
 
 $(ISO): $(KERNEL) boot/limine.conf
@@ -158,12 +177,17 @@ $(ISO): $(KERNEL) boot/limine.conf
 		cp -u $(BUILD_DIR)/taek-os-*.iso "build antigua/" 2>/dev/null || true; \
 	fi
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine $(BUILD_DIR)/iso_root/EFI/BOOT
+	@rm -f $(BUILD_DIR)/iso_root/boot/video_1080p.mp4
 	@cp boot/limine/limine-bios-cd.bin boot/limine/limine-bios.sys boot/limine/limine-uefi-cd.bin $(BUILD_DIR)/iso_root/boot/limine/
 	@cp boot/limine/BOOTX64.EFI $(BUILD_DIR)/iso_root/EFI/BOOT/
 	@FECHA_MENU=$$(date +'%Y-%m-%d_%H-%M-%S'); \
 	sed "s|/TAEK OS|/TAEK OS ($${FECHA_MENU})|" boot/limine.conf > $(BUILD_DIR)/iso_root/boot/limine/limine.conf; \
 	cp $(BUILD_DIR)/iso_root/boot/limine/limine.conf $(BUILD_DIR)/iso_root/limine.conf
 	@cp $(KERNEL) $(BUILD_DIR)/iso_root/boot/nucleo.elf
+	@if [ -f "Recursos Asets/Video 360p.mp4" ]; then \
+		echo "==> Copiando Video 360p.mp4 a la ISO..."; \
+		cp "Recursos Asets/Video 360p.mp4" $(BUILD_DIR)/iso_root/boot/video_360p.mp4; \
+	fi
 	@xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
 	        -no-emul-boot -boot-load-size 4 -boot-info-table \
 	        --efi-boot boot/limine/limine-uefi-cd.bin \
@@ -214,6 +238,6 @@ qemu-trace: $(IMG)
 		-trace "usb_xhci_*" \
 		-serial stdio
 
-$(filter $(BUILD_DIR)/nucleo/controladores/video/h264/%.o,$(OBJS)): $(H264_HEADERS)
+$(filter $(BUILD_DIR)/nucleo/controladores/multimedia/%.o,$(OBJS)): $(MULTIMEDIA_HEADERS)
 
 .PHONY: all clean qemu qemu-trace

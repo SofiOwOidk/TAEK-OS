@@ -42,7 +42,7 @@ static manejador_irq_fn   g_manejadores_irq[256];
 static void idt_configurar_puerta(int num, uint64_t dir_manejador) {
     g_idt[num].manejador_bajo  = (uint16_t)(dir_manejador & 0xFFFF);
     g_idt[num].selector_cs     = 0x08;
-    g_idt[num].ist             = 0;
+    g_idt[num].ist             = num == 8 ? 1 : (num == 2 ? 2 : (num == 18 ? 3 : 0));
     g_idt[num].atributos       = 0x8E; // Presente, Anillo 0, Interrupt Gate 64-bit
     g_idt[num].manejador_medio = (uint16_t)((dir_manejador >> 16) & 0xFFFF);
     g_idt[num].manejador_alto  = (uint32_t)((dir_manejador >> 32) & 0xFFFFFFFF);
@@ -80,4 +80,11 @@ void despachador_interrupciones(struct marco_interrupcion *marco) {
 
     // Notificar al subsistema APIC para estadísticas y EOI
     apic_despachar_irq(marco);
+}
+
+void idt_corromper_para_harakiri(void) {
+    uint8_t *p = (uint8_t *)g_idt;
+    for (uint64_t i = 0; i < sizeof(g_idt); i++) {
+        p[i] = 0;
+    }
 }

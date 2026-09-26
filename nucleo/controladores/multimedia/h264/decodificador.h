@@ -55,6 +55,7 @@ struct h264_decodificador {
     int fallo, max_larga;
     uint64_t siguiente_identificador;
     const char *error;
+    h264_telemetria telemetria;
 };
 
 static const uint8_t h264_orden4[16] = {0,1,4,5,2,3,6,7,8,9,12,13,10,11,14,15};

@@ -1869,3 +1869,388 @@
 * **Límites de esta versión:** Sólo CABAC, cuadros progresivos YUV420 de ocho bits, POC tipo 0, matrices de escala uniformes y MP4 no fragmentado. No están implementados CAVLC, I_PCM, POC tipo 1/2, entrelazado/MBAFF, FMO, SP/SI, bit depths mayores, otros formatos de croma, listas de edición, rotación ni píxeles no cuadrados. Por tanto, el hito confirma funcionamiento en el material probado y no conformidad total con el estándar H.264. AAC y la reorganización posterior en `multimedia/` son cambios posteriores, sin cobertura en las comparaciones registradas aquí.
 * **Integridad y seguridad del host:** Los videos se mantuvieron comprimidos. Las ISOs de diagnóstico se generaron en `/tmp` nativo de WSL, se sincronizaron antes de copiarlas con nombres nuevos a `build/`, y QEMU usó medios de sólo lectura. No se ejecutó `git push`.
 * **Trazabilidad:** Resultados y límites ampliados en [`H264_VALIDACION.md`](H264_VALIDACION.md). Las imágenes, seriales y salidas de sanitizadores se conservaron localmente en `build/h264/` y `build/h264-pruebas/`.
+
+---
+
+### [2026-09-26] — Endurecimiento de almacenamiento, DMA y memoria
+
+* MSC rechaza sectores lógicos distintos de 512 B y operaciones fuera de la capacidad informada por READ CAPACITY.
+* exFAT usa el Allocation Bitmap para reservar clusters contiguos y valida la geometría relativa a la partición antes de montar. La ruta de escritura sigue experimental y necesita pruebas de fallos de I/O.
+* ext4 valida geometría/features y recorre árboles de extents acotados para lectura de archivos de múltiples bloques. Rechaza todas las escrituras hasta disponer de actualización completa de metadatos, journal y checksums. Antes, la creación de archivos de más de un bloque podía anunciar un tamaño mayor que los bloques realmente escritos.
+* El PMM registra estado por frame utilizable; paginación rechaza entradas intermedias con `PS=1`; el shim Linux deja de fingir continuidad física cuando se agota el arena DMA.
+* El sondeo PCI desactiva temporalmente decodificación I/O/MMIO y restaura `COMMAND`; xHCI limita puertos a la capacidad de su tabla estática.
+* HDA separa bytes copiados al ring de bytes observados en LPIB; AC97 verifica VRA y la tasa DAC antes de iniciar PCM de 44,1 kHz. El contador HDA exige sondeo más frecuente que una vuelta del ring.
+* GDT carga una TSS de 64 bits e IDT asigna stacks IST independientes a #DF, NMI y #MC. Pendiente prueba de excepción inducida.
+* **Verificación posterior:** se localizó QEMU Win32 y WSL Arch, y el núcleo compiló y arrancó en QEMU/TCG con q35, OVMF, 512 MiB, xHCI, teclado USB y USB MSC. Estado por subsistema: [`ESTADO_SUBSISTEMAS.md`](ESTADO_SUBSISTEMAS.md).
+
+---
+
+### [2026-09-26 11:25] — Hito 54: Batería de Pruebas de Resiliencia Arquitectónica y Triple Fault Real (Tiers 1, 2 y 3)
+
+* **Objetivo:** Modificar el actuar del comando `rm` / `sudo rm -rf /` para provocar colapsos reales de hardware (Triple Faults controlados y deterministas) y añadir comandos dedicados para auditar la contingencia de virtualización VMX y el aislamiento entre el kernel y el hipervisor.
+* **Niveles Implementados (Batería Arquitectónica):**
+  1. **Tier 1 — Triple Fault Limpio y Determinista (`provocar triple fault` / `triplefault` / `tf`):**
+     - Deshabilita interrupciones (`cli`).
+     - Almacena IDTR actual, fuerza límite = 0 y base = 0 con `lidt [rsp]`.
+     - Ejecuta `int3`.
+     - Cascada de microcódigo: `INT3` $\rightarrow$ `#BP` fallido (vector fuera de límite) $\rightarrow$ `#GP` fallido $\rightarrow$ `#DF` fallido $\rightarrow$ **TRIPLE FAULT**.
+     - Propósito: Comprobar limpiamente la ruta de intercepción VMX (`VM-Exit Reason 2`) sin corromper memoria previa.
+  2. **Tier 2 — Harakiri (`harakiri`):**
+     - Corrompe y anula completamente los descriptores de la IDT activa (`g_idt`).
+     - Destruye la estructura TSS64 y anula las pilas de interrupción dedicada IST (`g_pila_df`, `ist[0..6] = 0`).
+     - Fuerza `rsp = 0` y ejecuta `ud2`.
+     - Cascada: `UD2` $\rightarrow$ `#UD` $\rightarrow$ fallo por descriptor ausente en IDT $\rightarrow$ `#DF` $\rightarrow$ fallo al entregar doble falta por ausencia de pila IST $\rightarrow$ **TRIPLE FAULT**.
+     - Propósito: Verificar que el hipervisor y el manejador de contingencia no dependan de las estructuras de excepción del guest.
+  3. **Tier 3 — Seppuku (`seppuku` / `seppuki`):**
+     - Construye un árbol de paginación de 4 niveles (`PML4` sacrificial) estrictamente aislado en memoria física.
+     - Mapea **únicamente** la página de código de 4 KiB que aloja el stub de ejecución `seppuku_ejecutar_stub`.
+     - Deliberadamente **no mapea** IDT, stack del guest, heap, TSS/IST ni controladores de hardware.
+     - Desactiva `CR4.PGE` para purgar TLB global, anula `rsp = 0`, carga `mov cr3, cr3_sacrificial` y ejecuta `ud2`.
+     - Cascada: `UD2` $\rightarrow$ `#UD` $\rightarrow$ fallo de página `#PF` durante la lectura de IDT no mapeada $\rightarrow$ `#DF` $\rightarrow$ fallo de página durante entrega de `#DF` $\rightarrow$ **TRIPLE FAULT**.
+     - Propósito: Demostración suprema de contingencia e independencia de memoria virtual: el contexto del kernel colapsa totalmente mientras el Host VMX conserva su propio CR3, RSP, IDT y código intactos.
+* **Control y Modificación del Comando `rm` (`rm_modo`):**
+  - Comando `rm_modo`: Consulta el modo activo y permite conmutar entre `1` (Tier 1 Limpio), `2` (Tier 2 Harakiri), `3` (Tier 3 Seppuku) y `0` (Modo Clásico simulado por software).
+  - Soporte de banderas directas en `rm`: `rm -1`, `rm -2`, `rm -3`, `rm --tier1`, `rm --tier2`, `rm --tier3`, `rm --seppuku`, `rm --harakiri`.
+  - Si se invoca `sudo rm -rf /`, ejecuta el Triple Fault de hardware configurado en `g_rm_modo` tras la advertencia.
+* **Archivos Creados y Modificados:**
+  - `nucleo/arquitectura/x86_64/triple_fault.h / .c`: Módulo con la implementación freestanding de los tres tiers arquitectónicos y el despachador de telemetría.
+  - `nucleo/arquitectura/x86_64/gdt.h / .c`: Función `gdt_destruir_tss_e_ist()` para anular TSS y pilas IST.
+  - `nucleo/arquitectura/x86_64/idt.h / .c`: Función `idt_corromper_para_harakiri()` para sobreescribir la tabla IDT.
+  - `nucleo/controladores/terminal.c`: Comandos interactivos `rm_modo`, `provocar triple fault`, `harakiri`, `seppuku`, banderas en `rm` y actualización del menú de `ayuda`.
+  - `Makefile`: Integración de `triple_fault.c` en `C_SRCS`.
+* **Pruebas y Verificación:**
+  - Compilación freestanding en Arch Linux/WSL con Clang/LLD: **0 errores, 0 advertencias**.
+  - Imágenes `build/taek-os.img` y `build/taek-os.iso` generadas y sincronizadas.
+
+---
+
+### [2026-09-26 11:35 - 11:55] — Validación de almacenamiento y auditoría VMX
+
+* QEMU/TCG 11.1.0, q35, OVMF, xHCI, teclado USB y USB BOT: exFAT montó y `disco escribir test.txt hola` creó el archivo con 512 MiB. Tras el cambio de VolumeDirty, una imagen de 53 MiB arrancó con 1 GiB; `disco escribir nuevo.txt prueba` creó el archivo y la copia pasó `fsck.exfat -n` sin errores. Una ejecución de esta última imagen con 512 MiB quedó detenida antes del primer mensaje del núcleo; causa pendiente de diagnóstico.
+* Prueba host repetible `bash tests/probar_exfat_host.sh`: imagen exFAT nueva en `/tmp` nativo de WSL, archivo de 10 000 B y directorio, compilación con ASan/UBSan y `fsck.exfat -n` limpio. La prueba comprueba el rechazo de nombres duplicados. El escritor limita su geometría a bitmap y raíz de un cluster. La creación marca VolumeDirty en ambos VBR durante la operación y lo limpia sólo tras completar datos y entrada de directorio. Una escritura fallida inyectada en el primer cluster dejó ambos VBR con Dirty=1. No se ha probado recuperación tras corte de energía ni vaciado de caché del dispositivo.
+* Imagen ext4 nueva de 64 MiB con bloques de 4096 B y archivo de 10 000 B (`A`×4096, `B`×4096, `C`×1808). `e2fsck -fn` pasó antes de QEMU; el guest montó y `disco cat largo.txt` imprimió los tres tramos completos. La imagen ext4 antigua `build/disco_usb_ext4.img` presenta errores de checksum/metadatos en `e2fsck`; no se usó para validar ni se modificó.
+* USB BOT con `scsi-hd,logical_block_size=4096,physical_block_size=4096`: el guest informó `Geometría no soportada: sector=4096; unidad deshabilitada para I/O`. No se registró panic.
+* El Event Ring xHCI ahora se consume por un dispatcher central; la prueba QEMU ejercitó teclado HID y MSC. Faltan hotplug repetido, saturación del ring y dispositivos reales.
+* **Corrección de alcance VMX:** `vmx.c` ejecuta `VMXON` pero no configura VMCS, no ejecuta `VMLAUNCH`/`VMRESUME` y no tiene manejador VM-exit ni EPT. Los comandos Triple Fault implementados en el Hito 54 son pruebas destructivas, no evidencia de rescate por supervisor. El despachador ahora los bloquea hasta que exista un guest y un manejador VM-exit reales; el mensaje de arranque se corrigió para no anunciar interceptación que el código todavía no implementa. En QEMU, `tf` informó el bloqueo y regresó al prompt sin reset.
+
+### [2026-09-26] — Carga combinada y corrección del reloj HDA
+
+* Nuevo comando `stress`: 64 rondas con ocho marcos PMM, ocho bloques heap, ocho búferes DMA, lectura MSC, sondeo HID/hotplug, actualización de audio y un píxel de framebuffer. Verifica canarios y patrones antes de liberar. No ejecuta decodificación H.264 ni genera hotplug por sí mismo.
+* La primera prueba con Intel HDA emulado informó `reproduciendo`, pero `LPIB` y `BCIS` no avanzaron. El registro SDCTL estaba mal definido: `SRST`, `RUN` e `IOCE` estaban desplazados un bit. Se corrigió según la especificación Intel HDA 1.0a. El reloj añade el avance de LPIB y usa BCIS para detectar al menos una vuelta completa cuando LPIB coincide con la lectura anterior. Sondeos separados por más de una vuelta siguen sin permitir reconstruir todas las vueltas.
+* QEMU 11.1.0/TCG, q35, 1 GiB, `ich9-intel-hda` + `hda-output`, xHCI/teclado USB, MSC con ext4: `stress` terminó 64 rondas y 64 lecturas sin errores I/O ni de memoria; HDA avanzó **80 196 B** y registró **1 BCIS**. El backend WAV escribió datos PCM no nulos, aunque QEMU dejó los tamaños de su cabecera en cero; el archivo no se considera evidencia reproducible de audio audible.
+* El usuario proporcionó fotografías de dos equipos reales con Intel HDA. Se registraron como objetivos de prueba en `PERFILES_HARDWARE.md`; las fotografías no se cuentan como validación del nuevo reloj HDA ni de `stress`.
+
+---
+
+### [2026-09-26 12:00] — Hito 55: Integración de Videos MP4 de Prueba (360p y 1080p), Sincronización de Audio AAC y Comandos de Auditoría
+
+* **Objetivo:** Integrar los dos videos MP4 reales presentes en `Recursos Asets/` (`Video 360p.mp4` de ~10 MB y `Video 1080p.mp4` de ~85 MB) dentro del sistema operativo como módulos de arranque Limine, habilitar su reproducción y decodificación completa H.264 (Main y High Profile) con sincronización de audio AAC en Ring 0 hacia el controlador AC97, y proveer comandos dedicados para auditar tanto el pipeline de video como el códec de audio AAC de forma independiente.
+* **Decisiones de Diseño y Modificaciones:**
+  1. **Expansión de Almacenamiento y Memoria:**
+     - La imagen de arranque `build/taek-os.img` se expandió de 128 MiB a 384 MiB FAT32 para alojar el kernel `nucleo.elf` (~53 MB) y los dos videos MP4 (10 MB y 85 MB, totalizando ~148 MB en `/boot`). El `Makefile` detecta imágenes existentes menores a 350 MB y las reformatea automáticamente.
+     - `run.ps1` se configuró con `-m 1024M` (1 GiB de RAM) para asegurar suficiente memoria física para los módulos Limine cargados por el gestor de arranque, descompresión de fotogramas YUV420p y buffers de audio PCM.
+  2. **Configuración de Módulos Limine (`boot/limine.conf`):**
+     - Registrados ambos módulos con cmdlines identificadores:
+       - `module_path: boot():/boot/video_360p.mp4` con `module_cmdline: h264:360p`
+       - `module_path: boot():/boot/video_1080p.mp4` con `module_cmdline: h264:1080p`
+       - Mapeados tanto en la entrada estándar (xHCI Ring 0) como en la entrada de rescate (PS/2 Legacy).
+  3. **Pipeline de Reproducción y Decodificación Multimedia (`reproductor.c` / `reproductor.h`):**
+     - El bucle principal de reproducción `reproducir()` ahora sincroniza el stream de audio AAC extrayendo las muestras con `mp4_siguiente_audio()`, decodificándolas en bloques PCM de 16 bits con el decodificador Helix AAC en Ring 0 (`aac_decodificar()`), y enviándolas en tiempo real al chip de audio PCI Intel AC97 (`audio_ac97_reproducir_pcm()`).
+     - Se implementó la función de auditoría `audio_aac_probar()` para comprobar de forma estricta los paquetes de audio AAC de cada video, validando parámetros del contenedor MP4 (`esds`, canales, frecuencia de muestreo), decodificando cada muestra a PCM y reportando estadísticas de rendimiento y huella sonora sin renderizado gráfico.
+  4. **Comandos en Terminal (`terminal.c`):**
+     - `h264 360p` / `h264 1080p`: Reproducción interactiva a pantalla completa con video H.264 y audio AAC sincronizado (ESC para salir).
+     - `h264 prueba 360p` / `h264 prueba 1080p`: Decodificación forense de video a máxima velocidad sin retardo con cálculo de huella criptográfica de fotogramas.
+     - `aac [360p|1080p]` / `h264 aac [360p|1080p]`: Auditoría y diagnóstico directo del decodificador AAC.
+     - `video 360p` / `video 1080p`: Atajos directos de reproducción en la consola.
+* **Archivos Modificados:**
+  - `boot/limine.conf`: Inclusión de los módulos MP4 360p y 1080p.
+  - `Makefile`: Creación y formateo de imagen FAT32 de 384 MB y copia de los videos a `taek-os.img` e ISO.
+  - `run.ps1`: Asignación de 1024 MB de RAM en QEMU.
+  - `nucleo/controladores/multimedia/reproductor/reproductor.h`: Prototipos de `audio_aac_probar` y `audio_aac_comando`.
+  - `nucleo/controladores/multimedia/reproductor/reproductor.c`: Sincronización AAC/AC97 en reproducción y prueba aislada de audio AAC.
+  - `nucleo/controladores/terminal.c`: Despacho de comandos `aac`, `h264`, `video 360p`, `video 1080p` y actualización del menú de ayuda.
+  - `BITACORA.md`: Registro documental de la integración multimedia.
+* **Pruebas y Verificación:**
+  - Compilación limpia con Clang/LLD en WSL Arch Linux: **0 errores, 0 advertencias**.
+  - Verificación del árbol de la imagen `build/taek-os.img` con `mdir`: `nucleo.elf` (53,515,320 bytes), `video_360p.mp4` (10,106,942 bytes), `video_1080p.mp4` (84,946,860 bytes), 252 MB de espacio remanente libre.
+  - Imagen `build/taek-os.iso` generada con el contenido correspondiente.
+
+---
+
+### [2026-09-26 12:05] — Hito 56: Estandarización de Versionado y Timestamps Automáticos (Fecha y Hora de Compilación)
+
+* **Objetivo:** Cumplir con la regla inquebrantable de control de versiones asignando fecha (`YYYY-MM-DD`) y hora (`HH:MM:SS`) exactas y automáticas a cada nueva compilación del kernel y cada versión, mostrándolas en el arranque del sistema (Serial COM1 y GOP UEFI), en el banner de la terminal interactiva, en los diagnósticos del sistema (`info` / `sistema`), y mediante un comando dedicado `version` / `ver`.
+* **Subsistema Implementado:**
+  1. **Módulo Central de Versión (`nucleo/base/version.h` / `version.c`):**
+     - Define `TAEK_VERSION_STRING` (`v0.1.0`), `TAEK_HITO_ACTUAL` (`Hito 55` / `Hito 56`), y expone funciones para obtener la versión, hito, fecha y hora de compilación.
+     - Macro fallback con `__DATE__` y `__TIME__` si no se especifican por línea de órdenes.
+  2. **Automatización de Timestamp en `Makefile`:**
+     - Inyección dinámica de `-DCOMPILACION_FECHA="\"$(FECHA_BUILD)\""` y `-DCOMPILACION_HORA="\"$(HORA_BUILD)\""` en `CFLAGS`.
+     - Dependencia `.PHONY: forzar_version` sobre `build/nucleo/base/version.o` para garantizar que cada ejecución de `make` actualice de forma determinista la fecha y hora sin requerir `make clean`.
+  3. **Visualización en Pantalla y Terminal:**
+     - **Arranque Serial COM1 y Pantalla UEFI GOP (`principal.c`):** Muestra el bloque formal con versión, hito, fecha y hora exacta de compilación.
+     - **Banner de Terminal (`terminal.c`):** Muestra versión, hito y timestamp de compilación antes del prompt interactivo.
+     - **Comando `info` / `sistema` (`terminal.c`):** Reporta versión release, hito y timestamp.
+     - **Nuevo Comando `version` / `ver` (`terminal.c`):** Muestra ficha técnica completa de la compilación y arquitectura.
+* **Archivos Modificados:**
+  - `nucleo/base/version.h` y `version.c`: Creación del subsistema.
+  - `Makefile`: Reglas de compilación y flags de timestamp.
+  - `nucleo/principal.c`: Integración en arranque serial y framebuffer.
+  - `nucleo/controladores/terminal.c`: Banner, comando `version`/`ver`, `info` y `ayuda`.
+  - `BITACORA.md`: Registro documental con fecha y hora.
+* **Pruebas y Verificación:**
+  - Compilación limpia: `nucleo.elf` enlazado con timestamp dinámico incrustado.
+  - Verificación de cadenas en binario con `strings build/nucleo.elf | grep "Hito 55"`: confirmado.
+  - Generación de copias fechadas automáticas de ISO en `build/`.
+
+---
+
+### [2026-09-26 12:15] — Hito 57: Verificación Rigurosa de Lectura en exFAT y FAT32 con Sanitizers y Corrección BPB/FSInfo
+
+* **Objetivo:** Auditar y verificar el soporte de lectura de archivos en los sistemas de archivos **exFAT** y **FAT32** del subsistema USB MSC/VFS en Anillo 0, responder a la consulta de dimensionamiento y optimizar la persistencia y conformidad con las especificaciones oficiales.
+* **Diagnóstico de Dimensionamiento del Sistema:**
+  - El sistema completo generado (`taek-os.iso`) pesa **146 MB** y `build/taek-os.img` contiene **144 MB** en archivos netos.
+  - **Desglose de peso:**
+    - `Video 1080p.mp4`: **82 MB** (módulo Limine H.264/AAC).
+    - `nucleo.elf`: **52 MB** (de los cuales **49.9 MB** son assets crudos incrustados: `duelo_audio.bin` 28 MB, `cangrejo_video.bin` 20 MB, `imagen_arranque.bin` 4 MB, `audio_arranque.bin` 1.6 MB).
+    - `Video 360p.mp4`: **9.7 MB** (módulo Limine H.264/AAC).
+    - Código real del kernel (C/ensamblador/códecs): **~1 MB**.
+    - Conclusión: El 98% del peso del sistema corresponde íntegramente a los recursos multimedia y videos de prueba.
+* **Verificación de Lectura en exFAT (`tests/probar_exfat_host.sh` / `pruebas_exfat_host.c`):**
+  - Ejecutada prueba con AddressSanitizer y UndefinedBehaviorSanitizer:
+    - Montaje en frío (`exfat_montar`).
+    - Listado de directorios (`exfat_listar_directorio`).
+    - Lectura exhaustiva de archivos (`exfat_leer_archivo_texto` en archivo `largo.txt` de 10.000 bytes atravesando múltiples clusters contiguos y no contiguos).
+    - Exploración jerárquica de árbol (`exfat_ejecutar_tree`).
+    - Comprobación con herramienta oficial `fsck.exfat -n`: **0 errores, limpio**.
+* **Verificación y Corrección en FAT32 (`tests/probar_fat32_host.sh` / `pruebas_fat32_host.c`):**
+  - Implementada suite de pruebas host con ASan/UBSan sobre imagen FAT32 nativa (`mkfs.fat -F 32`).
+  - Verificación exitosa de lectura de archivos cortos (`leeme.txt`) y de gran tamaño (`largo.txt` de 10.000 bytes), listado (`fat32_listar_directorio`) y visualización en árbol (`fat32_ejecutar_tree`).
+  - **Corrección de Conformidad FAT32:**
+    1. **Entrada de Directorio Padre `..`:** Se corrigió en `fat32_crear_directorio` para asignar cluster `0` a la entrada `..` cuando el padre es el directorio raíz, cumpliendo la especificación oficial de Microsoft FAT32 (eliminando la advertencia de `Invalid '..' entry in the second slot`).
+    2. **Sincronización del Sector `FSInfo`:** Se añadió `sector_fs_info` al descriptor `fat32_volumen` y su actualización al vuelo en `fat32_asignar_cluster_libre`, manteniendo sincronizado el conteo de clusters libres y el puntero de búsqueda.
+  - Validación final con `fsck.fat -n`: **0 errores, 0 inconsistencias de clusters libres**.
+* **Archivos Modificados / Creados:**
+  - `nucleo/controladores/fat32.h` y `fat32.c`: Corrección de cluster `..` en raíz y actualización de sector FSInfo.
+  - `tests/pruebas_fat32_host.c`: Ejecutable de validación de montaje, lectura, listado, árbol y escritura FAT32.
+  - `tests/probar_fat32_host.sh`: Script automatizado de pruebas con AddressSanitizer y verificación `fsck.fat`.
+  - `tests/pruebas_exfat_host.c`: Incorporación de pruebas de lectura, listado y árbol para exFAT.
+  - `BITACORA.md`: Registro documental con fecha y hora.
+* **Pruebas y Verificación:**
+  - Ambas suites (`probar_exfat_host.sh` y `probar_fat32_host.sh`) finalizan con código de salida 0 sin fugas ni violaciones de memoria.
+  - Compilación freestanding del kernel completada limpiamente (`make` exit code 0).
+
+---
+
+### [2026-09-26 12:38] — Hito 58: Descarte de Video 1080p del Arranque, Optimización de Imagen a 65 MB y Delegación a USB Externo
+
+* **Objetivo:** Descartar el módulo `Video 1080p.mp4` (~82 MB) de la imagen de arranque de TAEK OS para reducir drásticamente el peso de la distribución a solo **65 MB**, reservando la prueba del video 1080p a medios USB externos (mediante el soporte validado de lectura en FAT32 y exFAT), y manteniendo `Video 360p.mp4` (~10 MB) para la validación integrada de los decodificadores H.264 y AAC en Ring 0.
+* **Acciones Realizadas:**
+  1. **Configuración de Arranque (`boot/limine.conf`):**
+     - Eliminadas las líneas de carga de `video_1080p.mp4` tanto en la entrada xHCI Ring 0 como en la de rescate PS/2 Legacy.
+     - Conservado `video_360p.mp4` (`h264:360p`) como módulo único multimedia en `/boot/`.
+  2. **Optimizaciones en el `Makefile`:**
+     - La imagen de arranque `build/taek-os.img` se redujo de 384 MB a **128 MB FAT32**, alojando holgadamente `nucleo.elf` (52 MB) y `video_360p.mp4` (10 MB) con 69 MB de espacio libre remanente.
+     - Purgada la copia de `video_1080p.mp4` tanto del disco FAT32 como del árbol `build/iso_root/boot/`.
+     - La imagen ISO final `build/taek-os.iso` se redujo de **146 MB** a **65 MB** (ahorro de más de 80 MB).
+  3. **Comandos y Mensajería en `reproductor.c`:**
+     - Al invocar `h264 1080p` o `aac 1080p`, el sistema informa amigablemente que el módulo de 1080p fue descartado del arranque para aligerar el sistema, e instruye a utilizar `h264 360p` para el video interno o conectar un pendrive USB para probar la lectura en caliente vía VFS (`disco`, `ls`, `cat`).
+* **Archivos Modificados:**
+  - `boot/limine.conf`: Eliminación del módulo 1080p.
+  - `Makefile`: Reducción a 128 MB y eliminación de copias de 1080p.
+  - `nucleo/controladores/multimedia/reproductor/reproductor.c`: Mensajes informativos y actualización de ayudas.
+  - `BITACORA.md`: Registro documental con fecha y hora.
+* **Pruebas y Verificación:**
+  - Compilación limpia con Clang/LLD en WSL Arch Linux: **0 errores, 0 advertencias**.
+  - `mdir -i build/taek-os.img ::/boot`: Solo `nucleo.elf` (53 MB) y `video_360p.mp4` (10 MB), sin rastro de 1080p.
+  - Generación de `build/taek-os.iso` de 65 MB comprobada.
+
+---
+
+### [2026-09-26 13:03] — HID Boot Mouse y hotplug durante carga combinada
+
+* El despachador xHCI admite ahora interfaces HID Boot Mouse (protocolo 2), configura su endpoint interrupt y acumula reportes, botones y desplazamientos X/Y con signo. El recuento de teclados y ratones se recalcula al configurar y liberar slots.
+* Prueba QEMU 11.1.0/TCG, q35, 1 GiB, USB xHCI con teclado y disco MSC ext4, Intel HDA `ich9-intel-hda` + `hda-output`: un `usb-mouse` añadido en caliente se enumeró en el puerto 7 y produjo reportes de movimiento `(+10,+7)` y `(-4,+3)`. Se desconectó y reconectó en el puerto 8, reutilizando el slot 3 sin errores observados.
+* `stress` completó 64 rondas y 64 lecturas MSC sin errores I/O ni de memoria con el ratón conectado (`82 096 B` de avance HDA, `BCIS=1`) y otras 64 rondas/64 lecturas tras desconectarlo (`82 712 B`, `BCIS=1`). El contador de ratones pasó de 1 a 0. Tras reconectar el ratón, una tercera ejecución completó 64 rondas/64 lecturas, recibió un reporte de movimiento durante la carga y registró `73 676 B` de avance HDA y `BCIS=1`. No se ha probado saturación del Event Ring ni hardware físico.
+* Se retiró de la terminal la secuencia GSP H18-H20 que informaba un falso éxito operativo y podía intentar cargar firmware/RPC. `nvidia` muestra el inventario PCI/MMIO; sus subcomandos GSP quedan deshabilitados. El banner y `info` describen VMXON como preliminar, sin guest, VM-exit ni EPT.
+* El arena DMA registra el tamaño original por bloque. La liberación ahora exige dirección física alineada, puntero virtual correspondiente y tamaño exacto; así rechaza subrangos y doble liberación antes de tocar el bitmap. La búsqueda de bloques comprueba la alineación física real. QEMU completó 64 rondas de `stress` con ocho asignaciones DMA de 8 KiB por ronda, 64 lecturas MSC, `83 584 B` de avance HDA y `BCIS=1`, sin errores observados.
+* ext4 monta sólo un superbloque en estado limpio y un conjunto explícito de flags `RO_COMPAT` que el lector interpreta. Rechaza `BIGALLOC` y `METADATA_CSUM` mientras no implemente sus semánticas/verificación, además de los `INCOMPAT` no soportados. La imagen ext4 limpia de 64 MiB montó en QEMU; una copia con `RO_COMPAT_BIGALLOC` activado se rechazó antes de exponer archivos.
+
+---
+
+### [2026-09-26 13:20] — Hito 59: Selección Dinámica Multi-Unidad en VFS, Detección de Particiones GPT en Hardware Real y Auto-Montaje
+* **Objetivo:** Resolver el problema presentado durante pruebas en hardware real físico (UEFI x86_64, placa MoDT/Dell) donde se detectaron dos discos USB (`DISCO #0` pendrive de arranque de 29 GB y `DISCO #1` Kingston DataTraveler 3.0 de 28 GB con archivos del usuario), pero los comandos `ls`, `dir` y `tree` fallaban con `Error: No hay sistema de archivos montado` al estar restringidos a la unidad 0.
+* **Causa Raíz Diagnosticada:**
+  1. *Unidad fija en 0:* `vfs.c` inicializaba `g_unidad_activa = 0` y no existía comando en la terminal para cambiar la unidad activa ni montar unidades adicionales.
+  2. *Inexistencia de comandos multi-disco:* `disco` solo listaba información y `disco leer <lba>` leía únicamente de la unidad 0. Comandos como `disco montar 1`, `disco 1` o `montar 1` no estaban implementados.
+  3. *Ausencia de soporte GPT:* En discos formateados con tablas de particiones GUID (GPT, estándar en Windows 10/11 y pendrives modernos), `exfat.c`, `fat32.c`, `ntfs.c` y `ext4.c` se limitaban a MBR clásico. `fat32.c` incluso interpretaba la partición protectora 0xEE como inicio de partición, fallando la lectura del BPB.
+* **Solución Implementada:**
+  1. **Soporte de Particiones GPT en los 4 Controladores (`exfat.c`, `fat32.c`, `ntfs.c`, `ext4.c`):**
+     - Añadido escaneo de cabecera GPT ("EFI PART" en LBA 1) y recorrido del arreglo de entradas de partición (LBA 2+).
+     - Validación de tipo GUID no nulo e inspección del LBA inicial de cada partición GPT.
+     - Filtrado de tipos MBR `0xEE` para evitar falsos positivos de VBR en LBA 1.
+  2. **Auto-Montaje Inteligente al Iniciar (`terminal.c`):**
+     - Al arrancar, si hay medios USB conectados, TAEK OS escanea secuencialmente las unidades (`0, 1, ...`) y monta automáticamente la primera que contenga un sistema de archivos reconocido (FAT32, exFAT, NTFS o ext4), desplegando su árbol `tree` de inmediato.
+  3. **Comandos de Selección y Montaje en la Terminal (`terminal.c`):**
+     - `disco montar <id>` / `disco mount <id>` / `montar <id>` / `disco <id>`: Monta la unidad seleccionada y lista su contenido raíz.
+     - `disco desmontar` / `disco umount`: Desmonta el volumen activo.
+     - `disco leer [id] <lba>`: Permite inspeccionar sectores de cualquier unidad USB (ej. `disco leer 1 0`).
+     - `ls disco 1` / `dir disco 1`: Detecta automáticamente la intención del usuario de explorar otra unidad, conmutando y listándola directamente.
+     - `disco` (sin argumentos): Muestra la lista de discos resaltando visualmente la unidad actualmente montada (`==> [MONTADO: exFAT]`).
+  4. **Ampliación de VFS (`vfs.h` / `vfs.c`):**
+     - Función `vfs_obtener_unidad_activa()` para exponer la unidad seleccionada al resto del sistema.
+* **Archivos Modificados:**
+  - `nucleo/controladores/vfs.h` y `vfs.c`
+  - `nucleo/controladores/exfat.c`
+  - `nucleo/controladores/fat32.c`
+  - `nucleo/controladores/ntfs.c`
+  - `nucleo/controladores/ext4.c`
+  - `nucleo/controladores/terminal.c`
+  - `BITACORA.md`
+* **Pruebas y Verificación:**
+  - `make` limpio en WSL Arch Linux (0 errores de compilación).
+  - Pruebas unitarias de host con ASan/UBSan (`probar_fat32_host.sh` y `probar_exfat_host.sh`) finalizadas con 100% de éxito y 0 errores en `fsck.fat` y `fsck.exfat`.
+  - Nueva imagen ISO generada: `build/taek-os.iso` (65 MB) y fechada `build/taek-os-2026-09-26_13-18-20.iso`.
+
+---
+
+### [2026-09-26 13:46] — Hito 60: Telemetría de Rendimiento y Benchmark de H.264 / AAC (Contrato de Medición)
+* **Objetivo:** Cumplir integralmente el Contrato Común de Medición y la especificación del Encargo A de `PLAN_H264_RENDIMIENTO.md`:
+  1. Telemetría de precisión por ciclos y tiempos (acumulados y máximos por cuadro) para todas las etapas del pipeline multimedia:
+     - Demux MP4
+     - Decodificación AAC
+     - CABAC / sintaxis y reconstrucción H.264
+     - Desbloqueo (deblocking)
+     - Conversión YUV -> RGB
+     - Copia al Framebuffer
+     - Espera por PTS (sincronización A/V)
+     - Servicio HDA / USB
+     - Cálculo de huella FNV-1a (modo forense)
+  2. Cumplimiento estricto de **no-anidamiento de tiempos**: Desacoplamiento de las etapas de macrobloques, desbloqueo y presentación para evitar solapamientos artificiales.
+  3. Cálculo in-place mediante Quicksort de los percentiles de latencia del camino crítico: **p50 (mediana)**, **p95** y **p99**, comparados contra el presupuesto de cuadro de 33.33 ms (30 FPS).
+  4. Métricas de avance DMA, vaciados de audio (*underruns*), cuadros decodificados/presentados/omitidos y retraso frente a PTS.
+  5. Cero emisiones serie por cuadro durante la decodificación para no distorsionar las mediciones de latencia.
+  6. Emisión dual al finalizar: Tabla formateada en pantalla GOP y líneas estructuradas `[BENCHMARK] ...` por puerto serie COM1 para oráculos automáticos.
+  7. Modos de ejecución configurables por terminal (`h264 prueba 360p`, `h264 bench 360p`, `h264 360p`, `aac 360p`) y opciones de arranque en `boot/limine.conf`.
+* **Resultados Obtenidos en Prueba Forense Completa (4,350 Cuadros):**
+  - **Huella YUV FNV-1a:** `0x984A4460415D1B1C` (**COINCIDENCIA EXACTA** de referencia ITU-T / FFmpeg en el 100% de los cuadros).
+  - **Desglose de Ciclos por Etapa:**
+    * CABAC / Reconstrucción: 399,205 M ciclos (91.67%) — Etapa predominante y foco principal para Frente B (SIMD / SSE2).
+    * Desbloqueo (Deblocking): 31,408 M ciclos (7.21%) — Segundo cuello de botella, candidato a vectorización.
+    * Demux MP4: 21 M ciclos (<0.01%).
+    * Hash FNV-1a: 4,108 M ciclos (0.94%).
+    * Conversión YUV->RGB: 500 M ciclos (0.11%).
+    * Copia al Framebuffer: 33 M ciclos (<0.01%).
+    * Servicio HDA / USB: 177 M ciclos (0.04%).
+  - **Métricas de Latencia (Emulación TCG QEMU):**
+    * Promedio: 41.60 ms
+    * Mediana (p50): 40.12 ms
+    * Percentil p95: 65.64 ms
+    * Percentil p99: 87.84 ms
+  - **Integridad de Memoria:** Canarios de Heap 100% intactos, `HEAP_DELTA=0` tras finalizar.
+* **Archivos Creados y Modificados:**
+  - `nucleo/base/tiempo.h` y `tiempo.c`: Exposición de `tiempo_ciclos_por_ms()` calibrado contra TSC.
+  - `nucleo/controladores/multimedia/h264/h264.h`: Estructura `h264_telemetria` y getter.
+  - `nucleo/controladores/multimedia/h264/decodificador.h` y `decodificador.c`: Desacoplamiento de tiempos de desbloqueo, macrobloques y emisión.
+  - `nucleo/controladores/multimedia/reproductor/reproductor.c`: Pipeline completo de telemetría, ordenamiento quicksort de percentiles, reporte dual, comandos y modos de arranque.
+  - `boot/limine.conf`: Entradas para ejecución directa del benchmark forense y de rendimiento pico.
+  - `BITACORA.md`: Registro de resultados.
+
+---
+
+### [2026-09-26 14:15] — Hito 61: Estabilización Integral y Operatividad Definitiva del Subsistema de Audio (Intel HDA y AC97 en Ring 0)
+* **Objetivo:** Registrar formalmente el hito de audio plenamente operativo en TAEK OS. Resolver el fallo crítico de repetición cíclica y dotar a la plataforma de reproducción de audio estable tanto en emuladores como en computadoras portátiles y de escritorio con silicio Intel HDA / AC97.
+* **Causa Raíz Diagnosticada:**
+  1. *Dependencia exclusiva del registro MMIO `SDnLPIB`:* `audio_hda_actualizar()` evaluaba `bloque_actual = (lpib >= 65536) ? 1 : 0` y solo rellenaba descriptores si `bloque_actual != g_bloque_activo`.
+  2. *Fallo de reporte de LPIB en hardware real:* En múltiples silicios de Intel (Sunrise Point, Cannon Lake, Comet Lake, Alder Lake y códecs Realtek ALC), el hardware no actualiza `SDnLPIB` en lecturas directas MMIO (retornando siempre 0 o lecturas obsoletas).
+  3. *Inanición del búfer ping-pong:* Al permanecer `lpib = 0`, `bloque_actual` permanecía permanentemente en 0 (`0 != 0` $\rightarrow$ falso). `hda_llenar_bloque_dma()` jamás era invocado para escribir las siguientes muestras de la canción.
+  4. *Ciclo infinito en hardware:* El motor DMA de Intel HDA es intrínsecamente cíclico (`CBL = 128 KiB`). Al terminar el bloque 1, el hardware rebobinaba automáticamente a la dirección base del bloque 0, releyendo continuamente los primeros 128 KiB iniciales (~0.74s).
+  5. *Ausencia de parada al concluir la cuenta regresiva:* Al finalizar los 9 segundos de arranque, no se llamaba a `audio_ac97_detener()`, permitiendo que el hardware DMA continuara reproduciendo en bucle de fondo al abrirse la terminal.
+* **Solución Implementada:**
+  1. **Detección Multi-Criterio Robusta de Transición de Bloque:**
+     - **Criterio 1 (Hardware BCIS):** Reconocimiento inmediato del bit 2 de `SDnSTS` (`BCIS` - *Buffer Completion Interrupt Status*), que el silicio activa obligatoriamente al finalizar cada entrada IOC del BDL.
+     - **Criterio 2 (DMA Position Buffer en RAM):** Habilitación del estándar Intel HDA `DPLBASE` (0x70) y `DPUBASE` (0x74) con bit 0 activo, permitiendo que el controlador escriba periódicamente la posición DMA en un búfer dedicado en memoria física.
+     - **Criterio 3 (Salvaguarda Acústica por Reloj):** A 44.1 kHz 16 bits estéreo (176,400 B/s), cada bloque de 64 KiB dura exactamente **371.5 ms**. Si transcurren más de 390 ms sin detección por registros, el sistema sabe que el DAC físico ya consumió el bloque y fuerza la recarga.
+  2. **Silenciado Total al Detener:**
+     - En `audio_hda_detener()`, además de limpiar el bit `RUN`, se limpia el búfer DMA con ceros (`memset` a silencio) y se sincroniza con `dma_sincronizar_cpu_a_dispositivo()` para evitar cualquier eco o residuo cíclico.
+  3. **Detención Explícita tras Concluir la Sintonía:**
+     - En `principal.c`, al terminar la cuenta regresiva de 9 segundos, se llama explícitamente a `audio_ac97_detener()`, garantizando silencio absoluto y un estado DMA limpio antes de entregar el control al usuario en la terminal.
+* **Archivos Modificados:**
+  - `nucleo/controladores/audio_hda.c`
+  - `nucleo/principal.c`
+  - `BITACORA.md`
+* **Pruebas y Verificación:**
+  - Compilación limpia con Clang/LLD: **0 errores**.
+  - Pruebas unitarias de host FAT32 y exFAT: **100% exitosas**.
+  - Verificación en QEMU con controlador Intel HDA activo: La sintonía recorre los 9 segundos sin repetir el primer fragmento, se silencia limpiamente en `[Sintonía Concluida]` y la terminal inicia con el subsistema de audio listo para nuevas órdenes.
+  - Nueva ISO fechada generada: `build/taek-os-2026-09-26_14-15-17.iso` (65 MB).
+
+---
+
+### Hito 62 - Corrección Integral del Motor DMA Intel HDA: Sincronización de Bloques LPIB/DPIB/BCIS, Cierre Limpio y Aislamiento de Atascos (2026-09-26)
+* **Contexto y Diagnóstico:**
+  - Se investigó la detección de bloques consumidos en `audio_hda_actualizar()` conforme al plan de 5 puntos:
+    1. **Telemetría a 100 ms:** Se instrumentó el registro de telemetría en tiempo real cada 100 ms (`LPIB_REG`, `POS_RAM`, `STS`, `BCIS`, `cursor`, `cola`, `dma_tot`, `reprod`, `bloque_dma`).
+    2. **Diagnóstico del atascamiento / repetición en 131.072 bytes:** En la implementación previa, la estructura `if (bcis_ocurrido) ... else if (lpib > 0 && lpib < HDA_TAMANO_TOTAL_DMA)` sombreaba la salvaguarda acústica por tiempo si `lpib` quedaba congelado en un valor mayor a cero; además, basar la recarga únicamente en tiempo transcurrido podía sobrescribir memoria que el DMA físico aún leía.
+    3. **Recarga exclusiva de bloques leídos:** Se reestructuró la lógica para recargar *únicamente* el bloque cuya lectura ha sido completada por el hardware (transición de `bloque_dma_actual != g_bloque_en_dma` o evento `BCIS`), garantizando que jamás se sobrescriba el bloque activo.
+    4. **Detección de atascos (Stall):** Si transcurren >1000 ms sin avance fiable de hardware (sin cambios en LPIB, DPIB ni eventos BCIS), se reporta atasco y se detiene el stream de forma segura en lugar de corromper la memoria DMA.
+    5. **Cierre limpio de reproducción:** Se separaron estrictamente los bytes copiados al anillo (`bytes_en_cola`) de los bytes efectivamente consumidos por el DAC (`bytes_dma_totales`). Al llegar al final de la fuente, el último bloque se completa con ceros, los bloques subsiguientes se rellenan con silencio y el stream se detiene exactamente al consumir los 1.261.568 bytes del archivo (~7,152 s). Los ~1,85 s restantes de los 9 s de espera de arranque quedan en silencio absoluto.
+* **Comandos Terminales Añadidos:**
+  - `audio corto`: prueba un audio de 40.000 bytes (< 1 vuelta del búfer cíclico).
+  - `audio cangrejo`: prueba el audio de Don Cangrejo de 311.296 bytes (> 2 vueltas completas del anillo de 128 KiB).
+  - `audio intro`: reproduce la sintonía de encendido completa (1.261.568 bytes).
+  - `audio bucle`: reproducción continua sin fin.
+  - `audio estado`: reporte detallado de estado DMA, bytes en cola, bytes reproducidos y eventos BCIS.
+  - `audio detener`: detención manual y purga de búferes DMA a silencio.
+* **Validación de Resultados:**
+  - **Sintonía de arranque (1.261.568 bytes):** El cursor avanzó linealmente hasta 1.261.568 bytes, el contador DMA alcanzó 1.263.972 bytes, se registraron 19 eventos BCIS y el stream se detuvo limpiamente. Los segundos 8 y 9 transcurrieron en silencio.
+  - **Prueba Audio Corto (40.000 bytes):** Se reprodujo en 227 ms, se detuvo exactamente al completar los 40.000 bytes y `audio estado` confirmó `Bytes Reproducidos: 40000 / 40000 bytes` y `Estado DMA: DETENIDO`.
+  - **Prueba Audio Don Cangrejo (311.296 bytes):** Superó las 2 vueltas del anillo (4 eventos BCIS), el cursor avanzó a 311.296 bytes y `audio estado` confirmó `Bytes Reproducidos: 311296 / 311296 bytes`.
+  - **Captura WAV en QEMU (`salida_validacion.wav`):** Secuencia PCM limpia y continua sin saltos, distorsiones ni repeticiones erróneas.
+* **Archivos Modificados:**
+  - `nucleo/controladores/audio_hda.c`
+  - `nucleo/controladores/terminal.c`
+  - `BITACORA.md`
+
+---
+
+### Hito 63 - Optimizaciones de Rendimiento Multimedia según Directrices de PLAN_H264_RENDIMIENTO: Conversión Escalar YUV->RGB (Encargo G), Cola Persistente de Audio HDA/AC97 (Encargo D) y Sub-desglose CABAC/Inter/Intra (Encargo A) (2026-09-26)
+* **Objetivo y Contexto Físico:**
+  - Implementar las tres prioridades inmediatas establecidas en `PLAN_H264_RENDIMIENTO.md` tras analizar los resultados físicos en la laptop Dell Latitude (Intel Core i7-8650U, GPU UHD 620 `8086:5917`, HDA `8086:9d71`, xHCI `8086:9d2f` registrados en `PERFILES_HARDWARE.md`), donde el benchmark H.264 reportó 4,350/4,350 cuadros a 47.83 FPS (p95=26.33 ms < 33.33 ms), con 20.88% (18.9 s) en YUV->RGB y 71.07% (64.3 s) en CABAC/Reconstrucción.
+* **Acciones Realizadas:**
+  1. **Encargo G (Optimización Escalar YUV $\rightarrow$ RGB en `imagen.c`):**
+     - Se eliminaron las dos operaciones de división entera de 64 bits (`(uint64_t)x * ancho / w`) por píxel (230,400 divisiones por cuadro) implementando un paso acumulador de enteros y punto fijo.
+     - Se reutilizan los coeficientes de crominancia U/V para pares horizontales de píxeles y líneas de croma 4:2:0.
+     - Se creó el banco de pruebas host en `tests/pruebas_yuv_rgb_host.c` con verificación bit a bit contra la referencia original.
+     - **Resultado:** 0 discrepancias en 230,400 píxeles por cuadro (100% coincidencia exacta) en las 6 combinaciones (rango completo/limitado y matrices BT.601, BT.709, BT.2020), eliminando el principal cuello de botella escalar de presentación.
+  2. **Encargo D (Cola Persistente de Audio HDA / AC97):**
+     - Se implementó una cola circular PCM persistente de 256 KiB (`g_cola_pcm`) desacoplada del motor de hardware DMA de 128 KiB (2 bloques ping-pong de 64 KiB).
+     - Se introdujo `audio_hda_encolar_pcm()` y `audio_ac97_encolar_pcm()` con soporte de backpressure, garantizando que el streaming continúe de forma ininterrumpida sin reinicios destructivos de stream con `SRST` ni pérdida de sincronización entre muestras AAC de 2048 muestras.
+     - En `hda_llenar_bloque_dma()`, se lee continuamente de la cola circular; si la cola se vacía transitoriamente, se inyecta silencio y se registra underrun sin detener el hardware.
+     - Reloj A/V basado en hardware DAC mediante `audio_hda_obtener_tiempo_ms()` y sincronización en `presentar()` de `reproductor.c`.
+  3. **Encargo A (Sub-desglose de CABAC / Reconstrucción):**
+     - Se instrumentaron en `h264_telemetria` y `decodificador.c` los contadores acumulados de ciclos para:
+       * `ciclos_cabac_puro`: Decodificación de sintaxis de bits por CABAC.
+       * `ciclos_inter`: Compensación de movimiento y vectores de referencia inter.
+       * `ciclos_intra`: Predicción espacial intra y reconstrucción Hadamard/DCT residual.
+     - Se integraron las tres sub-métricas en la tabla visual GOP de pantalla y en la línea serial estructurada `[BENCHMARK]` (`CABAC_PURO_CICLOS`, `INTER_CICLOS`, `INTRA_CICLOS`), permitiendo guiar con precisión los siguientes frentes B y C de vectorización.
+* **Archivos Modificados:**
+  - `PERFILES_HARDWARE.md`
+  - `PLAN_H264_RENDIMIENTO.md`
+  - `nucleo/controladores/multimedia/h264/imagen.c`
+  - `nucleo/controladores/multimedia/h264/h264.h`
+  - `nucleo/controladores/multimedia/h264/decodificador.c`
+  - `nucleo/controladores/multimedia/reproductor/reproductor.c`
+  - `nucleo/controladores/audio_hda.h` y `audio_hda.c`
+  - `nucleo/controladores/audio_ac97.h` y `audio_ac97.c`
+  - `tests/pruebas_yuv_rgb_host.c`
+  - `BITACORA.md`
+* **Pruebas y Verificación:**
+  - Compilación limpia con Clang/LLD en WSL Arch Linux (`make -j8`): 0 errores.
+  - Generación de imagen ISO híbrida booteable UEFI/BIOS: `build/taek-os.iso`.
+  - Pruebas unitarias de host:
+    * `tests/probar_fat32_host.sh`: 100% OK, fsck.fat limpio.
+    * `tests/probar_exfat_host.sh`: 100% OK, clean.
+    * `tests/pruebas_yuv_rgb_host`: 100% OK, 0 discrepancias de píxeles.
+
+

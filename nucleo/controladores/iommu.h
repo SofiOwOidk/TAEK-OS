@@ -62,7 +62,7 @@ int  iommu_vt_d_detectado(void);
 // Obtiene el estado actual del controlador IOMMU
 const iommu_estado_t *iommu_obtener_estado(void);
 
-// Autodiagnóstico de IOMMU, validación de permisos DMA para GPU y ausencia de fallos DMAR
+// Telemetría de DMAR/DRHD/RMRR. No configura root/context tables ni aísla DMA.
 int  iommu_ejecutar_autodiagnostico(void);
 
 #endif // CONTROLADORES_IOMMU_H

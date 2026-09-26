@@ -88,6 +88,7 @@ struct fat32_volumen {
     uint32_t bytes_por_cluster;
     uint32_t sectores_por_fat;
     uint32_t cluster_raiz;
+    uint16_t sector_fs_info;
     char     etiqueta[12];
 };
 

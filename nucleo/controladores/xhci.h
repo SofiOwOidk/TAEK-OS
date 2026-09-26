@@ -49,6 +49,7 @@ struct estado_xhci {
     int      puertos_conectados;
     int      teclado_detectado;
     int      teclados_activos;
+    int      ratones_activos;
     uint8_t  teclado_slot_id;
     uint8_t  teclado_ep_dci;
     uint8_t  teclado_num_eps;
@@ -59,6 +60,10 @@ struct estado_xhci {
     uint16_t teclado_id_producto;
     uint64_t paquetes_recibidos;
     uint64_t reportes_hid_recibidos;
+    uint64_t reportes_raton_recibidos;
+    int64_t  movimiento_raton_x;
+    int64_t  movimiento_raton_y;
+    uint8_t  botones_raton;
     uint32_t ultimo_evento_trb_tipo;
     uint8_t  ultimo_caracter;
     uint8_t  etapa_enumeracion;       // 1=slot, 2=address, 3=device desc, 4=config desc, 5=HID, 6=endpoints, 7=recepción

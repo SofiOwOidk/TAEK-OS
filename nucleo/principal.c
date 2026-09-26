@@ -14,6 +14,7 @@
 #include "base/energia.h"
 #include "base/utf8.h"
 #include "base/tiempo.h"
+#include "base/version.h"
 #include "base/memoria.h"
 #include "base/paginacion.h"
 #include "controladores/pantalla.h"
@@ -29,7 +30,7 @@
 #include "controladores/xhci.h"
 #include "controladores/terminal.h"
 #include "controladores/teclado.h"
-#include "controladores/video/h264/reproductor.h"
+#include "controladores/multimedia/reproductor/reproductor.h"
 
 // Revision 3 del protocolo Limine
 __attribute__((used, section(".requests")))
@@ -85,11 +86,15 @@ void principal(void) {
     // 1. Inicializar Serial de inmediato para capturar cualquier mensaje de arranque
     serial_iniciar();
     serial_imprimir_linea("\n==============================================================");
-    serial_imprimir_linea("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Marcha    ");
-#ifdef COMPILACION_FECHA
+    serial_imprimir("  TAEK OS ");
+    serial_imprimir(taek_obtener_version());
+    serial_imprimir(" (");
+    serial_imprimir(taek_obtener_hito());
+    serial_imprimir_linea(") - Anillo 0 en Marcha");
     serial_imprimir("  Compilación: ");
-    serial_imprimir_linea(COMPILACION_FECHA);
-#endif
+    serial_imprimir(taek_obtener_fecha_compilacion());
+    serial_imprimir(" ");
+    serial_imprimir_linea(taek_obtener_hora_compilacion());
     serial_imprimir_linea("==============================================================");
     serial_imprimir("[BOOT] Puerto Serial COM1 (0x3F8): ");
     if (serial_esta_activo()) {
@@ -135,11 +140,15 @@ void principal(void) {
         consola_iniciar();
         consola_limpiar();
         consola_imprimir_linea_color("==============================================================", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea_color("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Marcha    ", COLOR_USUARIO_DEFAULT);
-#ifdef COMPILACION_FECHA
+        consola_imprimir("  TAEK OS ");
+        consola_imprimir(taek_obtener_version());
+        consola_imprimir(" (");
+        consola_imprimir(taek_obtener_hito());
+        consola_imprimir_linea_color(") - Anillo 0 en Marcha", COLOR_USUARIO_DEFAULT);
         consola_imprimir("  Compilación: ");
-        consola_imprimir_linea_color(COMPILACION_FECHA, COLOR_AVISO_DEFAULT);
-#endif
+        consola_imprimir_color(taek_obtener_fecha_compilacion(), COLOR_AVISO_DEFAULT);
+        consola_imprimir(" ");
+        consola_imprimir_linea_color(taek_obtener_hora_compilacion(), COLOR_AVISO_DEFAULT);
         consola_imprimir_linea_color("==============================================================", COLOR_PROMPT_DEFAULT);
     }
 
@@ -242,12 +251,13 @@ void principal(void) {
     serial_imprimir("] ");
     huevo_etapa_ok();
 
-    huevo_etapa("Subsistema Aislado NVIDIA Resource Manager (Core / GSP)");
+    huevo_etapa("Infraestructura PCI/DMA NVIDIA (experimental)");
     nvidia_core_iniciar();
     const struct nvidia_dispositivo *ndev = nvidia_core_obtener_dispositivo();
     serial_imprimir("[Pipeline: ");
     serial_imprimir(ndev->chip_name);
-    serial_imprimir(ndev->presente ? " (Hardware MoDT Activo)" : " (Canal GSP Listo)");
+    serial_imprimir(ndev->presente ? " (Hardware detectado; GSP descontinuado)" :
+                                    " (Sin hardware; GSP descontinuado)");
     serial_imprimir("] ");
     huevo_etapa_ok();
 
@@ -311,12 +321,12 @@ void principal(void) {
         base_virtual = g_peticion_direccion.response->virtual_base;
     }
 
-    huevo_etapa("Inicialización de Hipervisor Ring -1 (Intel VMX)");
+    huevo_etapa("Detección y activación preliminar de Intel VMX");
     if (vmx_iniciar(base_fisica, base_virtual) == 0) {
-        serial_imprimir("[VMX Root Activo - Interceptación Triple Fault Habilitada] ");
+        serial_imprimir("[VMXON activo - Guest y VM-Exit aún sin configurar] ");
         huevo_etapa_ok();
     } else {
-        serial_imprimir("[Guardián de Fallos Activo en Ring 0] ");
+        serial_imprimir("[VMX no disponible; excepciones IDT/TSS en Ring 0] ");
         huevo_etapa_ok();
     }
 
@@ -364,13 +374,14 @@ void principal(void) {
         huevo_verificar();
     }
     serial_imprimir("[Sintonía Concluida] ");
+    audio_ac97_detener();
     huevo_etapa_ok();
 
     serial_imprimir_linea("");
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("  TAEK OS v0.1 (TelAvivEpsteinKirkOS) - Anillo 0 en Español   ");
     serial_imprimir_linea("  Procesador: x86_64 (Intel Core / AMD64 Compatible)          ");
-    serial_imprimir_linea("  ¡Hipervisor VMX y Guardián Don Cangrejo Armados!            ");
+    serial_imprimir_linea("  IDT/TSS activos; VMX guest y EPT pendientes                 ");
     serial_imprimir_linea("==============================================================");
     serial_imprimir_linea("  [ OK ] Todas las etapas verificadas por El Huevo.           ");
     serial_imprimir_linea("  [ OK ] El Huevo sigue 100% INTACTO. Integridad: 100%.       ");

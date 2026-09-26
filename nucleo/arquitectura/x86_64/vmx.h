@@ -6,5 +6,6 @@
 int  vmx_soportado(void);
 int  vmx_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel);
 int  vmx_esta_activo(void);
+int  vmx_intercepcion_triple_fault_disponible(void);
 
 #endif // ARQUITECTURA_X86_64_VMX_H

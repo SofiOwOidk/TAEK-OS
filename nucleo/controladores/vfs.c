@@ -26,6 +26,10 @@ int vfs_esta_montado(void) {
     return (g_tipo_activo != VFS_FS_NINGUNO);
 }
 
+uint8_t vfs_obtener_unidad_activa(void) {
+    return g_unidad_activa;
+}
+
 enum vfs_tipo_fs vfs_obtener_tipo_fs(void) {
     return g_tipo_activo;
 }

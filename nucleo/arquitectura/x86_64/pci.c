@@ -129,13 +129,22 @@ static void pci_sondear_barra(uint8_t bus, uint8_t ranura, uint8_t func, int bar
 
     uint8_t offset = (uint8_t)(0x10 + barra_idx * 4);
     uint32_t orig_lo = pci_leer_config_32(bus, ranura, func, offset);
+    int barra_64 = !(orig_lo & 1) && ((orig_lo >> 1) & 3) == 2 && barra_idx < 5;
+    uint8_t offset_hi = (uint8_t)(offset + 4);
+    uint32_t orig_hi = barra_64 ? pci_leer_config_32(bus, ranura, func, offset_hi) : 0;
+    uint16_t comando = pci_leer_config_16(bus, ranura, func, 0x04);
+    pci_escribir_config_16(bus, ranura, func, 0x04, comando & (uint16_t)~0x0003U);
 
-    // Escribir 0xFFFFFFFF para descubrir los bits cableados en el silicio
+    // Un BAR de 64 bits se mide como una sola entidad, con ambas mitades en 1.
     pci_escribir_config_32(bus, ranura, func, offset, 0xFFFFFFFF);
+    if (barra_64) pci_escribir_config_32(bus, ranura, func, offset_hi, 0xFFFFFFFF);
     uint32_t mask_lo = pci_leer_config_32(bus, ranura, func, offset);
-    pci_escribir_config_32(bus, ranura, func, offset, orig_lo); // Restaurar inmediatamente
+    uint32_t mask_hi = barra_64 ? pci_leer_config_32(bus, ranura, func, offset_hi) : 0;
+    if (barra_64) pci_escribir_config_32(bus, ranura, func, offset_hi, orig_hi);
+    pci_escribir_config_32(bus, ranura, func, offset, orig_lo);
 
     if (mask_lo == 0 || mask_lo == 0xFFFFFFFF) {
+        pci_escribir_config_16(bus, ranura, func, 0x04, comando);
         return; // Barra no implementada
     }
 
@@ -145,40 +154,34 @@ static void pci_sondear_barra(uint8_t bus, uint8_t ranura, uint8_t func, int bar
         barra->dir_base = orig_lo & ~0x3;
         uint32_t tam    = ~(mask_lo & ~0x3) + 1;
         barra->tamano   = tam;
-        barra->valida   = 1;
+        barra->valida   = (tam != 0 && (tam & (tam - 1)) == 0);
     } else {
         // Espacio de Memoria Física (MMIO)
         barra->es_io      = 0;
         barra->predecible = (orig_lo & 0x08) ? 1 : 0;
         uint8_t tipo      = (orig_lo >> 1) & 0x03;
 
-        if (tipo == 0x02 && barra_idx < 5) {
+        if (barra_64) {
             // BAR de 64 bits (consume barra_idx y barra_idx + 1)
             *es_64           = 1;
             barra->es_64bits = 1;
-            uint8_t offset_hi = (uint8_t)(0x10 + (barra_idx + 1) * 4);
-            uint32_t orig_hi  = pci_leer_config_32(bus, ranura, func, offset_hi);
-
-            pci_escribir_config_32(bus, ranura, func, offset_hi, 0xFFFFFFFF);
-            uint32_t mask_hi = pci_leer_config_32(bus, ranura, func, offset_hi);
-            pci_escribir_config_32(bus, ranura, func, offset_hi, orig_hi);
-
             uint64_t base64 = ((uint64_t)orig_hi << 32) | (orig_lo & ~0xF);
             uint64_t mask64 = ((uint64_t)mask_hi << 32) | (mask_lo & ~0xF);
             uint64_t tam64  = ~mask64 + 1;
 
             barra->dir_base = base64;
             barra->tamano   = tam64;
-            barra->valida   = 1;
+            barra->valida   = (tam64 != 0 && (tam64 & (tam64 - 1)) == 0);
         } else {
             // BAR de 32 bits
             barra->es_64bits = 0;
             barra->dir_base  = orig_lo & ~0xF;
             uint32_t tam     = ~(mask_lo & ~0xF) + 1;
             barra->tamano    = tam;
-            barra->valida    = 1;
+            barra->valida    = (tipo == 0 && tam != 0 && (tam & (tam - 1)) == 0);
         }
     }
+    pci_escribir_config_16(bus, ranura, func, 0x04, comando);
 }
 
 void pci_iniciar(void) {

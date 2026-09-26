@@ -6,7 +6,7 @@
 
 // ============================================================================
 // TAEK OS - CONTROLADOR DE SISTEMA DE ARCHIVOS EXT4 (Hito 51)
-// Arquitectura Anillo 0 en Español (Lectura y Escritura)
+// Arquitectura Anillo 0 en Español (lectura; escritura deshabilitada)
 // ============================================================================
 
 static struct ext4_volumen g_volumen = {0};
@@ -59,16 +59,22 @@ void ext4_desmontar(void) {
 
 // Lee un bloque lógico ext4 del volumen activo
 static int ext4_leer_bloque(uint32_t bloque, void *destino) {
-    if (!g_volumen.montado) return -1;
-    uint32_t lba = g_volumen.lba_inicio_particion + (bloque * g_volumen.sectores_por_bloque);
-    return usb_msc_leer_sectores(g_volumen.unidad_msc, lba, (uint16_t)g_volumen.sectores_por_bloque, destino);
+    if (!g_volumen.montado || !destino || bloque >= g_volumen.total_bloques) return -1;
+    uint64_t lba = (uint64_t)g_volumen.lba_inicio_particion +
+                   (uint64_t)bloque * g_volumen.sectores_por_bloque;
+    if (lba > UINT32_MAX) return -1;
+    return usb_msc_leer_sectores(g_volumen.unidad_msc, (uint32_t)lba,
+                                 (uint16_t)g_volumen.sectores_por_bloque, destino);
 }
 
 // Escribe un bloque lógico ext4 en el volumen activo
 static int ext4_escribir_bloque(uint32_t bloque, const void *origen) {
     if (!g_volumen.montado) return -1;
-    uint32_t lba = g_volumen.lba_inicio_particion + (bloque * g_volumen.sectores_por_bloque);
-    return usb_msc_escribir_sectores(g_volumen.unidad_msc, lba, (uint16_t)g_volumen.sectores_por_bloque, origen);
+    uint64_t lba = (uint64_t)g_volumen.lba_inicio_particion +
+                   (uint64_t)bloque * g_volumen.sectores_por_bloque;
+    if (lba > UINT32_MAX) return -1;
+    return usb_msc_escribir_sectores(g_volumen.unidad_msc, (uint32_t)lba,
+                                     (uint16_t)g_volumen.sectores_por_bloque, origen);
 }
 
 // Lee el descriptor del grupo de bloques especificado
@@ -76,12 +82,15 @@ static int ext4_leer_descriptor_grupo(uint32_t grupo, struct ext4_grupo_descript
     if (!g_volumen.montado || !gd) return -1;
     if (grupo >= g_volumen.total_grupos) return -2;
 
-    uint32_t offset_bytes = grupo * g_volumen.tamano_descriptor_grupo;
-    uint32_t bloque_gdt = (offset_bytes / g_volumen.tamano_bloque);
+    uint64_t offset_bytes = (uint64_t)grupo * g_volumen.tamano_descriptor_grupo;
+    uint64_t bloque_gdt = offset_bytes / g_volumen.tamano_bloque;
     uint32_t offset_en_bloque = offset_bytes % g_volumen.tamano_bloque;
 
-    uint32_t lba_gdt = g_volumen.lba_bloque_descriptores + (bloque_gdt * g_volumen.sectores_por_bloque);
-    int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba_gdt, (uint16_t)g_volumen.sectores_por_bloque, g_bloque_aux);
+    uint64_t lba_gdt = (uint64_t)g_volumen.lba_bloque_descriptores +
+                       bloque_gdt * g_volumen.sectores_por_bloque;
+    if (lba_gdt > UINT32_MAX || offset_en_bloque + 32 > g_volumen.tamano_bloque) return -2;
+    int res = usb_msc_leer_sectores(g_volumen.unidad_msc, (uint32_t)lba_gdt,
+                                   (uint16_t)g_volumen.sectores_por_bloque, g_bloque_aux);
     if (res != 0) return -3;
 
     const uint8_t *src = &g_bloque_aux[offset_en_bloque];
@@ -130,8 +139,10 @@ static int ext4_leer_inodo(uint32_t inodo_num, struct ext4_inodo *inodo_out) {
         tabla_inodos_bloque |= ((uint64_t)gd.bg_inode_table_hi << 32);
     }
 
-    uint32_t offset_bytes = indice * g_volumen.tamano_inodo;
-    uint32_t bloque_inodo = (uint32_t)tabla_inodos_bloque + (offset_bytes / g_volumen.tamano_bloque);
+    uint64_t offset_bytes = (uint64_t)indice * g_volumen.tamano_inodo;
+    uint64_t bloque_inodo_64 = tabla_inodos_bloque + offset_bytes / g_volumen.tamano_bloque;
+    if (bloque_inodo_64 > UINT32_MAX) return -3;
+    uint32_t bloque_inodo = (uint32_t)bloque_inodo_64;
     uint32_t offset_en_bloque = offset_bytes % g_volumen.tamano_bloque;
 
     if (ext4_leer_bloque(bloque_inodo, g_bloque_buf) != 0) return -3;
@@ -179,51 +190,50 @@ static int ext4_escribir_inodo(uint32_t inodo_num, const struct ext4_inodo *inod
 static int ext4_mapear_bloque_logico(const struct ext4_inodo *inodo, uint32_t bloque_logico, uint32_t *bloque_fisico_out) {
     if (!inodo || !bloque_fisico_out) return -1;
 
-    // Verificar si el inodo usa extents
+    // Descender el árbol de extents con límites explícitos por nodo y profundidad.
     if (inodo->i_flags & EXT4_EXTENTS_FL) {
-        const struct ext4_extent_cabecera *eh = (const struct ext4_extent_cabecera *)&inodo->i_block[0];
-        if (eh->eh_magic != EXT4_EXTENTS_MAGIC) {
-            return -2;
-        }
-
-        if (eh->eh_depth == 0) {
-            // Hojas directas en i_block
-            const struct ext4_extent *ex = (const struct ext4_extent *)(&inodo->i_block[3]);
-            for (uint16_t i = 0; i < eh->eh_entries; i++) {
-                uint32_t inicio = ex[i].ee_block;
-                uint32_t fin = inicio + (uint32_t)ex[i].ee_len;
-                if (bloque_logico >= inicio && bloque_logico < fin) {
-                    uint32_t delta = bloque_logico - inicio;
-                    *bloque_fisico_out = ex[i].ee_start_lo + delta;
-                    return 0;
-                }
-            }
-            return -3; // No mapeado (agujero o fuera de rango)
-        } else {
-            // Nivel 1 de árbol de extents (índices apuntan a bloques con hojas)
-            const uint32_t *idx_ptr = &inodo->i_block[3];
-            for (uint16_t i = 0; i < eh->eh_entries; i++) {
-                uint32_t ei_block = idx_ptr[i * 3 + 0];
-                uint32_t ei_leaf_lo = idx_ptr[i * 3 + 1];
-                // Leer el bloque de hojas
-                if (ext4_leer_bloque(ei_leaf_lo, g_bloque_aux) == 0) {
-                    const struct ext4_extent_cabecera *leh = (const struct ext4_extent_cabecera *)g_bloque_aux;
-                    if (leh->eh_magic == EXT4_EXTENTS_MAGIC && leh->eh_depth == 0) {
-                        const struct ext4_extent *lex = (const struct ext4_extent *)&g_bloque_aux[sizeof(struct ext4_extent_cabecera)];
-                        for (uint16_t j = 0; j < leh->eh_entries; j++) {
-                            uint32_t inicio = lex[j].ee_block;
-                            uint32_t fin = inicio + (uint32_t)lex[j].ee_len;
-                            if (bloque_logico >= inicio && bloque_logico < fin) {
-                                uint32_t delta = bloque_logico - inicio;
-                                *bloque_fisico_out = lex[j].ee_start_lo + delta;
-                                return 0;
-                            }
-                        }
+        const uint8_t *nodo = (const uint8_t *)inodo->i_block;
+        uint32_t capacidad_bytes = sizeof(inodo->i_block);
+        uint16_t profundidad_anterior = 6;
+        for (;;) {
+            const struct ext4_extent_cabecera *eh = (const struct ext4_extent_cabecera *)nodo;
+            uint32_t capacidad = (capacidad_bytes - sizeof(*eh)) / sizeof(struct ext4_extent);
+            if (eh->eh_magic != EXT4_EXTENTS_MAGIC || eh->eh_depth >= profundidad_anterior ||
+                eh->eh_depth > 5 || eh->eh_entries > eh->eh_max ||
+                eh->eh_max > capacidad) return -2;
+            if (eh->eh_depth == 0) {
+                const struct ext4_extent *ex = (const struct ext4_extent *)(nodo + sizeof(*eh));
+                for (uint16_t i = 0; i < eh->eh_entries; i++) {
+                    uint32_t longitud = ex[i].ee_len;
+                    if (longitud == 0 || longitud > 32768 || ex[i].ee_start_hi != 0) return -3;
+                    if (bloque_logico >= ex[i].ee_block &&
+                        bloque_logico - ex[i].ee_block < longitud) {
+                        uint64_t fisico = (uint64_t)ex[i].ee_start_lo +
+                                          (bloque_logico - ex[i].ee_block);
+                        if (fisico > UINT32_MAX || fisico == 0) return -3;
+                        *bloque_fisico_out = (uint32_t)fisico;
+                        return 0;
                     }
                 }
-                (void)ei_block;
+                return -3;
             }
-            return -4;
+            const uint8_t *indices = nodo + sizeof(*eh);
+            uint32_t hoja = 0;
+            for (uint16_t i = 0; i < eh->eh_entries; i++) {
+                const uint8_t *idx = indices + (uint32_t)i * 12;
+                uint32_t inicio, siguiente;
+                uint16_t alto;
+                memcpy(&inicio, idx, 4);
+                memcpy(&siguiente, idx + 4, 4);
+                memcpy(&alto, idx + 8, 2);
+                if (inicio > bloque_logico) break;
+                if (alto != 0) return -4;
+                hoja = siguiente;
+            }
+            profundidad_anterior = eh->eh_depth;
+            if (!hoja || ext4_leer_bloque(hoja, g_bloque_aux) != 0) return -4;
+            nodo = g_bloque_aux;
+            capacidad_bytes = g_volumen.tamano_bloque;
         }
     } else {
         // Bloques directos clásicos estilo ext2/ext3 (primeros 12 bloques directos)
@@ -244,6 +254,7 @@ int ext4_montar(uint8_t unidad_msc) {
     if (!dev || !dev->activo || !dev->listo) return -2;
 
     if (g_volumen.montado && g_volumen.unidad_msc == unidad_msc) return 0;
+    g_volumen.montado = 0;
 
     // 1. Leer LBA 0 para detectar MBR
     uint8_t mbr[512];
@@ -266,11 +277,55 @@ int ext4_montar(uint8_t unidad_msc) {
                                 ((uint32_t)mbr[p_off + 14] << 16) |
                                 ((uint32_t)mbr[p_off + 15] << 24);
 
-            if (cant_sec > 0 && inicio_lba > 0) {
-                if (tipo == 0x83 || tipo == 0xEE) {
-                    lba_particion = inicio_lba;
-                    particion_encontrada = 1;
-                    break;
+            if (cant_sec > 0 && inicio_lba > 0 && tipo != 0 && tipo != 0xEE) {
+                if (usb_msc_leer_sectores(unidad_msc, inicio_lba + 2, 2, g_bloque_buf) == 0) {
+                    const struct ext4_superbloque *test_sb = (const struct ext4_superbloque *)g_bloque_buf;
+                    if (test_sb->s_magic == EXT4_SUPER_MAGIC) {
+                        lba_particion = inicio_lba;
+                        particion_encontrada = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // GPT para ext4
+    if (!particion_encontrada) {
+        static uint8_t gpt_buf[512];
+        if (usb_msc_leer_sectores(unidad_msc, 1, 1, gpt_buf) == 0 &&
+            memcmp(gpt_buf, "EFI PART", 8) == 0) {
+            uint64_t part_lba = *(uint64_t *)&gpt_buf[72];
+            uint32_t num_parts = *(uint32_t *)&gpt_buf[80];
+            uint32_t part_size = *(uint32_t *)&gpt_buf[84];
+            if (part_size != 128) part_size = 128;
+            if (part_lba == 0) part_lba = 2;
+            if (num_parts > 32) num_parts = 32;
+
+            uint32_t sec_actual = 0xFFFFFFFF;
+            for (uint32_t p = 0; p < num_parts; p++) {
+                uint32_t sec = (uint32_t)part_lba + (p * part_size) / 512;
+                uint32_t off = (p * part_size) % 512;
+                if (sec != sec_actual) {
+                    if (usb_msc_leer_sectores(unidad_msc, sec, 1, gpt_buf) != 0) break;
+                    sec_actual = sec;
+                }
+                int guid_valido = 0;
+                for (int g = 0; g < 16; g++) {
+                    if (gpt_buf[off + g] != 0) { guid_valido = 1; break; }
+                }
+                if (!guid_valido) continue;
+
+                uint64_t inicio = *(uint64_t *)&gpt_buf[off + 32];
+                if (inicio > 0 && inicio <= UINT32_MAX) {
+                    if (usb_msc_leer_sectores(unidad_msc, (uint32_t)inicio + 2, 2, g_bloque_buf) == 0) {
+                        const struct ext4_superbloque *test_sb = (const struct ext4_superbloque *)g_bloque_buf;
+                        if (test_sb->s_magic == EXT4_SUPER_MAGIC) {
+                            lba_particion = (uint32_t)inicio;
+                            particion_encontrada = 1;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -296,6 +351,31 @@ int ext4_montar(uint8_t unidad_msc) {
         }
     }
 
+    // Solo se admiten geometrías y formatos que este lector sabe interpretar.
+    // Las rutas de escritura aún no mantienen journal, checksums ni contadores
+    // del superbloque, y por tanto permanecen deshabilitadas.
+    // RO_COMPAT_BIGALLOC cambia la unidad de los extents; METADATA_CSUM
+    // exige validar checksums antes de confiar en inodos/GDT/directorios.
+    // Este lector acepta sólo las variantes que interpreta íntegramente.
+    const uint32_t ro_compat_lectura = 0x1U | 0x2U | 0x8U | 0x20U | 0x40U | 0x1000U;
+    uint32_t tamano_bloque = sb->s_log_block_size <= 2 ? 1024U << sb->s_log_block_size : 0;
+    uint32_t sectores_por_bloque = tamano_bloque / 512;
+    if (!dev || !dev->listo || dev->tamano_sector != 512 ||
+        sb->s_log_block_size > 2 || sb->s_blocks_per_group == 0 ||
+        sb->s_blocks_per_group > tamano_bloque * 8U ||
+        sb->s_inodes_per_group == 0 ||
+        sb->s_state != 1 ||
+        (sb->s_feature_ro_compat & ~ro_compat_lectura) != 0 ||
+        (sb->s_feature_incompat & ~(0x2U | 0x40U | 0x80U | 0x200U)) != 0 ||
+        sb->s_blocks_count_hi != 0 || sb->s_blocks_count_lo == 0 ||
+        (uint64_t)lba_particion + (uint64_t)sb->s_blocks_count_lo * sectores_por_bloque > dev->sectores_totales ||
+        sb->s_inode_size < 128 || sb->s_inode_size > tamano_bloque ||
+        tamano_bloque % sb->s_inode_size != 0 ||
+        ((sb->s_feature_incompat & 0x80U) && sb->s_desc_size != 64)) {
+        serial_imprimir_linea("[EXT4] Geometría o features incompatibles; montaje rechazado.");
+        return -6;
+    }
+
     // Configurar descriptor de volumen
     g_volumen.montado = 1;
     g_volumen.unidad_msc = unidad_msc;
@@ -305,17 +385,19 @@ int ext4_montar(uint8_t unidad_msc) {
         g_volumen.tamano_bloque = 4096;
     }
     g_volumen.sectores_por_bloque = g_volumen.tamano_bloque / 512;
+    g_volumen.total_bloques = sb->s_blocks_count_lo;
     g_volumen.bloques_por_grupo = sb->s_blocks_per_group;
     g_volumen.inodos_por_grupo = sb->s_inodes_per_group;
     g_volumen.tamano_inodo = sb->s_inode_size ? sb->s_inode_size : 256;
 
-    if ((sb->s_feature_incompat & 0x80) && sb->s_desc_size >= 64) {
+    if (sb->s_feature_incompat & 0x80) {
         g_volumen.tamano_descriptor_grupo = sb->s_desc_size;
     } else {
         g_volumen.tamano_descriptor_grupo = 32;
     }
 
-    g_volumen.total_grupos = (sb->s_blocks_count_lo + sb->s_blocks_per_group - 1) / sb->s_blocks_per_group;
+    g_volumen.total_grupos = (uint32_t)(((uint64_t)sb->s_blocks_count_lo +
+                                         sb->s_blocks_per_group - 1) / sb->s_blocks_per_group);
 
     // Cálculo del LBA de inicio de la tabla de descriptores de grupo (GDT):
     // Si tamano_bloque == 1024, bloque 0 = boot, bloque 1 = superblock, bloque 2 = GDT.
@@ -789,6 +871,11 @@ static int ext4_insertar_entrada_directorio(uint32_t inodo_dir, uint32_t inodo_n
 }
 
 int ext4_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano) {
+    // Falta una transacción completa de bitmap/inodo/superbloque para ext4.
+    // Rechazar antes de la primera escritura, también para archivos multibloque.
+    (void)nombre; (void)datos; (void)tamano;
+    return -8;
+#if 0
     if (!nombre || *nombre == '\0') return -1;
     if (!g_volumen.montado) {
         if (ext4_montar(0) != 0) return -2;
@@ -864,9 +951,13 @@ int ext4_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano
     consola_imprimir_dec(nuevo_inodo);
     consola_imprimir_linea(")");
     return 0;
+#endif
 }
 
 int ext4_crear_directorio(const char *nombre) {
+    (void)nombre;
+    return -8;
+#if 0
     if (!nombre || *nombre == '\0') return -1;
     if (!g_volumen.montado) {
         if (ext4_montar(0) != 0) return -2;
@@ -938,4 +1029,5 @@ int ext4_crear_directorio(const char *nombre) {
     consola_imprimir_dec(nuevo_inodo);
     consola_imprimir_linea(")");
     return 0;
+#endif
 }

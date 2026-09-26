@@ -94,6 +94,7 @@ int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t bander
         uint64_t pdpt_fisica = VIRTUAL_A_FISICA(nueva_pdpt);
         g_pml4_kernel->entradas[idx_pml4] = pdpt_fisica | PAGINA_PRESENTE | PAGINA_ESCRITURA | (banderas & PAGINA_USUARIO);
     }
+    if (g_pml4_kernel->entradas[idx_pml4] & PAGINA_GIGANTE) return -3;
     tabla_paginacion_t *pdpt = (tabla_paginacion_t *)FISICA_A_VIRTUAL(g_pml4_kernel->entradas[idx_pml4] & MASCARA_DIRECCION_FISICA);
 
     // Nivel 3: PDPT -> PD
@@ -103,6 +104,7 @@ int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t bander
         uint64_t pd_fisica = VIRTUAL_A_FISICA(nueva_pd);
         pdpt->entradas[idx_pdpt] = pd_fisica | PAGINA_PRESENTE | PAGINA_ESCRITURA | (banderas & PAGINA_USUARIO);
     }
+    if (pdpt->entradas[idx_pdpt] & PAGINA_GIGANTE) return -3;
     tabla_paginacion_t *pd = (tabla_paginacion_t *)FISICA_A_VIRTUAL(pdpt->entradas[idx_pdpt] & MASCARA_DIRECCION_FISICA);
 
     // Nivel 2: PD -> PT
@@ -112,6 +114,7 @@ int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t bander
         uint64_t pt_fisica = VIRTUAL_A_FISICA(nueva_pt);
         pd->entradas[idx_pd] = pt_fisica | PAGINA_PRESENTE | PAGINA_ESCRITURA | (banderas & PAGINA_USUARIO);
     }
+    if (pd->entradas[idx_pd] & PAGINA_GIGANTE) return -3;
     tabla_paginacion_t *pt = (tabla_paginacion_t *)FISICA_A_VIRTUAL(pd->entradas[idx_pd] & MASCARA_DIRECCION_FISICA);
 
     // Nivel 1: PT -> Marco Físico de 4 KiB

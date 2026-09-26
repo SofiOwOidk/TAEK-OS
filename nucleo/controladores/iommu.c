@@ -314,7 +314,7 @@ int iommu_ejecutar_autodiagnostico(void) {
     if (!g_estado_iommu.tabla_dmar_detectada) {
         serial_imprimir_linea("[INFO] Plataforma sin tabla ACPI DMAR. Operando en modo DMA Directo Físico 1:1.");
         serial_imprimir_linea("[OK] Bus PCIe autorizado para transacciones directas Bus Master sin aislamiento IOMMU.");
-        serial_imprimir_linea("--- AUTODIAGNÓSTICO IOMMU COMPLETADO ---");
+        serial_imprimir_linea("--- DESCUBRIMIENTO IOMMU COMPLETADO; SIN AISLAMIENTO DMA ---");
         return 0;
     }
 
@@ -352,6 +352,6 @@ int iommu_ejecutar_autodiagnostico(void) {
         serial_imprimir_linea("");
     }
 
-    serial_imprimir_linea("--- AUTODIAGNÓSTICO IOMMU EXITOSO ---");
+    serial_imprimir_linea("--- DESCUBRIMIENTO VT-d COMPLETADO; DOMINIOS DMA NO CONFIGURADOS ---");
     return 0;
 }

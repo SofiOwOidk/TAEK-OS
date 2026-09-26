@@ -50,9 +50,9 @@
 #define RIRBCTL_RUN        ((1U << 1) | (1U << 0)) // bit 1 = DMA Enable, bit 0 = Response Interrupt Enable
 
 // Banderas de Stream Control (SD_CTL)
-#define SD_CTL_SRST        (1U << 1) // Stream Reset
-#define SD_CTL_RUN         (1U << 2) // Stream Run
-#define SD_CTL_IOCE        (1U << 3) // Interrupt On Completion Enable
+#define SD_CTL_SRST        (1U << 0) // Stream Reset (HDA 1.0a, SDCTL bit 0)
+#define SD_CTL_RUN         (1U << 1) // Stream Run (bit 1)
+#define SD_CTL_IOCE        (1U << 2) // Interrupt On Completion Enable (bit 2)
 #define SD_CTL_STREAM_TAG  (1U << 20)// Stream ID = 1 en bits 23:20
 
 // Formato de Stream para 44.1 kHz, 16 bits estéreo
@@ -97,7 +97,24 @@ static const uint8_t *g_audio_fuente = NULL;
 static uint32_t       g_audio_tamano = 0;
 static uint32_t       g_audio_cursor = 0;
 static int            g_audio_en_bucle = 0;
-static uint8_t        g_bloque_activo = 0;
+static uint8_t        g_bloque_en_dma = 0;
+static uint32_t       g_pos_dma_anterior = 0;
+static uint32_t       g_ultimo_pos_ram = 0;
+static uint32_t       g_ultimo_lpib_reg = 0;
+static uint64_t       g_t_ultimo_bloque = 0;
+static uint64_t       g_t_ultimo_progreso = 0;
+static uint32_t      *g_pos_buffer = NULL;
+static uint64_t       g_pos_buffer_fisica = 0;
+static uint8_t        g_stream_idx = 0;
+
+// Cola persistente de PCM para streaming A/V continuo (Encargo D)
+#define HDA_COLA_PCM_CAPACIDAD (256 * 1024) // 256 KiB = ~1.45 segundos de búfer
+static uint8_t        g_cola_pcm[HDA_COLA_PCM_CAPACIDAD];
+static uint32_t       g_cola_lectura = 0;
+static uint32_t       g_cola_escritura = 0;
+static uint32_t       g_cola_ocupada = 0;
+static int            g_modo_stream = 0;
+static uint32_t       g_vaciados_stream = 0;
 
 // --- FUNCIONES DE LECTURA/ESCRITURA MMIO ---
 static inline uint8_t __attribute__((unused)) mmio_leer8(uint64_t dir) {
@@ -312,34 +329,60 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
 
 // --- GESTIÓN DE BÚFERES Y REPRODUCCIÓN DMA ---
 static void hda_llenar_bloque_dma(uint8_t bloque) {
-    if (!g_dma_pcm_buffer || !g_audio_fuente) return;
+    if (!g_dma_pcm_buffer) return;
 
     uint8_t *destino = g_dma_pcm_buffer + (bloque * HDA_TAMANO_BLOQUE_DMA);
 
-    if (g_audio_cursor < g_audio_tamano) {
-        uint32_t restante = g_audio_tamano - g_audio_cursor;
-        uint32_t copiar = (restante > HDA_TAMANO_BLOQUE_DMA) ? HDA_TAMANO_BLOQUE_DMA : restante;
-        copiar &= ~3; // Múltiplo de muestra de 4 bytes
+    if (g_modo_stream) {
+        // En streaming continuo, extraer hasta 64 KiB de la cola persistente
+        uint32_t copiar = (g_cola_ocupada >= HDA_TAMANO_BLOQUE_DMA) ? HDA_TAMANO_BLOQUE_DMA : g_cola_ocupada;
+        copiar &= ~3; // Múltiplo de muestra estéreo de 4 bytes (16b x 2)
 
         for (uint32_t i = 0; i < copiar; i++) {
-            destino[i] = g_audio_fuente[g_audio_cursor + i];
+            destino[i] = g_cola_pcm[g_cola_lectura];
+            g_cola_lectura = (g_cola_lectura + 1) % HDA_COLA_PCM_CAPACIDAD;
         }
+        g_cola_ocupada -= copiar;
+        g_hda_estado.bytes_en_cola += copiar;
 
-        // Si el bloque no se llenó por completo, rellenar con silencio
+        // Rellenar con silencio si la cola se vació antes de completar el bloque
         for (uint32_t i = copiar; i < HDA_TAMANO_BLOQUE_DMA; i++) {
             destino[i] = 0;
         }
+        if (copiar < HDA_TAMANO_BLOQUE_DMA) {
+            g_vaciados_stream++;
+            g_hda_estado.vaciados_audio++;
+        }
+    } else if (g_audio_fuente) {
+        if (g_audio_cursor < g_audio_tamano) {
+            uint32_t restante = g_audio_tamano - g_audio_cursor;
+            uint32_t copiar = (restante > HDA_TAMANO_BLOQUE_DMA) ? HDA_TAMANO_BLOQUE_DMA : restante;
+            copiar &= ~3; // Múltiplo de muestra de 4 bytes
 
-        g_audio_cursor += copiar;
-        g_hda_estado.bytes_reproducidos = g_audio_cursor;
+            for (uint32_t i = 0; i < copiar; i++) {
+                destino[i] = g_audio_fuente[g_audio_cursor + i];
+            }
 
-        if (g_audio_cursor >= g_audio_tamano) {
-            if (g_audio_en_bucle) {
-                g_audio_cursor = 0;
+            // Si el bloque no se llenó por completo, rellenar con silencio
+            for (uint32_t i = copiar; i < HDA_TAMANO_BLOQUE_DMA; i++) {
+                destino[i] = 0;
+            }
+
+            g_audio_cursor += copiar;
+            g_hda_estado.bytes_en_cola += copiar;
+
+            if (g_audio_cursor >= g_audio_tamano) {
+                if (g_audio_en_bucle) {
+                    g_audio_cursor = 0;
+                }
+            }
+        } else {
+            // Silencio si no hay más datos
+            for (uint32_t i = 0; i < HDA_TAMANO_BLOQUE_DMA; i++) {
+                destino[i] = 0;
             }
         }
     } else {
-        // Silencio si no hay más datos
         for (uint32_t i = 0; i < HDA_TAMANO_BLOQUE_DMA; i++) {
             destino[i] = 0;
         }
@@ -351,19 +394,181 @@ static void hda_llenar_bloque_dma(uint8_t bloque) {
 void audio_hda_actualizar(void) {
     if (!g_hda_estado.inicializado || !g_hda_estado.reproduciendo) return;
 
-    // Leer la posición actual del puntero DMA de hardware en el búfer cíclico
-    uint32_t lpib = mmio_leer32(g_stream_base + SD_REG_LPIB);
-    uint8_t bloque_actual = (lpib >= HDA_TAMANO_BLOQUE_DMA) ? 1 : 0;
+    uint64_t t_ahora = tiempo_obtener_milisegundos();
 
-    // Si el hardware cambió de bloque, rellenar el bloque que acaba de quedar libre
-    if (bloque_actual != g_bloque_activo) {
-        hda_llenar_bloque_dma(g_bloque_activo);
-        g_bloque_activo = bloque_actual;
+    // 1. Leer estado del stream
+    uint8_t sts = mmio_leer8(g_stream_base + SD_REG_STS);
 
-        // Si se terminó el audio y no está en bucle, detener
-        if (g_audio_cursor >= g_audio_tamano && !g_audio_en_bucle) {
-            audio_hda_detener();
+    // Error fatal de descriptor (DESE = bit 4)
+    if (sts & 0x10) {
+        g_hda_estado.errores_stream++;
+        serial_imprimir_linea("[HDA ERROR] Error fatal de descriptor (DESE) en stream DMA.");
+        audio_hda_detener();
+        return;
+    }
+
+    // Error de FIFO (FIFOE = bit 3)
+    if (sts & 0x08) {
+        g_hda_estado.errores_stream++;
+        mmio_escribir8(g_stream_base + SD_REG_STS, 0x08); // W1C
+    }
+
+    // Reconocer y contabilizar finalizaciones de bloque (BCIS = bit 2)
+    int bcis_detectado = 0;
+    if (sts & 0x04) {
+        bcis_detectado = 1;
+        g_hda_estado.eventos_bcis++;
+        mmio_escribir8(g_stream_base + SD_REG_STS, 0x04); // W1C
+    }
+
+    // 2. Leer ambas fuentes de posición DMA
+    uint32_t pos_ram = 0;
+    if (g_pos_buffer) {
+        dma_sincronizar_dispositivo_a_cpu(g_pos_buffer, 1024);
+        pos_ram = g_pos_buffer[g_stream_idx * 2];
+    }
+    uint32_t lpib_reg = mmio_leer32(g_stream_base + SD_REG_LPIB);
+
+    int pos_ram_valido  = (pos_ram < HDA_TAMANO_TOTAL_DMA);
+    int lpib_reg_valido = (lpib_reg < HDA_TAMANO_TOTAL_DMA);
+
+    // Detectar avance real en cada fuente
+    int pos_ram_avanzo  = (pos_ram_valido && pos_ram != g_ultimo_pos_ram);
+    int lpib_reg_avanzo = (lpib_reg_valido && lpib_reg != g_ultimo_lpib_reg);
+
+    if (pos_ram_avanzo)  g_ultimo_pos_ram = pos_ram;
+    if (lpib_reg_avanzo) g_ultimo_lpib_reg = lpib_reg;
+
+    // Seleccionar posición activa preferente:
+    // Priorizamos la fuente que demuestre avance real o valor coherente
+    uint32_t pos_actual = 0;
+    int fuente_pos_activa = 0;
+
+    if (pos_ram_valido && pos_ram_avanzo) {
+        pos_actual = pos_ram;
+        fuente_pos_activa = 1;
+    } else if (lpib_reg_valido && lpib_reg_avanzo) {
+        pos_actual = lpib_reg;
+        fuente_pos_activa = 1;
+    } else if (pos_ram_valido && pos_ram > 0) {
+        pos_actual = pos_ram;
+        fuente_pos_activa = 1;
+    } else if (lpib_reg_valido && lpib_reg > 0) {
+        pos_actual = lpib_reg;
+        fuente_pos_activa = 1;
+    } else if (pos_ram_valido) {
+        pos_actual = pos_ram;
+    } else if (lpib_reg_valido) {
+        pos_actual = lpib_reg;
+    }
+
+    // 3. Contabilizar avance del cursor DMA en bytes reproducidos
+    if (pos_actual != g_pos_dma_anterior) {
+        uint32_t delta = 0;
+        if (pos_actual > g_pos_dma_anterior) {
+            delta = pos_actual - g_pos_dma_anterior;
+        } else {
+            // Wraparound en HDA_TAMANO_TOTAL_DMA (128 KiB)
+            delta = (pos_actual + HDA_TAMANO_TOTAL_DMA) - g_pos_dma_anterior;
         }
+
+        // Filtro contra saltos erráticos mayores a un búfer casi completo (jitter)
+        if (delta > 0 && delta <= (HDA_TAMANO_TOTAL_DMA - 4096)) {
+            g_hda_estado.bytes_dma_totales += delta;
+            g_pos_dma_anterior = pos_actual;
+            g_t_ultimo_progreso = t_ahora;
+        }
+    } else if (bcis_detectado && !fuente_pos_activa) {
+        // En silicio sin reporte en RAM ni LPIB MMIO, BCIS es la confirmación fiable
+        g_hda_estado.bytes_dma_totales += HDA_TAMANO_BLOQUE_DMA;
+        g_t_ultimo_progreso = t_ahora;
+    } else if (bcis_detectado) {
+        g_t_ultimo_progreso = t_ahora;
+    }
+
+    // Actualizar bytes_reproducidos (separados de bytes_en_cola)
+    if (g_hda_estado.bytes_dma_totales >= g_audio_tamano) {
+        g_hda_estado.bytes_reproducidos = g_audio_tamano;
+    } else {
+        g_hda_estado.bytes_reproducidos = (uint32_t)g_hda_estado.bytes_dma_totales;
+    }
+
+    // 4. Detección de atasco (stall):
+    // Si transcurrieron >1000 ms sin progreso fiable de hardware (LPIB, DPIB ni BCIS),
+    // reportar atasco y detener. El tiempo transcurrido NO autoriza sobrescribir DMA.
+    uint64_t ms_sin_progreso = (t_ahora >= g_t_ultimo_progreso) ? (t_ahora - g_t_ultimo_progreso) : 0;
+    if (ms_sin_progreso >= 1000) {
+        serial_imprimir_linea("[HDA ERROR] Atasco detectado: stream DMA congelado (sin avance en LPIB, DPIB ni BCIS durante >1000 ms). Deteniendo.");
+        g_hda_estado.errores_stream++;
+        audio_hda_detener();
+        return;
+    }
+
+    // 5. Determinar bloque que terminó su lectura y recargarlo:
+    // El hardware lee bloque 0 en [0, 64KB) y bloque 1 en [64KB, 128KB).
+    uint8_t bloque_en_dma_ahora = (pos_actual >= HDA_TAMANO_BLOQUE_DMA) ? 1 : 0;
+    int cambio_bloque = 0;
+    uint8_t bloque_liberado = 0;
+
+    if (fuente_pos_activa) {
+        if (bloque_en_dma_ahora != g_bloque_en_dma) {
+            // La posición hardware confirma que el DMA cruzó al otro bloque.
+            // El bloque previo 'g_bloque_en_dma' terminó de ser leído.
+            cambio_bloque = 1;
+            bloque_liberado = g_bloque_en_dma;
+            g_bloque_en_dma = bloque_en_dma_ahora;
+        }
+    } else if (bcis_detectado) {
+        // En fallback por BCIS, la interrupción confirma finalización del bloque actual
+        cambio_bloque = 1;
+        bloque_liberado = g_bloque_en_dma;
+        g_bloque_en_dma = (g_bloque_en_dma == 0) ? 1 : 0;
+    }
+
+    if (cambio_bloque) {
+        // Recargar ÚNICAMENTE el bloque cuya lectura ha terminado
+        hda_llenar_bloque_dma(bloque_liberado);
+        g_t_ultimo_bloque = t_ahora;
+    }
+
+    // 6. Registro de telemetría cada 100 ms (Requisito 1)
+    static uint64_t g_t_ultimo_log = 0;
+    if (t_ahora >= g_t_ultimo_log + 100) {
+        g_t_ultimo_log = t_ahora;
+        serial_imprimir("[HDA METRICA t=");
+        serial_imprimir_dec(t_ahora);
+        serial_imprimir("ms] LPIB_REG=");
+        serial_imprimir_dec(lpib_reg);
+        serial_imprimir(" POS_RAM=");
+        serial_imprimir_dec(pos_ram);
+        serial_imprimir(" STS=0x");
+        serial_imprimir_hex(sts);
+        serial_imprimir(" BCIS=");
+        serial_imprimir_dec(bcis_detectado);
+        serial_imprimir(" (tot=");
+        serial_imprimir_dec(g_hda_estado.eventos_bcis);
+        serial_imprimir(") cursor=");
+        serial_imprimir_dec(g_audio_cursor);
+        serial_imprimir(" cola=");
+        serial_imprimir_dec((uint32_t)g_hda_estado.bytes_en_cola);
+        serial_imprimir(" dma_tot=");
+        serial_imprimir_dec((uint32_t)g_hda_estado.bytes_dma_totales);
+        serial_imprimir(" reprod=");
+        serial_imprimir_dec(g_hda_estado.bytes_reproducidos);
+        serial_imprimir(" bloque_dma=");
+        serial_imprimir_dec(g_bloque_en_dma);
+        serial_imprimir_linea("");
+    }
+
+    // 7. Cierre limpio de reproducción (Requisito 4):
+    // En modo buffer de archivo, detener al alcanzar el final. En modo stream continuo, esperar audio_hda_detener().
+    if (!g_modo_stream && !g_audio_en_bucle && g_hda_estado.bytes_dma_totales >= g_audio_tamano) {
+        serial_imprimir("[HDA] Reproducción completada: ");
+        serial_imprimir_dec((uint32_t)g_hda_estado.bytes_dma_totales);
+        serial_imprimir(" / ");
+        serial_imprimir_dec(g_audio_tamano);
+        serial_imprimir_linea(" bytes procesados por hardware. Deteniendo stream.");
+        audio_hda_detener();
     }
 }
 
@@ -375,36 +580,31 @@ int audio_hda_esta_reproduciendo(void) {
 void audio_hda_detener(void) {
     if (!g_hda_estado.inicializado) return;
 
-    // Detener el motor DMA del Stream 1
+    // Detener el motor DMA del Stream
     uint32_t ctl = mmio_leer32(g_stream_base + SD_REG_CTL);
     mmio_escribir32(g_stream_base + SD_REG_CTL, ctl & ~SD_CTL_RUN);
+
+    // Limpiar búfer DMA con silencio para evitar cualquier residuo cíclico
+    if (g_dma_pcm_buffer) {
+        memset(g_dma_pcm_buffer, 0, HDA_TAMANO_TOTAL_DMA);
+        dma_sincronizar_cpu_a_dispositivo(g_dma_pcm_buffer, HDA_TAMANO_TOTAL_DMA);
+    }
 
     g_hda_estado.reproduciendo = 0;
     g_audio_fuente = NULL;
     g_audio_tamano = 0;
     g_audio_cursor = 0;
+    g_bloque_en_dma = 0;
+    g_pos_dma_anterior = 0;
+    g_ultimo_pos_ram = 0;
+    g_ultimo_lpib_reg = 0;
+    g_modo_stream = 0;
+    g_cola_ocupada = 0;
+    g_cola_lectura = 0;
+    g_cola_escritura = 0;
 }
 
-static int hda_iniciar_reproduccion(const void *datos_pcm, uint32_t tamano_bytes, int bucle) {
-    if (!g_hda_estado.inicializado || !datos_pcm || tamano_bytes == 0) {
-        return -1;
-    }
-
-    // Detener si estaba reproduciendo
-    audio_hda_detener();
-
-    g_audio_fuente   = (const uint8_t *)datos_pcm;
-    g_audio_tamano   = tamano_bytes;
-    g_audio_cursor   = 0;
-    g_audio_en_bucle = bucle;
-    g_hda_estado.bytes_totales = tamano_bytes;
-    g_hda_estado.bytes_reproducidos = 0;
-    g_bloque_activo  = 0;
-
-    // Llenar ambos bloques iniciales con los primeros datos
-    hda_llenar_bloque_dma(0);
-    hda_llenar_bloque_dma(1);
-
+static int hda_arrancar_stream_hardware(void) {
     // --- Reset del Stream (SD_CTL bit 0 = SRST) ---
     // 1. Poner SRST=1 para entrar en reset
     uint32_t ctl = mmio_leer32(g_stream_base + SD_REG_CTL);
@@ -418,6 +618,10 @@ static int hda_iniciar_reproduccion(const void *datos_pcm, uint32_t tamano_bytes
         esperar_milisegundos(1);
         timeout--;
     }
+    if (!(mmio_leer32(g_stream_base + SD_REG_CTL) & SD_CTL_SRST)) {
+        serial_imprimir_linea("[HDA] Timeout entrando en reset de stream.");
+        return -2;
+    }
 
     // 3. Limpiar SRST=0 para salir del reset
     ctl = mmio_leer32(g_stream_base + SD_REG_CTL);
@@ -429,6 +633,10 @@ static int hda_iniciar_reproduccion(const void *datos_pcm, uint32_t tamano_bytes
     while ((mmio_leer32(g_stream_base + SD_REG_CTL) & SD_CTL_SRST) && timeout > 0) {
         esperar_milisegundos(1);
         timeout--;
+    }
+    if (mmio_leer32(g_stream_base + SD_REG_CTL) & SD_CTL_SRST) {
+        serial_imprimir_linea("[HDA] Timeout saliendo de reset de stream.");
+        return -3;
     }
 
     // --- Programar el Stream Descriptor ---
@@ -451,14 +659,133 @@ static int hda_iniciar_reproduccion(const void *datos_pcm, uint32_t tamano_bytes
     dma_sincronizar_cpu_a_dispositivo(g_bdl, HDA_NUM_BLOQUES * sizeof(*g_bdl));
 
     // --- Iniciar reproducción DMA ---
-    // Stream Tag en bits [23:20]: Tag=1 → bits 23:20 = 0001 → valor 0x00100000
-    // RUN en bit 1 (SD_CTL_RUN = (1U<<2) es incorrecto — corrección: ver spec)
-    // HDA SD_CTL: bit 1 = SRST, bit 2 = RUN (Run/Stop)
     uint32_t nuevo_ctl = (1U << 20) | SD_CTL_RUN | SD_CTL_IOCE;
     mmio_escribir32(g_stream_base + SD_REG_CTL, nuevo_ctl);
+    if (!(mmio_leer32(g_stream_base + SD_REG_CTL) & SD_CTL_RUN)) {
+        serial_imprimir_linea("[HDA] El controlador no aceptó RUN.");
+        return -4;
+    }
 
     g_hda_estado.reproduciendo = 1;
     return 0;
+}
+
+static int hda_iniciar_reproduccion(const void *datos_pcm, uint32_t tamano_bytes, int bucle) {
+    if (!g_hda_estado.inicializado || !datos_pcm || tamano_bytes == 0) {
+        return -1;
+    }
+
+    // Detener si estaba reproduciendo
+    audio_hda_detener();
+
+    g_modo_stream       = 0;
+    g_audio_fuente      = (const uint8_t *)datos_pcm;
+    g_audio_tamano      = tamano_bytes;
+    g_audio_cursor      = 0;
+    g_audio_en_bucle    = bucle;
+    g_hda_estado.bytes_totales = tamano_bytes;
+    g_hda_estado.bytes_reproducidos = 0;
+    g_hda_estado.bytes_dma_totales = 0;
+    g_hda_estado.bytes_en_cola = 0;
+    g_hda_estado.eventos_bcis = 0;
+    g_hda_estado.errores_stream = 0;
+    g_bloque_en_dma     = 0;
+    g_pos_dma_anterior  = 0;
+    g_ultimo_pos_ram    = 0;
+    g_ultimo_lpib_reg   = 0;
+    g_t_ultimo_bloque   = tiempo_obtener_milisegundos();
+    g_t_ultimo_progreso = g_t_ultimo_bloque;
+
+    if (g_pos_buffer) {
+        memset(g_pos_buffer, 0, 1024);
+        dma_sincronizar_cpu_a_dispositivo(g_pos_buffer, 1024);
+    }
+
+    // Llenar ambos bloques iniciales con los primeros datos
+    hda_llenar_bloque_dma(0);
+    hda_llenar_bloque_dma(1);
+
+    return hda_arrancar_stream_hardware();
+}
+
+int audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+    if (!g_hda_estado.inicializado || !datos_pcm || tamano_bytes == 0) {
+        return -1;
+    }
+
+    const uint8_t *src = (const uint8_t *)datos_pcm;
+
+    // Si el stream aún no está en marcha o no está en modo streaming, arrancarlo
+    if (!g_modo_stream || !g_hda_estado.reproduciendo) {
+        audio_hda_detener();
+        g_modo_stream       = 1;
+        g_cola_lectura      = 0;
+        g_cola_escritura    = 0;
+        g_cola_ocupada      = 0;
+        g_vaciados_stream   = 0;
+        g_audio_fuente      = NULL;
+        g_audio_tamano      = 0;
+        g_audio_cursor      = 0;
+        g_audio_en_bucle    = 0;
+        g_hda_estado.bytes_reproducidos = 0;
+        g_hda_estado.bytes_dma_totales = 0;
+        g_hda_estado.bytes_en_cola = 0;
+        g_hda_estado.eventos_bcis = 0;
+        g_hda_estado.errores_stream = 0;
+        g_hda_estado.vaciados_audio = 0;
+        g_bloque_en_dma     = 0;
+        g_pos_dma_anterior  = 0;
+        g_ultimo_pos_ram    = 0;
+        g_ultimo_lpib_reg   = 0;
+        g_t_ultimo_bloque   = tiempo_obtener_milisegundos();
+        g_t_ultimo_progreso = g_t_ultimo_bloque;
+
+        if (g_pos_buffer) {
+            memset(g_pos_buffer, 0, 1024);
+            dma_sincronizar_cpu_a_dispositivo(g_pos_buffer, 1024);
+        }
+
+        // Copiar los datos iniciales a la cola
+        uint32_t a_copiar = (tamano_bytes > HDA_COLA_PCM_CAPACIDAD) ? HDA_COLA_PCM_CAPACIDAD : tamano_bytes;
+        for (uint32_t i = 0; i < a_copiar; i++) {
+            g_cola_pcm[g_cola_escritura] = src[i];
+            g_cola_escritura = (g_cola_escritura + 1) % HDA_COLA_PCM_CAPACIDAD;
+        }
+        g_cola_ocupada = a_copiar;
+
+        // Precargar ambos bloques DMA (0 y 1)
+        hda_llenar_bloque_dma(0);
+        hda_llenar_bloque_dma(1);
+
+        return hda_arrancar_stream_hardware();
+    }
+
+    // Stream ya activo: encolar datos con backpressure
+    uint32_t libre = HDA_COLA_PCM_CAPACIDAD - g_cola_ocupada;
+    uint32_t a_escribir = (tamano_bytes <= libre) ? tamano_bytes : libre;
+
+    for (uint32_t i = 0; i < a_escribir; i++) {
+        g_cola_pcm[g_cola_escritura] = src[i];
+        g_cola_escritura = (g_cola_escritura + 1) % HDA_COLA_PCM_CAPACIDAD;
+    }
+    g_cola_ocupada += a_escribir;
+
+    return (a_escribir < tamano_bytes) ? 1 : 0;
+}
+
+uint64_t audio_hda_obtener_tiempo_ms(void) {
+    if (!g_hda_estado.inicializado) return 0;
+    // 44100 Hz * 16 bits (2B) * 2 canales = 176400 bytes/segundo
+    return ((uint64_t)g_hda_estado.bytes_reproducidos * 1000ULL) / 176400ULL;
+}
+
+void audio_hda_reiniciar_reloj(void) {
+    g_hda_estado.bytes_reproducidos = 0;
+    g_hda_estado.bytes_dma_totales = 0;
+}
+
+uint32_t audio_hda_obtener_vaciados(void) {
+    return g_vaciados_stream;
 }
 
 int audio_hda_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
@@ -728,8 +1055,21 @@ int audio_hda_iniciar(void) {
         g_bdl[1].longitud_bytes  = HDA_TAMANO_BLOQUE_DMA;
         g_bdl[1].ioc             = 1;
 
-        // 7. Base del primer Descriptor de Stream de Salida
-        g_stream_base = g_mmio_base + 0x80 + (g_hda_estado.num_iss * 0x20);
+        // 7. Asignar DMA Position Buffer (DPIB) para reporte en RAM por hardware
+        if (!g_pos_buffer) {
+            g_pos_buffer = (uint32_t *)dma_asignar_bufer_contiguo(1024, 128, &g_pos_buffer_fisica);
+        }
+        if (g_pos_buffer) {
+            memset(g_pos_buffer, 0, 1024);
+            dma_sincronizar_cpu_a_dispositivo(g_pos_buffer, 1024);
+            // DPLBASE (0x70) y DPUBASE (0x74) con bit 0 = 1 (Enable)
+            mmio_escribir32(g_mmio_base + 0x70, (uint32_t)(g_pos_buffer_fisica & 0xFFFFFFFF) | 0x01);
+            mmio_escribir32(g_mmio_base + 0x74, (uint32_t)(g_pos_buffer_fisica >> 32));
+        }
+
+        // 8. Base del primer Descriptor de Stream de Salida
+        g_stream_idx = g_hda_estado.num_iss;
+        g_stream_base = g_mmio_base + 0x80 + (g_stream_idx * 0x20);
 
         // 8. Configurar códecs detectados
         uint64_t t_inicio_codecs = tiempo_obtener_milisegundos();

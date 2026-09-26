@@ -132,10 +132,16 @@ int vmx_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel) {
     }
 
     g_vmx_activo = 1;
-    serial_imprimir_linea("[ VMX ] CPU en VMX Root Operation (Ring -1). Guardián activo.");
+    serial_imprimir_linea("[ VMX ] VMXON activo; todavía no hay guest ni manejador VM-exit.");
     return 0;
 }
 
 int vmx_esta_activo(void) {
     return g_vmx_activo;
+}
+
+int vmx_intercepcion_triple_fault_disponible(void) {
+    // VMXON por sí solo no crea un guest ni intercepta VM-exits.
+    // Cambiar a verdadero únicamente después de VMLAUNCH y un handler operativo.
+    return 0;
 }
