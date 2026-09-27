@@ -7,7 +7,7 @@
 #define TAEK_VERSION_MENOR       1
 #define TAEK_VERSION_PARCHE      0
 #define TAEK_VERSION_STRING      "v0.1.0"
-#define TAEK_HITO_ACTUAL         "Hito 61"
+#define TAEK_HITO_ACTUAL         "Hito 66"
 
 #ifndef COMPILACION_FECHA
 #define COMPILACION_FECHA __DATE__

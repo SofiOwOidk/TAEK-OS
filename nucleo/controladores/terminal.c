@@ -218,6 +218,20 @@ static int str_comienza_con(const char *str, const char *prefijo) {
     return 1;
 }
 
+static int str_comienza_con_sin_caso(const char *str, const char *prefijo) {
+    if (!str || !prefijo) return 0;
+    int i = 0;
+    while (prefijo[i]) {
+        char c1 = str[i];
+        char c2 = prefijo[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return 0;
+        i++;
+    }
+    return 1;
+}
+
 static int str_contiene(const char *haystack, const char *needle) {
     if (!haystack || !needle) return 0;
     if (!*needle) return 1;
@@ -1746,10 +1760,172 @@ static void ejecutar_lectura_usb_msc(uint8_t unidad, uint32_t lba) {
     }
 }
 
+static void listar_discos_y_entradas(int modo_detalle) {
+    int total_msc = usb_msc_obtener_cantidad();
+    consola_imprimir_linea_color("================== ENTRADAS Y DISCOS DETECTADOS ==================", COLOR_AVISO_DEFAULT);
+    consola_imprimir("Unidades de almacenamiento detectadas: ");
+    consola_imprimir_dec(total_msc);
+    consola_imprimir_linea("");
+
+    if (total_msc == 0) {
+        consola_imprimir_linea_color("  [!] No se encontraron memorias USB o discos externos conectados.", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("      Conecta un pendrive USB y escribe 'entradas' o 'disco' para detectarlo.");
+    } else {
+        for (int i = 0; i < USB_MSC_MAX_DISPOSITIVOS; i++) {
+            const struct usb_msc_dispositivo *msc = usb_msc_obtener_dispositivo(i);
+            if (msc && msc->activo) {
+                consola_imprimir_color("  * DISCO #", COLOR_PROMPT_DEFAULT);
+                consola_imprimir_dec(i);
+                consola_imprimir(": ");
+                consola_imprimir_color(msc->fabricante, COLOR_EXITO_DEFAULT);
+                consola_imprimir(" ");
+                consola_imprimir_color(msc->producto, COLOR_EXITO_DEFAULT);
+                if (vfs_esta_montado() && vfs_obtener_unidad_activa() == i) {
+                    consola_imprimir_color(" ==> [ABIERTO: ", COLOR_AVISO_DEFAULT);
+                    consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_EXITO_DEFAULT);
+                    consola_imprimir_color("]", COLOR_AVISO_DEFAULT);
+                }
+                consola_imprimir_linea("");
+
+                uint64_t cap_mb = msc->capacidad_bytes / (1024ULL * 1024ULL);
+                uint64_t cap_gb = msc->capacidad_bytes / (1024ULL * 1024ULL * 1024ULL);
+                consola_imprimir("    Capacidad : ");
+                if (cap_gb > 0) {
+                    consola_imprimir_dec(cap_gb);
+                    consola_imprimir(" GB (");
+                }
+                consola_imprimir_dec(cap_mb);
+                consola_imprimir(" MB");
+                if (cap_gb > 0) consola_imprimir(")");
+                consola_imprimir_linea("");
+
+                consola_imprimir("    Estado    : ");
+                if (msc->listo) {
+                    consola_imprimir_linea_color("Conectado y listo", COLOR_EXITO_DEFAULT);
+                } else {
+                    consola_imprimir_linea_color("Medio no listo o no insertado", COLOR_AVISO_DEFAULT);
+                }
+
+                if (modo_detalle) {
+                    consola_imprimir("    Geometría : ");
+                    consola_imprimir_dec(msc->sectores_totales);
+                    consola_imprimir(" sectores físicos de ");
+                    consola_imprimir_dec(msc->tamano_sector);
+                    consola_imprimir_linea(" bytes");
+
+                    consola_imprimir("    Conexión  : Slot ");
+                    consola_imprimir_dec(msc->slot_id);
+                    consola_imprimir(" Puerto ");
+                    consola_imprimir_dec(msc->puerto_idx);
+                    consola_imprimir_linea("");
+                }
+            }
+        }
+    }
+    consola_imprimir_linea_color("------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("Comandos sencillos:", COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color("  leer 0         -> Abre el DISCO #0 y muestra sus archivos.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("  leer <archivo> -> Muestra un archivo de texto (ej: leer notas.txt).", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("  montar 0       -> Monta el DISCO #0.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("  ver / ls       -> Muestra los archivos del disco abierto.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("  arbol          -> Muestra carpetas y archivos en forma de árbol.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("==================================================================", COLOR_AVISO_DEFAULT);
+}
+
+static void ejecutar_comando_leer(const char *arg) {
+    if (arg) arg = str_saltar_espacios(arg);
+
+    // 1. Caso sin argumentos: 'leer' a secas
+    if (!arg || *arg == '\0') {
+        consola_imprimir_linea_color("Uso: leer <disco>   (ej: leer 0 o leer 1 para abrir una unidad)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("     leer <archivo> (ej: leer notas.txt para ver su contenido)", COLOR_PROMPT_DEFAULT);
+        if (vfs_esta_montado()) {
+            consola_imprimir("  [Unidad actual activa: DISCO #");
+            consola_imprimir_dec(vfs_obtener_unidad_activa());
+            consola_imprimir(" (");
+            consola_imprimir(vfs_obtener_nombre_fs());
+            consola_imprimir_linea(")]");
+        }
+        listar_discos_y_entradas(0);
+        return;
+    }
+
+    // 2. Comprobar si el usuario escribió un disco: "0", "1", "disco 0", "disco 1", "d0", "d1"
+    const char *p = arg;
+    if (str_comienza_con(p, "disco ")) p = str_saltar_espacios(p + 6);
+    else if (str_comienza_con(p, "disco")) p = str_saltar_espacios(p + 5);
+    else if (str_comienza_con(p, "usb ")) p = str_saltar_espacios(p + 4);
+    else if ((p[0] == 'd' || p[0] == 'D') && p[1] >= '0' && p[1] <= '9') p = p + 1;
+
+    if (*p >= '0' && *p <= '9' && (*(p + 1) == '\0' || *(p + 1) == ' ')) {
+        uint8_t u = (uint8_t)(*p - '0');
+        consola_imprimir_color("==> [ VFS ] Abriendo DISCO #", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_dec(u);
+        consola_imprimir_linea("...");
+
+        if (vfs_montar(u) == 0) {
+            consola_imprimir_color("==> [EXITO] DISCO #", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec(u);
+            consola_imprimir(" abierto con éxito (Sistema: ");
+            consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("):");
+            vfs_listar_directorio(NULL);
+        } else {
+            consola_imprimir_color("  [ERROR] No se pudo leer el DISCO #", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec(u);
+            consola_imprimir_linea(". Verifica que contenga FAT32, exFAT, NTFS o ext4.");
+            consola_imprimir_linea_color("  Uso: leer <disco> (ej: leer 0 o leer 1)", COLOR_AVISO_DEFAULT);
+            listar_discos_y_entradas(0);
+        }
+        return;
+    }
+
+    // 3. Caso: LBA directo para depuración técnica ('leer lba <n>' o 'leer sector <n>')
+    if (str_comienza_con(arg, "lba ") || str_comienza_con(arg, "sector ")) {
+        const char *p_lba = str_saltar_espacios(arg + (str_comienza_con(arg, "lba ") ? 4 : 7));
+        uint32_t lba = 0;
+        while (*p_lba >= '0' && *p_lba <= '9') {
+            lba = lba * 10 + (*p_lba++ - '0');
+        }
+        ejecutar_lectura_usb_msc(vfs_obtener_unidad_activa(), lba);
+        return;
+    }
+
+    // 4. Caso: leer <archivo>
+    if (!vfs_esta_montado()) {
+        if (vfs_montar(0) != 0) {
+            consola_imprimir_color("  [ERROR] No hay ningún disco abierto para leer '", COLOR_ERROR_DEFAULT);
+            consola_imprimir(arg);
+            consola_imprimir_linea("'.");
+            consola_imprimir_linea_color("  Uso: leer <disco> (ej: leer 0 o leer 1 para abrir una unidad)", COLOR_AVISO_DEFAULT);
+            listar_discos_y_entradas(0);
+            return;
+        }
+    }
+
+    int res = vfs_leer_archivo_texto(arg);
+    if (res != 0) {
+        consola_imprimir_color("  [ERROR] No se pudo leer el archivo '", COLOR_ERROR_DEFAULT);
+        consola_imprimir(arg);
+        consola_imprimir_linea("'.");
+        consola_imprimir_linea_color("  Uso: leer <disco> (ej: leer 0) o leer <archivo>", COLOR_AVISO_DEFAULT);
+    }
+}
+
 static void ejecutar_comando_disco(const char *arg) {
     if (arg) arg = str_saltar_espacios(arg);
 
-    if (arg && (str_igual(arg, "tree") || str_igual(arg, "arbol") || str_comienza_con(arg, "tree ") || str_comienza_con(arg, "arbol "))) {
+    if (!arg || *arg == '\0') {
+        listar_discos_y_entradas(0);
+        return;
+    }
+
+    if (str_igual(arg, "detalle") || str_igual(arg, "detalles") || str_igual(arg, "-v")) {
+        listar_discos_y_entradas(1);
+        return;
+    }
+
+    if (str_igual(arg, "tree") || str_igual(arg, "arbol") || str_comienza_con(arg, "tree ") || str_comienza_con(arg, "arbol ")) {
         const char *sub = NULL;
         if (str_comienza_con(arg, "tree ")) sub = str_saltar_espacios(arg + 5);
         else if (str_comienza_con(arg, "arbol ")) sub = str_saltar_espacios(arg + 6);
@@ -1757,33 +1933,45 @@ static void ejecutar_comando_disco(const char *arg) {
         return;
     }
 
-    if (arg && (str_igual(arg, "ls") || str_igual(arg, "dir") || str_comienza_con(arg, "ls ") || str_comienza_con(arg, "dir "))) {
+    if (str_igual(arg, "ls") || str_igual(arg, "dir") || str_igual(arg, "archivos") ||
+        str_comienza_con(arg, "ls ") || str_comienza_con(arg, "dir ") || str_comienza_con(arg, "archivos ")) {
         const char *sub = NULL;
         if (str_comienza_con(arg, "ls ")) sub = str_saltar_espacios(arg + 3);
         else if (str_comienza_con(arg, "dir ")) sub = str_saltar_espacios(arg + 4);
+        else if (str_comienza_con(arg, "archivos ")) sub = str_saltar_espacios(arg + 9);
+
+        if (sub && (*sub >= '0' && *sub <= '9')) {
+            ejecutar_comando_leer(sub);
+            return;
+        }
         vfs_listar_directorio(sub);
         return;
     }
 
-    if (arg && (str_comienza_con(arg, "cat ") || str_comienza_con(arg, "ver "))) {
-        const char *archivo = str_saltar_espacios(arg + (str_comienza_con(arg, "cat ") ? 4 : 4));
-        vfs_leer_archivo_texto(archivo);
+    if (str_comienza_con(arg, "cat ") || str_comienza_con(arg, "ver ") || str_comienza_con(arg, "leer ")) {
+        const char *sub = str_saltar_espacios(arg + (str_comienza_con(arg, "cat ") ? 4 : (str_comienza_con(arg, "ver ") ? 4 : 5)));
+        ejecutar_comando_leer(sub);
         return;
     }
 
-    if (arg && (str_comienza_con(arg, "touch ") || str_comienza_con(arg, "crear "))) {
+    if (str_igual(arg, "leer")) {
+        ejecutar_comando_leer(NULL);
+        return;
+    }
+
+    if (str_comienza_con(arg, "touch ") || str_comienza_con(arg, "crear ")) {
         const char *archivo = str_saltar_espacios(arg + (str_comienza_con(arg, "touch ") ? 6 : 6));
         vfs_crear_archivo(archivo, "");
         return;
     }
 
-    if (arg && str_comienza_con(arg, "mkdir ")) {
+    if (str_comienza_con(arg, "mkdir ")) {
         const char *carpeta = str_saltar_espacios(arg + 6);
         vfs_crear_directorio(carpeta);
         return;
     }
 
-    if (arg && str_comienza_con(arg, "escribir ")) {
+    if (str_comienza_con(arg, "escribir ")) {
         const char *resto = str_saltar_espacios(arg + 9);
         char archivo[64];
         int idx = 0;
@@ -1807,74 +1995,48 @@ static void ejecutar_comando_disco(const char *arg) {
         return;
     }
 
-    if (arg && (str_comienza_con(arg, "montar") || str_comienza_con(arg, "mount"))) {
+    if (str_comienza_con(arg, "montar") || str_comienza_con(arg, "mount")) {
         const char *p = str_saltar_espacios(arg + (str_comienza_con(arg, "montar") ? 6 : 5));
-        uint8_t u = 0;
-        if (*p >= '0' && *p <= '9') u = (uint8_t)(*p - '0');
-        consola_imprimir_color("==> [ VFS ] Intentando montar DISCO #", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_dec(u);
-        consola_imprimir_linea("...");
-        if (vfs_montar(u) == 0) {
-            consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
+        if (*p >= '0' && *p <= '9') {
+            uint8_t u = (uint8_t)(*p - '0');
+            consola_imprimir_color("==> [ VFS ] Intentando montar DISCO #", COLOR_PROMPT_DEFAULT);
             consola_imprimir_dec(u);
-            consola_imprimir(" montado exitosamente como: ");
-            consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
-            vfs_listar_directorio(NULL);
+            consola_imprimir_linea("...");
+            if (vfs_montar(u) == 0) {
+                consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
+                consola_imprimir_dec(u);
+                consola_imprimir(" montado exitosamente como: ");
+                consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
+                vfs_listar_directorio(NULL);
+            } else {
+                consola_imprimir_color("  [ERROR] No se detectó un sistema de archivos soportado en DISCO #", COLOR_ERROR_DEFAULT);
+                consola_imprimir_dec(u);
+                consola_imprimir_linea(".");
+                consola_imprimir_linea_color("  Uso: leer <disco> o montar <disco> (ej: leer 0 o montar 0)", COLOR_AVISO_DEFAULT);
+                listar_discos_y_entradas(0);
+            }
         } else {
-            consola_imprimir_color("  [ERROR] No se detectó un sistema de archivos soportado (FAT32, exFAT, NTFS o ext4) en DISCO #", COLOR_ERROR_DEFAULT);
-            consola_imprimir_dec(u);
-            consola_imprimir_linea(".");
+            consola_imprimir_linea_color("Uso: montar <disco> (ej: montar 0 o montar 1)", COLOR_PROMPT_DEFAULT);
+            listar_discos_y_entradas(0);
         }
         return;
     }
 
-    if (arg && (str_igual(arg, "desmontar") || str_igual(arg, "umount") || str_igual(arg, "unmount"))) {
+    if (str_igual(arg, "desmontar") || str_igual(arg, "umount") || str_igual(arg, "unmount")) {
         vfs_desmontar();
         consola_imprimir_linea_color("==> [ VFS ] Unidad desmontada.", COLOR_AVISO_DEFAULT);
         return;
     }
 
-    if (arg && *arg >= '0' && *arg <= '9' && (*(arg + 1) == '\0' || *(arg + 1) == ' ')) {
-        uint8_t u = (uint8_t)(*arg - '0');
-        consola_imprimir_color("==> [ VFS ] Cambiando a DISCO #", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_dec(u);
-        consola_imprimir_linea("...");
-        if (vfs_montar(u) == 0) {
-            consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
-            consola_imprimir_dec(u);
-            consola_imprimir(" activo (");
-            consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
-            consola_imprimir_linea("). Contenido:");
-            vfs_listar_directorio(NULL);
-        } else {
-            consola_imprimir_color("  [ERROR] No se encontró sistema de archivos soportado en DISCO #", COLOR_ERROR_DEFAULT);
-            consola_imprimir_dec(u);
-            consola_imprimir_linea(".");
-        }
+    if (*arg >= '0' && *arg <= '9' && (*(arg + 1) == '\0' || *(arg + 1) == ' ')) {
+        ejecutar_comando_leer(arg);
         return;
     }
 
-    if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
-        const char *p_lba = arg + 4;
-        p_lba = str_saltar_espacios(p_lba);
-
-        // Si es un nombre de archivo (letras no hex o contiene punto)
-        int es_archivo = 0;
-        for (int k = 0; p_lba[k]; k++) {
-            char c = p_lba[k];
-            if (c == '.' || (c >= 'g' && c <= 'z') || (c >= 'G' && c <= 'Z')) {
-                es_archivo = 1;
-                break;
-            }
-        }
-        if (es_archivo) {
-            vfs_leer_archivo_texto(p_lba);
-            return;
-        }
-
+    if (str_comienza_con(arg, "lba") || str_comienza_con(arg, "sector") || str_comienza_con(arg, "dump")) {
+        const char *p_lba = str_saltar_espacios(arg + (str_comienza_con(arg, "lba") ? 3 : (str_comienza_con(arg, "sector") ? 6 : 4)));
         uint32_t val1 = 0, val2 = 0;
         int tiene_val1 = 0, tiene_val2 = 0;
-
         if (*p_lba != '\0') {
             while (*p_lba >= '0' && *p_lba <= '9') {
                 val1 = val1 * 10 + (*p_lba++ - '0');
@@ -1888,7 +2050,6 @@ static void ejecutar_comando_disco(const char *arg) {
                 }
             }
         }
-
         uint8_t u_target = vfs_obtener_unidad_activa();
         uint32_t lba_target = 0;
         if (tiene_val2) {
@@ -1897,82 +2058,11 @@ static void ejecutar_comando_disco(const char *arg) {
         } else if (tiene_val1) {
             lba_target = val1;
         }
-
         ejecutar_lectura_usb_msc(u_target, lba_target);
         return;
     }
 
-    int total_msc = usb_msc_obtener_cantidad();
-    consola_imprimir_linea_color("================== SUBSISTEMA DE ALMACENAMIENTO USB ==================", COLOR_AVISO_DEFAULT);
-    consola_imprimir("Unidades USB Mass Storage detectadas: ");
-    consola_imprimir_dec(total_msc);
-    consola_imprimir_linea("");
-
-    if (total_msc == 0) {
-        consola_imprimir_linea_color("  [!] No se encontraron memorias USB o discos externos conectados.", COLOR_AVISO_DEFAULT);
-        consola_imprimir_linea("      Inserta un pendrive USB y ejecuta 'usb monitor' o 'disco' para detectarlo.");
-    } else {
-        for (int i = 0; i < USB_MSC_MAX_DISPOSITIVOS; i++) {
-            const struct usb_msc_dispositivo *msc = usb_msc_obtener_dispositivo(i);
-            if (msc && msc->activo) {
-                consola_imprimir_color("  * DISCO #", COLOR_PROMPT_DEFAULT);
-                consola_imprimir_dec(i);
-                consola_imprimir(": ");
-                consola_imprimir_color(msc->fabricante, COLOR_EXITO_DEFAULT);
-                consola_imprimir(" ");
-                consola_imprimir_color(msc->producto, COLOR_EXITO_DEFAULT);
-                consola_imprimir(" [Rev ");
-                consola_imprimir(msc->revision);
-                consola_imprimir("]");
-                if (vfs_esta_montado() && vfs_obtener_unidad_activa() == i) {
-                    consola_imprimir_color(" ==> [MONTADO: ", COLOR_AVISO_DEFAULT);
-                    consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_EXITO_DEFAULT);
-                    consola_imprimir_color("]", COLOR_AVISO_DEFAULT);
-                }
-                consola_imprimir_linea("");
-
-                consola_imprimir("    Estado SCSI       : ");
-                if (msc->listo) {
-                    consola_imprimir_linea_color("LISTO / EN LÍNEA (BOT + SCSI-2 SPC/SBC)", COLOR_EXITO_DEFAULT);
-                } else {
-                    consola_imprimir_linea_color("INICIALIZANDO O MEDIO NO INSERTADO", COLOR_AVISO_DEFAULT);
-                }
-
-                uint64_t cap_mb = msc->capacidad_bytes / (1024ULL * 1024ULL);
-                uint64_t cap_gb = msc->capacidad_bytes / (1024ULL * 1024ULL * 1024ULL);
-                consola_imprimir("    Capacidad Total   : ");
-                if (cap_gb > 0) {
-                    consola_imprimir_dec(cap_gb);
-                    consola_imprimir(" GB (");
-                }
-                consola_imprimir_dec(cap_mb);
-                consola_imprimir(" MB");
-                if (cap_gb > 0) consola_imprimir(")");
-                consola_imprimir_linea("");
-
-                consola_imprimir("    Geometría LBA     : ");
-                consola_imprimir_dec(msc->sectores_totales);
-                consola_imprimir(" sectores físicos de ");
-                consola_imprimir_dec(msc->tamano_sector);
-                consola_imprimir_linea(" bytes");
-
-                consola_imprimir("    Conexión xHCI     : Slot ");
-                consola_imprimir_dec(msc->slot_id);
-                consola_imprimir(" en Puerto ");
-                consola_imprimir_dec(msc->puerto_idx);
-                consola_imprimir(" (EP Bulk IN: DCI ");
-                consola_imprimir_dec(msc->ep_in_dci);
-                consola_imprimir(", Bulk OUT: DCI ");
-                consola_imprimir_dec(msc->ep_out_dci);
-                consola_imprimir_linea(")");
-            }
-        }
-    }
-    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
-    consola_imprimir_linea_color("Tip: Escribe 'disco montar 1' (o 'disco 1') para montar el DISCO #1.", COLOR_TEXTO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Escribe 'disco leer 1 0' para inspeccionar el sector MBR del DISCO #1.", COLOR_TEXTO_DEFAULT);
-    consola_imprimir_linea_color("Tip: Escribe 'ls' o 'tree' para explorar archivos en la unidad activa.", COLOR_TEXTO_DEFAULT);
-    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
+    listar_discos_y_entradas(0);
 }
 
 static void ejecutar_comando_usb(const char *arg) {
@@ -2211,6 +2301,94 @@ static void ejecutar_comando_usb(const char *arg) {
     consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
 }
 
+// ============================================================================
+// HOMENAJE A TERRY A. DAVIS Y TEMPLEOS: COMANDO 'pray' / 'orar'
+// Generador de oráculos, pasajes bíblicos y palabras sagradas por hardware (rdtsc)
+// ============================================================================
+
+struct pasaje_biblico {
+    const char *referencia;
+    const char *texto;
+};
+
+static const struct pasaje_biblico g_pasajes_biblicos[] = {
+    {"Génesis 1:1-3", "En el principio creó Dios los cielos y la tierra. Y la tierra estaba desordenada y vacía, y las tinieblas estaban sobre la faz del abismo. Y dijo Dios: Sea la luz; y fue la luz."},
+    {"Salmos 23:1-3", "Jehová es mi pastor; nada me faltará. En lugares de delicados pastos me hará descansar; junto a aguas de reposo me pastoreará. Confortará mi alma; me guiará por sendas de justicia por amor de su nombre."},
+    {"Salmos 23:4", "Aunque ande en valle de sombra de muerte, no temeré mal alguno, porque tú estarás conmigo; tu vara y tu cayado me infundirán aliento."},
+    {"Eclesiastés 3:1-2", "Todo tiene su tiempo, y todo lo que se quiere debajo del cielo tiene su hora: tiempo de nacer, y tiempo de morir; tiempo de plantar, y tiempo de arrancar lo plantado."},
+    {"Juan 1:1-5", "En el principio era el Verbo, y el Verbo era con Dios, y el Verbo era Dios. En él estaba la vida, y la vida era la luz de los hombres. La luz en las tinieblas resplandece, y las tinieblas no prevalecieron contra ella."},
+    {"1 Corintios 13:4-7", "El amor es sufrido, es benigno; el amor no tiene envidia, el amor no es jactancioso, no se envanece; no hace nada indebido, no busca lo suyo, no se irrita, no guarda rencor; no se goza de la injusticia, mas se goza de la verdad."},
+    {"Mateo 5:3-9", "Bienaventurados los pobres en espíritu, porque de ellos es el reino de los cielos. Bienaventurados los pacificadores, porque ellos serán llamados hijos de Dios. Bienaventurados los limpios de corazón, porque ellos verán a Dios."},
+    {"Mateo 7:7-8", "Pedid, y se os dará; buscad, y hallaréis; llamad, y se os abrirá. Porque todo aquel que pide, recibe; y el que busca, halla; y al que llama, se le abrirá."},
+    {"Proverbios 3:5-6", "Fíate de Jehová de todo tu corazón, y no te apoyes en tu propia prudencia. Reconócelo en todos tus caminos, y él enderezará tus veredas."},
+    {"Isaías 40:28-31", "¿No has sabido, no has oído que el Dios eterno es Jehová? Los que esperan en Jehová tendrán nuevas fuerzas; levantarán alas como las águilas; correrán, y no se cansarán; caminarán, y no se fatigarán."},
+    {"Salmos 19:1-2", "Los cielos cuentan la gloria de Dios, y el firmamento anuncia la obra de sus manos. Un día emite palabra a otro día, y una noche a otra noche declara sabiduría."},
+    {"Romanos 8:38-39", "Por lo cual estoy seguro de que ni la muerte, ni la vida, ni ángeles, ni potestades, ni lo presente, ni lo por venir nos podrá separar del amor de Dios, que es en Cristo Jesús Señor nuestro."},
+    {"Apocalipsis 21:3-4", "He aquí el tabernáculo de Dios con los hombres, y él morará con ellos. Y enjugará Dios toda lágrima de los ojos de ellos; y ya no habrá muerte, ni habrá más llanto, ni dolor, porque las primeras cosas pasaron."},
+    {"Juan 8:12", "Otra vez Jesús les habló, diciendo: Yo soy la luz del mundo; el que me sigue, no andará en tinieblas, sino que tendrá la luz de la vida."},
+    {"Filipenses 4:6-7", "Por nada estéis afanosos, sino sean conocidas vuestras peticiones delante de Dios en toda oración y ruego. Y la paz de Dios, que sobrepasa todo entendimiento, guardará vuestros corazones."},
+    {"Josué 1:9", "Mira que te mando que te esfuerces y seas valiente; no temas ni desmayes, porque Jehová tu Dios estará contigo en dondequiera que vayas."},
+    {"Proverbios 4:23", "Sobre toda cosa guardada, guarda tu corazón; porque de él mana la vida."},
+    {"Jeremías 29:11", "Porque yo sé los pensamientos que tengo acerca de vosotros, dice Jehová, pensamientos de paz, y no de mal, para daros el fin que esperáis."},
+    {"Salmos 46:1-2", "Dios es nuestro amparo y fortaleza, nuestro pronto auxilio en las tribulaciones. Por tanto, no temeremos, aunque la tierra sea removida, y se traspasen los montes al corazón del mar."},
+    {"Mateo 11:28-30", "Venid a mí todos los que estáis trabajados y cargados, y yo os haré descansar. Llevad mi yugo sobre vosotros, y aprended de mí, que soy manso y humilde de corazón; y hallaréis descanso para vuestras almas."},
+    {"Salmos 119:105", "Lámpara es a mis pies tu palabra, y lumbrera a mi camino."},
+    {"Eclesiastés 1:2-4", "Vanidad de vanidades, dijo el Predicador; vanidad de vanidades, todo es vanidad. ¿Qué provecho tiene el hombre de todo su trabajo? Generación va, y generación viene; mas la tierra siempre permanece."},
+    {"Job 38:4-7", "¿Dónde estabas tú cuando yo fundaba la tierra? Házmelo saber, si tienes inteligencia. ¿Quién ordenó sus medidas, si lo sabes? ¿Cuándo alababan juntas todas las estrellas del alba, y se regocijaban todos los hijos de Dios?"},
+    {"1 Juan 4:7-8", "Amados, amémonos unos a otros; porque el amor es de Dios. Todo aquel que ama, es nacido de Dios, y conoce a Dios. El que no ama, no ha conocido a Dios; porque Dios es amor."},
+    {"Salmos 91:1-2", "El que habita al abrigo del Altísimo morará bajo la sombra del Omnipotente. Diré yo a Jehová: Esperanza mía, y castillo mío; mi Dios, en quien confiaré."},
+    {"Apocalipsis 1:8", "Yo soy el Alfa y la Omega, principio y fin, dice el Señor, el que es y que era y que ha de venir, el Todopoderoso."},
+    {"Isaías 9:2", "El pueblo que andaba en tinieblas vio gran luz; los que moraban en tierra de sombra de muerte, luz resplandeció sobre ellos."},
+    {"Habacuc 3:17-18", "Aunque la higuera no florezca, ni en las vides haya frutos; con todo, yo me alegraré en Jehová, y me gozaré en el Dios de mi salvación."},
+    {"Miqueas 6:8", "Oh hombre, él te ha declarado lo que es bueno, y qué pide Jehová de ti: solamente hacer justicia, y amar misericordia, y humillarte ante tu Dios."},
+    {"Romanos 12:2", "No os conforméis a este siglo, sino transformaos por medio de la renovación de vuestro entendimiento, para que comprobéis cuál sea la buena voluntad de Dios, agradable y perfecta."},
+    {"Juan 14:27", "La paz os dejo, mi paz os doy; yo no os la doy como el mundo la da. No se turbe vuestro corazón, ni tenga miedo."},
+    {"Éxodo 3:14", "Y respondió Dios a Moisés: YO SOY EL QUE SOY. Y dijo: Así dirás a los hijos de Israel: YO SOY me envió a vosotros."}
+};
+
+static const char * const g_palabras_temple[] = {
+    "TEMPLO", "PACTO", "LUZ", "MONTE", "NUBE", "TROMPETA", "QUERUBÍN",
+    "SION", "SANTUARIO", "GLORIA", "ESPÍRITU", "UNGIDO", "ALTAR", "REINO",
+    "FUEGO", "VERBO", "CORONA", "ETERNIDAD", "PAZ", "ROCÍO", "JUSTICIA",
+    "GRACIA", "MANÁ", "TABERNÁCULO", "CORDERO", "CÁLIZ", "INCIENSO",
+    "ESTRELLA", "TRONO", "SABIDURÍA", "MISTERIO", "ÉXODO", "ARCA", "VID",
+    "TORRE", "VARA", "CIMIENTO", "CÁNTICO", "MANANTIAL", "SERAFÍN", "ALFA",
+    "OMEGA", "JERICÓ", "OLIVO", "DESIERTO", "ALIANZA", "PURIFICACIÓN"
+};
+
+static void ejecutar_comando_pray(const char *arg) {
+    (void)arg;
+    uint32_t r = obtener_aleatorio();
+    int idx_pasaje = (int)(r % (sizeof(g_pasajes_biblicos) / sizeof(g_pasajes_biblicos[0])));
+
+    consola_imprimir_linea_color("================== [ TEMPLE ORACLE - HOMENAJE A TERRY DAVIS ] ==================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color(" \"Un templo digital de 64 bits. Dios habla a través del azar (rdtsc).\"", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea("");
+
+    consola_imprimir_color("  [ Pasaje: ", COLOR_AVISO_DEFAULT);
+    consola_imprimir_color(g_pasajes_biblicos[idx_pasaje].referencia, COLOR_EXITO_DEFAULT);
+    consola_imprimir_linea_color(" ]", COLOR_AVISO_DEFAULT);
+
+    consola_imprimir_color("  \"", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_color(g_pasajes_biblicos[idx_pasaje].texto, COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("\"", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea("");
+
+    // Oráculo de palabras sagradas (God Words de TempleOS)
+    consola_imprimir_color("  Oráculo aleatorio (God Words): ", COLOR_AVISO_DEFAULT);
+    int total_palabras = sizeof(g_palabras_temple) / sizeof(g_palabras_temple[0]);
+    for (int i = 0; i < 7; i++) {
+        uint32_t w_rnd = obtener_aleatorio();
+        int w_idx = (int)(w_rnd % total_palabras);
+        consola_imprimir_color(g_palabras_temple[w_idx], COLOR_USUARIO_DEFAULT);
+        if (i < 6) consola_imprimir_color(" · ", COLOR_AVISO_DEFAULT);
+    }
+    consola_imprimir_linea("");
+    consola_imprimir_linea_color("--------------------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'pray' u 'orar' para consultar otro pasaje del oráculo.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
+}
+
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -2371,16 +2549,18 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Controlador Intel VT-d, remapeo DRHD y regiones RMRR ('iommu probar').");
         consola_imprimir_color("  teclado        ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Autodiagnóstico del teclado USB y puertos ('teclado probar').", COLOR_EXITO_DEFAULT);
-        consola_imprimir_color("  usb            ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Inspección USB y lectura física ('usb leer <lba>', 'usb monitor', 'usb reset <p>').", COLOR_EXITO_DEFAULT);
-        consola_imprimir_color("  disco          ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Almacenamiento USB Mass Storage y lectura SCSI ('disco leer <lba>').", COLOR_EXITO_DEFAULT);
-        consola_imprimir_color("  tree / arbol   ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Despliega el árbol visual de directorios y archivos (FAT32, exFAT, NTFS, ext4).", COLOR_EXITO_DEFAULT);
-        consola_imprimir_color("  ls / dir       ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Lista los archivos y carpetas del sistema de archivos detectado.");
-        consola_imprimir_color("  cat <archivo>  ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Imprime el contenido de un archivo de texto del pendrive.");
+        consola_imprimir_color("  entradas / disco", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Lista los discos y memorias USB conectadas ('entradas', 'discos').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  leer <disco|arch>", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Abre un disco ('leer 0') o muestra un archivo ('leer notas.txt').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  montar <disco>   ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Monta una unidad USB ('montar 0').");
+        consola_imprimir_color("  ver / ls / dir   ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Lista los archivos del disco abierto ('archivos').");
+        consola_imprimir_color("  arbol / tree     ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Despliega el árbol visual de carpetas y archivos.");
+        consola_imprimir_color("  usb [opción]     ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Inspección USB ('usb monitor' vigila puertos en vivo).");
         consola_imprimir_color("  touch <archivo>", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Crea un archivo vacío en el sistema de archivos (FAT32, exFAT, ext4).", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  mkdir <carpeta>", COLOR_EXITO_DEFAULT);
@@ -2390,7 +2570,7 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  audio [opción] ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Audio DMA ('audio corto', 'audio cangrejo', 'audio intro', 'audio bucle', 'audio estado', 'audio detener').");
+        consola_imprimir_linea(": Audio DMA ('audio corto', 'audio cangrejo', 'audio intro', 'audio bucle', 'audio estado', 'audio trazas', 'audio detener').");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la animación de Don Cangrejo explotando.");
         consola_imprimir_color("  h264 [opción]  ", COLOR_PROMPT_DEFAULT);
@@ -2413,6 +2593,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Imprime un texto en la consola.");
         consola_imprimir_color("  ruleta         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Ruleta Rusa (1/6 de morir tú, 1/6 de morir el sistema).");
+        consola_imprimir_color("  pray / orar    ", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea_color(": Oráculo estilo TempleOS: genera pasajes bíblicos y palabras sagradas.", COLOR_AVISO_DEFAULT);
         if (g_el_comando_desbloqueado) {
             consola_imprimir_color("  El comando     ", COLOR_USUARIO_DEFAULT);
             consola_imprimir_linea(": [DESBLOQUEADO] Lo que hace es nada.");
@@ -2842,6 +3024,15 @@ static void procesar_comando(const char *linea_cruda) {
                 consola_imprimir(" / ");
                 consola_imprimir_dec(e->bytes_totales);
                 consola_imprimir_linea(" bytes");
+                consola_imprimir("  Silencio insertado: ");
+                consola_imprimir_dec((uint32_t)e->silencio_insertado_bytes);
+                consola_imprimir_linea(" bytes");
+                consola_imprimir("  Saltos rechazados : ");
+                consola_imprimir_dec(e->saltos_posicion_rechazados);
+                consola_imprimir_linea("");
+                consola_imprimir("  Max pausa atencion: ");
+                consola_imprimir_dec(e->max_intervalo_sin_atencion_ms);
+                consola_imprimir_linea(" ms");
                 consola_imprimir("  Eventos BCIS      : ");
                 consola_imprimir_dec(e->eventos_bcis);
                 consola_imprimir_linea("");
@@ -2855,6 +3046,13 @@ static void procesar_comando(const char *linea_cruda) {
             } else {
                 consola_imprimir_linea("  Controlador       : Inactivo / No detectado");
             }
+            return;
+        }
+
+        if (str_igual(arg, "trazas") || str_igual(arg, "trace")) {
+            consola_imprimir_linea_color("==> Volcando trazas recientes de Intel HDA al puerto serial COM1...", COLOR_PROMPT_DEFAULT);
+            audio_hda_volcar_trazas();
+            consola_imprimir_linea_color("[OK] Trazas enviadas al puerto serial (115200 baud).", COLOR_EXITO_DEFAULT);
             return;
         }
 
@@ -2952,20 +3150,34 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
-    // COMANDO: montar <id> / mount <id> / desmontar / umount
-    if (str_comienza_con(linea, "montar") || str_comienza_con(linea, "mount") ||
-        str_comienza_con(linea, "desmontar") || str_comienza_con(linea, "umount") || str_comienza_con(linea, "unmount")) {
-        ejecutar_comando_disco(linea);
-        return;
-    }
-
-    // COMANDO: disco / storage / pendrive
-    if (str_comienza_con(linea, "disco") || str_comienza_con(linea, "storage") || str_comienza_con(linea, "pendrive")) {
+    // COMANDO: entradas / monitor entradas / monitorias entradas / discos / disco / unidades / puertos / dispositivos
+    if (str_igual(linea, "entradas") || str_comienza_con(linea, "entradas ") ||
+        str_igual(linea, "monitor entradas") || str_igual(linea, "monitorear entradas") ||
+        str_igual(linea, "monitoria entradas") || str_igual(linea, "monitorias entradas") ||
+        str_igual(linea, "discos") || str_comienza_con(linea, "discos ") ||
+        str_igual(linea, "disco") || str_comienza_con(linea, "disco ") ||
+        str_igual(linea, "unidades") || str_comienza_con(linea, "unidades ") ||
+        str_igual(linea, "dispositivos") || str_comienza_con(linea, "dispositivos ") ||
+        str_igual(linea, "puertos") || str_comienza_con(linea, "puertos ") ||
+        str_comienza_con(linea, "storage") || str_comienza_con(linea, "pendrive")) {
         const char *arg = NULL;
-        if (str_comienza_con(linea, "disco ")) arg = str_saltar_espacios(linea + 6);
+        if (str_comienza_con(linea, "entradas ")) arg = str_saltar_espacios(linea + 9);
+        else if (str_comienza_con(linea, "discos ")) arg = str_saltar_espacios(linea + 7);
+        else if (str_comienza_con(linea, "disco ")) arg = str_saltar_espacios(linea + 6);
+        else if (str_comienza_con(linea, "unidades ")) arg = str_saltar_espacios(linea + 9);
+        else if (str_comienza_con(linea, "dispositivos ")) arg = str_saltar_espacios(linea + 13);
+        else if (str_comienza_con(linea, "puertos ")) arg = str_saltar_espacios(linea + 8);
         else if (str_comienza_con(linea, "storage ")) arg = str_saltar_espacios(linea + 8);
         else if (str_comienza_con(linea, "pendrive ")) arg = str_saltar_espacios(linea + 9);
         ejecutar_comando_disco(arg);
+        return;
+    }
+
+    // COMANDO: montar <disco> / mount <disco> / desmontar / umount
+    if (str_igual(linea, "montar") || str_comienza_con(linea, "montar ") ||
+        str_igual(linea, "mount") || str_comienza_con(linea, "mount ") ||
+        str_comienza_con(linea, "desmontar") || str_comienza_con(linea, "umount") || str_comienza_con(linea, "unmount")) {
+        ejecutar_comando_disco(linea);
         return;
     }
 
@@ -2978,48 +3190,52 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
-    // COMANDO: ls / dir
-    if (str_comienza_con(linea, "ls") || str_comienza_con(linea, "dir")) {
+    // COMANDO: ls / dir / archivos
+    if (str_igual(linea, "ls") || str_comienza_con(linea, "ls ") ||
+        str_igual(linea, "dir") || str_comienza_con(linea, "dir ") ||
+        str_igual(linea, "archivos") || str_comienza_con(linea, "archivos ")) {
         const char *arg = NULL;
         if (str_comienza_con(linea, "ls ")) arg = str_saltar_espacios(linea + 3);
         else if (str_comienza_con(linea, "dir ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "archivos ")) arg = str_saltar_espacios(linea + 9);
 
-        // Si el usuario escribió "ls disco 1", "dir disco 1" o "ls 1"
+        // Si el usuario escribió "ls disco 1", "dir 1" o "ls 1"
         if (arg && (str_comienza_con(arg, "disco ") || (*arg >= '0' && *arg <= '9' && (*(arg + 1) == '\0' || *(arg + 1) == ' ')))) {
-            const char *p_u = arg;
-            if (str_comienza_con(arg, "disco ")) p_u = str_saltar_espacios(arg + 6);
-            if (*p_u >= '0' && *p_u <= '9') {
-                uint8_t u = (uint8_t)(*p_u - '0');
-                consola_imprimir_color("==> [ VFS ] Seleccionando DISCO #", COLOR_PROMPT_DEFAULT);
-                consola_imprimir_dec(u);
-                consola_imprimir_linea("...");
-                if (vfs_montar(u) == 0) {
-                    consola_imprimir_color("==> [ VFS ] DISCO #", COLOR_EXITO_DEFAULT);
-                    consola_imprimir_dec(u);
-                    consola_imprimir(" montado (");
-                    consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
-                    consola_imprimir_linea("):");
-                    vfs_listar_directorio(NULL);
-                    return;
-                } else {
-                    consola_imprimir_color("  [ERROR] No se pudo montar DISCO #", COLOR_ERROR_DEFAULT);
-                    consola_imprimir_dec(u);
-                    consola_imprimir_linea(".");
-                    return;
-                }
+            ejecutar_comando_leer(arg);
+            return;
+        }
+
+        if (!vfs_esta_montado()) {
+            if (vfs_montar(0) != 0) {
+                consola_imprimir_linea_color("  [AVISO] No hay ningún disco abierto.", COLOR_AVISO_DEFAULT);
+                consola_imprimir_linea_color("  Uso: leer <disco> o montar <disco> (ej: leer 0 o montar 0)", COLOR_PROMPT_DEFAULT);
+                listar_discos_y_entradas(0);
+                return;
             }
         }
         vfs_listar_directorio(arg);
         return;
     }
 
-    // COMANDO: cat <archivo> / leer <archivo>
-    if (str_comienza_con(linea, "cat ") || str_comienza_con(linea, "leer ") || str_comienza_con(linea, "ver ")) {
-        const char *archivo = NULL;
-        if (str_comienza_con(linea, "cat ")) archivo = str_saltar_espacios(linea + 4);
-        else if (str_comienza_con(linea, "leer ")) archivo = str_saltar_espacios(linea + 5);
-        else if (str_comienza_con(linea, "ver ")) archivo = str_saltar_espacios(linea + 4);
-        vfs_leer_archivo_texto(archivo);
+    // COMANDO: leer <disco|archivo> / cat <archivo> / ver <archivo>
+    if (str_igual(linea, "leer") || str_comienza_con(linea, "leer ") ||
+        str_comienza_con(linea, "cat ") || str_comienza_con(linea, "ver ")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "leer ")) arg = str_saltar_espacios(linea + 5);
+        else if (str_comienza_con(linea, "cat ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "ver ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_leer(arg);
+        return;
+    }
+
+    // COMANDO: pray / orar / rezar / oraculo / temple / templeos / godword (Homenaje TempleOS)
+    if (str_igual_sin_caso(linea, "pray") || str_comienza_con_sin_caso(linea, "pray ") ||
+        str_igual_sin_caso(linea, "orar") || str_comienza_con_sin_caso(linea, "orar ") ||
+        str_igual_sin_caso(linea, "rezar") || str_comienza_con_sin_caso(linea, "rezar ") ||
+        str_igual_sin_caso(linea, "oraculo") || str_comienza_con_sin_caso(linea, "oraculo ") ||
+        str_igual_sin_caso(linea, "temple") || str_igual_sin_caso(linea, "templeos") ||
+        str_igual_sin_caso(linea, "godword")) {
+        ejecutar_comando_pray(linea);
         return;
     }
 

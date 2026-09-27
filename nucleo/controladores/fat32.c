@@ -15,7 +15,7 @@ static int g_fat32_inicializado = 0;
 // Búferes estáticos en BSS para evitar consumir la pila del kernel
 static uint8_t g_sector_buf[512];
 static uint8_t g_fat_sector_buf[512];
-static uint8_t g_cluster_buf[32768]; // Soporta clusters de hasta 32 KiB (64 sectores)
+static uint8_t g_cluster_buf[65536]; // Soporta clusters estándar de hasta 64 KiB (128 sectores)
 
 // Estructura interna para almacenar temporalmente los elementos de un directorio
 #define FAT32_MAX_ITEMS_DIR 128
@@ -253,13 +253,25 @@ int fat32_montar(uint8_t unidad_msc) {
         return -8;
     }
 
+    uint32_t bytes_por_cluster = (uint32_t)sec_per_clus * (uint32_t)bytes_sec;
+    if (bytes_sec != 512 || bytes_por_cluster > sizeof(g_cluster_buf) || bytes_por_cluster == 0) {
+        serial_imprimir("[FAT32 ERROR] Geometría no soportada: Bytes/Sec=");
+        serial_imprimir_dec(bytes_sec);
+        serial_imprimir(" Sec/Clus=");
+        serial_imprimir_dec(sec_per_clus);
+        serial_imprimir(" Total=");
+        serial_imprimir_dec(bytes_por_cluster);
+        serial_imprimir_linea(" (Límite: 64 KiB)");
+        return -9;
+    }
+
     // Guardar descriptor del volumen montado
     g_volumen.montado = 1;
     g_volumen.unidad_msc = unidad_msc;
     g_volumen.lba_inicio_particion = lba_particion;
     g_volumen.bytes_por_sector = bytes_sec;
     g_volumen.sectores_por_cluster = sec_per_clus;
-    g_volumen.bytes_por_cluster = (uint32_t)sec_per_clus * (uint32_t)bytes_sec;
+    g_volumen.bytes_por_cluster = bytes_por_cluster;
     g_volumen.sectores_por_fat = sec_fat;
     g_volumen.cluster_raiz = root_clus;
     g_volumen.sector_fs_info = bpb->sector_fs_info;
@@ -369,80 +381,90 @@ static int fat32_leer_entradas_directorio(uint32_t cluster_dir, int *num_items) 
     for (int i = 0; i < 256; i++) g_lfn_buffer[i] = '\0';
 
     while (cluster_actual >= 2 && *num_items < FAT32_MAX_ITEMS_DIR) {
-        uint32_t lba = fat32_cluster_a_lba(&g_volumen, cluster_actual);
-        uint16_t sec_cant = g_volumen.sectores_por_cluster;
-        if (sec_cant > 64) sec_cant = 64;
-
-        int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba, sec_cant, g_cluster_buf);
-        if (res != 0) {
-            serial_imprimir_linea("[FAT32 ERROR] Error leyendo cluster de directorio.");
-            break;
-        }
-
-        uint32_t total_entradas = g_volumen.bytes_por_cluster / 32;
+        uint32_t lba_base = fat32_cluster_a_lba(&g_volumen, cluster_actual);
+        uint32_t sec_restantes = g_volumen.sectores_por_cluster;
+        uint32_t sec_offset = 0;
         int fin_directorio = 0;
 
-        for (uint32_t e = 0; e < total_entradas; e++) {
-            const uint8_t *raw_entry = &g_cluster_buf[e * 32];
-            uint8_t primer_byte = raw_entry[0];
+        while (sec_restantes > 0 && !fin_directorio && *num_items < FAT32_MAX_ITEMS_DIR) {
+            uint32_t sec_a_leer = sec_restantes;
+            uint32_t max_sec = sizeof(g_cluster_buf) / g_volumen.bytes_por_sector;
+            if (sec_a_leer > max_sec) sec_a_leer = max_sec;
 
-            if (primer_byte == 0x00) {
-                // Entrada no asignada y fin de las entradas de este directorio
+            int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba_base + sec_offset, (uint16_t)sec_a_leer, g_cluster_buf);
+            if (res != 0) {
+                serial_imprimir_linea("[FAT32 ERROR] Error leyendo cluster de directorio.");
                 fin_directorio = 1;
                 break;
             }
 
-            if (primer_byte == 0xE5) {
-                // Entrada eliminada, reiniciar acumulador LFN
-                g_lfn_activo = 0;
-                continue;
-            }
+            uint32_t total_entradas = (sec_a_leer * g_volumen.bytes_por_sector) / 32;
 
-            uint8_t attr = raw_entry[11];
+            for (uint32_t e = 0; e < total_entradas; e++) {
+                const uint8_t *raw_entry = &g_cluster_buf[e * 32];
+                uint8_t primer_byte = raw_entry[0];
 
-            // ¿Es entrada de Nombre Largo (LFN)?
-            if (attr == FAT32_ATTR_LFN) {
-                fat32_procesar_entrada_lfn((const struct fat32_entrada_lfn *)raw_entry);
-                continue;
-            }
-
-            // Ignorar etiqueta de volumen o entradas ocultas del sistema que no sean directorios
-            if ((attr & FAT32_ATTR_VOLUME_ID) && !(attr & FAT32_ATTR_DIRECTORY)) {
-                g_lfn_activo = 0;
-                continue;
-            }
-
-            const struct fat32_entrada_dir *entry = (const struct fat32_entrada_dir *)raw_entry;
-            int es_dir = (attr & FAT32_ATTR_DIRECTORY) ? 1 : 0;
-
-            // Ignorar '.' y '..' para no generar ciclos recursivos en el árbol
-            if (entry->nombre[0] == '.') {
-                g_lfn_activo = 0;
-                continue;
-            }
-
-            struct fat32_item *item = &g_items_actuales[*num_items];
-            item->es_directorio = es_dir;
-            item->cluster_inicio = ((uint32_t)entry->cluster_alto << 16) | (uint32_t)entry->cluster_bajo;
-            item->tamano = entry->tamano_archivo;
-
-            // Asignar nombre (LFN o 8.3)
-            if (g_lfn_activo && g_lfn_buffer[0] != '\0') {
-                int p = 0;
-                while (g_lfn_buffer[p] && p < 255) {
-                    item->nombre[p] = g_lfn_buffer[p];
-                    p++;
+                if (primer_byte == 0x00) {
+                    // Entrada no asignada y fin de las entradas de este directorio
+                    fin_directorio = 1;
+                    break;
                 }
-                item->nombre[p] = '\0';
-            } else {
-                fat32_formatear_nombre_83(entry->nombre, item->nombre, es_dir);
+
+                if (primer_byte == 0xE5) {
+                    // Entrada eliminada, reiniciar acumulador LFN
+                    g_lfn_activo = 0;
+                    continue;
+                }
+
+                uint8_t attr = raw_entry[11];
+
+                // ¿Es entrada de Nombre Largo (LFN)?
+                if (attr == FAT32_ATTR_LFN) {
+                    fat32_procesar_entrada_lfn((const struct fat32_entrada_lfn *)raw_entry);
+                    continue;
+                }
+
+                // Ignorar etiqueta de volumen o entradas ocultas del sistema que no sean directorios
+                if ((attr & FAT32_ATTR_VOLUME_ID) && !(attr & FAT32_ATTR_DIRECTORY)) {
+                    g_lfn_activo = 0;
+                    continue;
+                }
+
+                const struct fat32_entrada_dir *entry = (const struct fat32_entrada_dir *)raw_entry;
+                int es_dir = (attr & FAT32_ATTR_DIRECTORY) ? 1 : 0;
+
+                // Ignorar '.' y '..' para no generar ciclos recursivos en el árbol
+                if (entry->nombre[0] == '.') {
+                    g_lfn_activo = 0;
+                    continue;
+                }
+
+                struct fat32_item *item = &g_items_actuales[*num_items];
+                item->es_directorio = es_dir;
+                item->cluster_inicio = ((uint32_t)entry->cluster_alto << 16) | (uint32_t)entry->cluster_bajo;
+                item->tamano = entry->tamano_archivo;
+
+                // Asignar nombre (LFN o 8.3)
+                if (g_lfn_activo && g_lfn_buffer[0] != '\0') {
+                    int p = 0;
+                    while (g_lfn_buffer[p] && p < 255) {
+                        item->nombre[p] = g_lfn_buffer[p];
+                        p++;
+                    }
+                    item->nombre[p] = '\0';
+                } else {
+                    fat32_formatear_nombre_83(entry->nombre, item->nombre, es_dir);
+                }
+
+                g_lfn_activo = 0;
+                for (int i = 0; i < 256; i++) g_lfn_buffer[i] = '\0';
+
+                (*num_items)++;
+                if (*num_items >= FAT32_MAX_ITEMS_DIR) break;
             }
 
-            g_lfn_activo = 0;
-            for (int i = 0; i < 256; i++) g_lfn_buffer[i] = '\0';
-
-            (*num_items)++;
-            if (*num_items >= FAT32_MAX_ITEMS_DIR) break;
+            sec_offset += sec_a_leer;
+            sec_restantes -= sec_a_leer;
         }
 
         if (fin_directorio) break;
@@ -687,24 +709,34 @@ int fat32_leer_archivo_texto(const char *nombre_buscado) {
     uint32_t bytes_restantes = objetivo->tamano;
 
     while (clus >= 2 && bytes_restantes > 0) {
-        uint32_t lba = fat32_cluster_a_lba(&g_volumen, clus);
-        uint16_t sec_cant = g_volumen.sectores_por_cluster;
-        if (sec_cant > 64) sec_cant = 64;
+        uint32_t lba_base = fat32_cluster_a_lba(&g_volumen, clus);
+        uint32_t sec_restantes = g_volumen.sectores_por_cluster;
+        uint32_t sec_offset = 0;
 
-        int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba, sec_cant, g_cluster_buf);
-        if (res != 0) {
-            consola_imprimir_linea_color("  [!] Error leyendo cluster de datos.", COLOR_ERROR_DEFAULT);
-            break;
+        while (sec_restantes > 0 && bytes_restantes > 0) {
+            uint32_t sec_a_leer = sec_restantes;
+            uint32_t max_sec = sizeof(g_cluster_buf) / g_volumen.bytes_por_sector;
+            if (sec_a_leer > max_sec) sec_a_leer = max_sec;
+
+            int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba_base + sec_offset, (uint16_t)sec_a_leer, g_cluster_buf);
+            if (res != 0) {
+                consola_imprimir_linea_color("  [!] Error leyendo cluster de datos.", COLOR_ERROR_DEFAULT);
+                break;
+            }
+
+            uint32_t bytes_chunk = sec_a_leer * g_volumen.bytes_por_sector;
+            uint32_t bytes_a_imprimir = (bytes_restantes < bytes_chunk) ? bytes_restantes : bytes_chunk;
+            for (uint32_t b = 0; b < bytes_a_imprimir; b++) {
+                char ch = (char)g_cluster_buf[b];
+                if (ch == '\r') continue;
+                consola_escribir_caracter(ch);
+            }
+
+            bytes_restantes -= bytes_a_imprimir;
+            sec_offset += sec_a_leer;
+            sec_restantes -= sec_a_leer;
         }
 
-        uint32_t bytes_a_imprimir = (bytes_restantes < g_volumen.bytes_por_cluster) ? bytes_restantes : g_volumen.bytes_por_cluster;
-        for (uint32_t b = 0; b < bytes_a_imprimir && b < 32768; b++) {
-            char ch = (char)g_cluster_buf[b];
-            if (ch == '\r') continue;
-            consola_escribir_caracter(ch);
-        }
-
-        bytes_restantes -= bytes_a_imprimir;
         clus = fat32_siguiente_cluster(&g_volumen, clus);
     }
 

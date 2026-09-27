@@ -2325,6 +2325,55 @@
   - `boot/limine.conf`
   - `BITACORA.md`
 
+---
 
-
-
+### Hito 66 - Reingeniería del Motor DMA Intel HDA, Blindaje de Búferes en FAT32/NTFS, Simplificación de Comandos VFS y Oráculo TempleOS (2026-09-27)
+* **Objetivo y Contexto:**
+  - Corregir de forma integral los fallos de continuidad acústica, selección errática de bloques DMA e inyecciones espurias de silencio en el controlador Intel High Definition Audio (HDA).
+  - Auditar y blindar los controladores de almacenamiento y sistemas de archivos (FAT32 y NTFS) contra accesos fuera de límites (out-of-bounds) y desajustes de geometría de clusters.
+  - Simplificar la experiencia de terminal eliminando la necesidad de comandos y terminología compleja tipo Unix para la gestión de discos y lectura de archivos.
+  - Integrar el comando de oráculo `pray` con generación aleatoria por hardware de pasajes bíblicos y palabras sagradas como homenaje a TempleOS.
+* **Causas Raíz Identificadas:**
+  1. **Alternancia de Fuentes de Posición y Rebote de Bloques en HDA:** El driver alternaba entre DPIB (DMA Position in Buffer en RAM) y LPIB (Link Position in Buffer en MMIO). Fluctuaciones transitorias entre lecturas al cruzar la frontera de 32 KiB provocaban un falso rebote hacia atrás (bloque 0 -> 1 -> 0), marcando el bloque como completado prematuramente y rellenándolo con silencio (origen de los 994 falsos "vaciados" reportados en hardware físico).
+  2. **Violación de Handshakes de Parada y Reset según Intel HDA Spec §3.3.35:** Se limpiaba el bit `RUN` o se pulsaba `SRST` durante 20 µs sin esperar confirmación del hardware en los registros de control, sobrescribiendo con ceros la memoria DMA mientras el motor continuaba activo.
+  3. **Colisión de Control entre Reproductor y Controlador:** `audio_hda_encolar_pcm()` arrancaba el stream DMA de forma autónoma interfiriendo con la lógica de presentación de video; el primer cuadro de video reseteaba abruptamente el reloj de audio; y los bucles de espera de PTS dejaban desatendida la cola de PCM.
+  4. **Desbordamientos de Búfer en FAT32 y NTFS:** En FAT32, `g_cluster_buf` de 32 KiB no soportaba clusters estándar de 64 KiB (128 sectores) y la lectura de directorios leía fuera de límites; en NTFS, los registros de fixups carecían de verificación de límites de offset y tamaño, y la lectura de clusters no residentes desbordaba el búfer estático.
+* **Soluciones de Ingeniería Implementadas:**
+  1. **Motor DMA Intel HDA Robusto y Determinista:**
+     - Se fijó una fuente de posición unívoca (`enum hda_fuente_pos`: DPIB bloqueado o LPIB) durante toda la sesión de reproducción.
+     - Se implementó un contador generacional de bloques (`g_bloque_gen[HDA_NUM_BLOQUES]`), impidiendo que un descriptor BDL sea rellenado más de una vez por ciclo del anillo DMA.
+     - Se introdujo validación de delta monótono: saltos negativos o que excedan el tamaño de un bloque (`HDA_TAMANO_BLOQUE_DMA`) son rechazados y contabilizados en `saltos_posicion_rechazados`.
+     - Se implementaron handshakes estrictos de detención y reset (`hda_detener_stream_hardware()` y `hda_reset_stream_hardware()`) con sondeo activo de bits de estado.
+     - Se añadió un búfer circular en RAM de 256 trazas (`audio_hda_volcar_trazas()`) sin escrituras bloqueantes a COM1 durante la reproducción.
+     - Se añadió `audio_hda_drenar()` para el vaciado limpio de muestras en EOF.
+  2. **Desacoplamiento en Reproductor Multimedia (`reproductor.c`):**
+     - `audio_hda_encolar_pcm()` ahora devuelve los bytes exactos aceptados para soporte de contrapresión.
+     - Se creó `reproductor_alimentar_audio()` para asegurar un colchón permanente >= 128 KiB, invocado activamente durante las esperas de PTS de video.
+     - Se eliminó el reseteo abrupto del reloj de audio en el primer cuadro de video.
+  3. **Blindaje de Controladores de Sistemas de Archivos (`fat32.c`, `ntfs.c`):**
+     - En FAT32, se amplió `g_cluster_buf` a 64 KiB, se validó la geometría del BPB (sectores por cluster <= 128) y se fragmentó la lectura de directorios y archivos en bloques seguros acotados.
+     - En NTFS, se añadieron comprobaciones rigurosas de límites en `ntfs_aplicar_fixups()`, validación del tamaño de registro MFT (máximo 1024 bytes) y segmentación de clusters no residentes en bloques de 4096 bytes.
+  4. **Simplificación de Comandos de Consola (`terminal.c`):**
+     - Se implementó el comando `entradas` (con alias `discos`, `unidades`, `puertos`, `monitor entradas`), mostrando un inventario intuitivo y legible sin tecnicismos innecesarios.
+     - Se implementó el comando universal `leer`:
+       * `leer`: Muestra guía de uso y lista de unidades disponibles.
+       * `leer <disco>` (ej: `leer 0`): Abre la unidad y despliega su lista de archivos.
+       * `leer <archivo>` (ej: `leer notas.txt`): Lee y muestra el archivo de texto.
+       * En caso de fallo, proporciona mensajes de orientación inmediata (`leer <disco>`).
+     - Se agregaron alias simplificados `archivos` y `arbol`.
+  5. **Comando `pray` (Homenaje a TempleOS):**
+     - Se incorporó el comando `pray` (alias `orar`, `rezar`, `oraculo`, `temple`), que consulta la entropía del procesador vía `rdtsc` para seleccionar entre 32 pasajes bíblicos clásicos en español y generar 7 palabras sagradas aleatorias al estilo del oráculo de Terry Davis.
+* **Archivos Modificados:**
+  - `nucleo/controladores/audio_hda.c`
+  - `nucleo/controladores/audio_hda.h`
+  - `nucleo/controladores/audio_ac97.c`
+  - `nucleo/controladores/audio_ac97.h`
+  - `nucleo/controladores/multimedia/reproductor/reproductor.c`
+  - `nucleo/controladores/fat32.c`
+  - `nucleo/controladores/ntfs.c`
+  - `nucleo/controladores/terminal.c`
+  - `nucleo/base/version.h`
+  - `BITACORA.md`
+* **Pruebas y Verificación:**
+  - Compilación y enlace exitosos en WSL Arch Linux (`clang` + `ld.lld`): 0 errores, 0 advertencias.
+  - Generación de imagen UEFI FAT32 (`build/taek-os.img`) e ISO híbrida booteable (`build/taek-os.iso`).

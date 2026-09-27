@@ -235,12 +235,19 @@ int audio_ac97_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
     if (g_usar_hda) return audio_hda_encolar_pcm(datos_pcm, tamano_bytes);
 
     // Fallback AC97: streaming continuo con buffer estático
-    return audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
+    int res = audio_ac97_reproducir_flujo(datos_pcm, tamano_bytes, 0);
+    return (res == 0) ? (int)tamano_bytes : -1;
 }
 
 int audio_ac97_iniciar_stream(void) {
     if (!g_iniciado) return -1;
     if (g_usar_hda) return audio_hda_iniciar_stream();
+    return 0;
+}
+
+int audio_ac97_drenar(void) {
+    if (!g_iniciado) return -1;
+    if (g_usar_hda) return audio_hda_drenar();
     return 0;
 }
 

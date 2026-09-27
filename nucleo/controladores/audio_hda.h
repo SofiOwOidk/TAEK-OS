@@ -17,6 +17,23 @@ struct __attribute__((packed)) hda_bdl_entrada {
     uint32_t ioc; // Bit 0 = Interrupt on completion
 };
 
+// Estados explícitos de la máquina de estados de reproducción (A2)
+enum hda_estado_reproductor {
+    HDA_ESTADO_DETENIDO      = 0,
+    HDA_ESTADO_PREPARANDO    = 1,
+    HDA_ESTADO_REPRODUCIENDO = 2,
+    HDA_ESTADO_DRENANDO      = 3,
+    HDA_ESTADO_ERROR         = 4
+};
+
+// Fuentes de posición validadas del DMA
+enum hda_fuente_pos {
+    HDA_POS_NINGUNA = 0,
+    HDA_POS_DPIB    = 1, // Reporte de hardware en RAM (DMA Position-in-Buffer)
+    HDA_POS_LPIB    = 2, // Registro MMIO Link Position in Buffer
+    HDA_POS_BCIS    = 3  // Fallback por finalización de bloque
+};
+
 // Estado público del subsistema Intel HDA
 struct estado_hda {
     int      controlador_detectado;
@@ -34,12 +51,21 @@ struct estado_hda {
     uint8_t  num_bss;
     uint16_t codecs_detectados;
     int      reproduciendo;
+    enum hda_estado_reproductor estado_reproductor;
+    enum hda_fuente_pos         fuente_pos_activa;
+    uint32_t reproduccion_id;
     uint32_t bytes_reproducidos;
     uint64_t bytes_dma_totales; // Contador monotónico de posición DMA observada
     uint64_t bytes_en_cola;     // Bytes de la fuente ya copiados al ring
     uint32_t eventos_bcis;     // Finalizaciones BDL observadas y reconocidas
     uint32_t errores_stream;   // FIFO/Descriptor errors observados
     uint32_t vaciados_audio;   // Underruns de búfer observados
+    uint32_t silencio_insertado_bytes; // Bytes de ceros insertados por falta de muestras
+    uint32_t pcm_aceptado_bytes;       // Total de bytes PCM aceptados en cola
+    uint32_t pcm_rechazado_bytes;      // Bytes que no cupieron por backpressure
+    uint32_t saltos_posicion_rechazados; // Saltos no coherentes filtrados
+    uint32_t max_intervalo_sin_atencion_ms; // Máxima latencia entre llamadas a actualizar
+    uint64_t t_ultimo_servicio_ms;
     uint32_t bytes_totales;
 };
 
@@ -54,11 +80,15 @@ int  audio_hda_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes);
 // Inicia la reproducción en bucle continuo de un búfer PCM
 int  audio_hda_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes);
 
-// Encola datos PCM (44.1 kHz, 16 bits estéreo) en la cola persistente para streaming A/V continuo
+// Encola datos PCM (44.1 kHz, 16 bits estéreo) en la cola persistente para streaming A/V continuo.
+// Retorna la cantidad exacta de bytes aceptados (>= 0), o código negativo en caso de error.
 int  audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes);
 
 // Inicia explícitamente el stream DMA de audio continuo tras la precarga inicial
 int  audio_hda_iniciar_stream(void);
+
+// Solicita el drenado limpio de las muestras remanentes en cola antes de detener
+int  audio_hda_drenar(void);
 
 // Devuelve el número de bytes ocupados en la cola circular de streaming
 uint32_t audio_hda_cola_ocupada(void);
@@ -81,8 +111,11 @@ void audio_hda_actualizar(void);
 // Indica si el motor DMA del stream de audio se encuentra reproduciendo actualmente
 int  audio_hda_esta_reproduciendo(void);
 
-// Detiene inmediatamente la reproducción de audio y el motor DMA
+// Detiene inmediatamente la reproducción de audio y el motor DMA de forma segura
 void audio_hda_detener(void);
+
+// Vuelca el buffer circular de trazas diagnósticas en RAM a la salida serial
+void audio_hda_volcar_trazas(void);
 
 // Obtiene el estado actual del controlador Intel HDA
 const struct estado_hda *audio_hda_obtener_estado(void);

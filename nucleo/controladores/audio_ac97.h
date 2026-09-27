@@ -9,6 +9,7 @@ int  audio_ac97_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes);
 int  audio_ac97_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes);
 int  audio_ac97_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes);
 int  audio_ac97_iniciar_stream(void);
+int  audio_ac97_drenar(void);
 uint32_t audio_ac97_cola_ocupada(void);
 uint32_t audio_ac97_cola_disponible(void);
 uint64_t audio_ac97_obtener_tiempo_ms(void);

@@ -12,6 +12,7 @@
 #include "controladores/teclado.h"
 #include "controladores/xhci.h"
 #include "controladores/audio_ac97.h"
+#include "controladores/audio_hda.h"
 
 // ============================================================================
 // TAEK OS - REPRODUCTOR MULTIMEDIA H.264 & AAC (Hito A: Telemetría y Benchmark)
@@ -66,8 +67,11 @@ typedef struct {
     uint64_t retraso_pts_acumulado_us;
     uint64_t retraso_pts_max_us;
 
-    // Avance DMA y audio
+    // Avance DMA y audio (A4)
+    uint64_t pcm_producido_bytes;
+    uint64_t pcm_aceptado_bytes;
     uint64_t avance_dma_bytes;
+    uint32_t silencio_insertado_bytes;
     uint32_t vaciados_audio;
 
     // Registro de latencia por cuadro para cálculo de percentiles
@@ -87,6 +91,8 @@ typedef struct {
     telemetria_reproductor telem;
     uint64_t t_inicio_cuadro_ciclos;
     uint64_t ciclos_espera_pts_ultimo_cuadro;
+    aac_decodificador *dec_aac;
+    mp4_contenedor    *mp4;
 } reproductor;
 
 typedef struct {
@@ -137,6 +143,53 @@ static int atender(reproductor *p) {
         if (dt > p->telem.max_ciclos_hda_usb) p->telem.max_ciclos_hda_usb = dt;
     }
     return p ? p->cancelado : 0;
+}
+
+// Alimenta continuamente la cola de audio cuando baja de 128 KiB (A4)
+static void reproductor_alimentar_audio(reproductor *p) {
+    if (!p || !p->dec_aac || !p->mp4 || !p->mp4->tiene_audio || p->modo != MODO_INTERACTIVO) return;
+
+    while (p->mp4->a_indice < p->mp4->a_muestras && audio_ac97_cola_ocupada() < (128 * 1024)) {
+        const uint8_t *datos_audio;
+        size_t bytes_audio;
+        int64_t pts_audio;
+        uint64_t t_da0 = rdtsc();
+        int res_a = mp4_siguiente_audio(p->mp4, &datos_audio, &bytes_audio, &pts_audio);
+        uint64_t dt_da = rdtsc() - t_da0;
+        p->telem.ciclos_demux += dt_da;
+        if (dt_da > p->telem.max_ciclos_demux) p->telem.max_ciclos_demux = dt_da;
+        if (res_a <= 0) break;
+
+        const uint8_t *ptr_aac = datos_audio;
+        int rem_aac = (int)bytes_audio;
+        int16_t pcm_buf[2048];
+
+        uint64_t t_aac0 = rdtsc();
+        int s = aac_decodificar(p->dec_aac, &ptr_aac, &rem_aac, pcm_buf);
+        uint64_t dt_aac = rdtsc() - t_aac0;
+        p->telem.ciclos_aac += dt_aac;
+        if (dt_aac > p->telem.max_ciclos_aac) p->telem.max_ciclos_aac = dt_aac;
+
+        if (s > 0) {
+            uint32_t pcm_bytes = (uint32_t)(s * sizeof(int16_t));
+            const uint8_t *ptr_pcm = (const uint8_t *)pcm_buf;
+            p->telem.pcm_producido_bytes += pcm_bytes;
+
+            uint64_t t_snd0 = rdtsc();
+            while (pcm_bytes > 0) {
+                int esc = audio_ac97_encolar_pcm(ptr_pcm, pcm_bytes);
+                if (esc > 0) {
+                    ptr_pcm += esc;
+                    pcm_bytes -= (uint32_t)esc;
+                    p->telem.pcm_aceptado_bytes += (uint32_t)esc;
+                } else {
+                    atender(p);
+                    esperar_microsegundos(200);
+                }
+            }
+            p->telem.ciclos_hda_usb += (rdtsc() - t_snd0);
+        }
+    }
 }
 
 // Detección de CPU y conteo de hilos lógicos vía CPUID
@@ -278,7 +331,6 @@ static int presentar(void *usuario, const h264_imagen *im) {
     if (!p->cuadros) {
         p->primer_pts = im->marca_tiempo;
         p->inicio = tiempo_obtener_milisegundos();
-        audio_ac97_reiniciar_reloj();
     }
 
     p->ciclos_espera_pts_ultimo_cuadro = 0;
@@ -308,6 +360,7 @@ static int presentar(void *usuario, const h264_imagen *im) {
                 if (t_act >= destino) break;
                 if ((rdtsc() - t_pts0) >= max_ciclos_espera) break;
                 if (atender(p)) return 1;
+                reproductor_alimentar_audio(p);
                 esperar_microsegundos(200);
             }
             uint64_t dt_pts = rdtsc() - t_pts0;
@@ -581,12 +634,24 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     telem_println(" ms)");
     telem_println("---------------------------------------------------------------------------------");
 
-    telem_println("SUBSISTEMA DE AUDIO:");
-    telem_print("  Avance DMA Total               : ");
-    telem_print_dec(p->telem.avance_dma_bytes);
-    telem_println(" bytes enviados al controlador");
+    telem_println("SUBSISTEMA DE AUDIO (A4):");
+    telem_print("  PCM Producido por AAC          : ");
+    telem_print_dec(p->telem.pcm_producido_bytes);
+    telem_println(" bytes generados");
 
-    telem_print("  Vaciados / Underruns de Audio  : ");
+    telem_print("  PCM Aceptado en Cola           : ");
+    telem_print_dec(p->telem.pcm_aceptado_bytes);
+    telem_println(" bytes encolados");
+
+    telem_print("  Avance DMA Hardware Total      : ");
+    telem_print_dec(p->telem.avance_dma_bytes);
+    telem_println(" bytes procesados por silicio");
+
+    telem_print("  Silencio Insertado (Underrun)  : ");
+    telem_print_dec(p->telem.silencio_insertado_bytes);
+    telem_println(" bytes de relleno");
+
+    telem_print("  Vaciados de Búfer Registrados  : ");
     telem_print_dec(p->telem.vaciados_audio);
     telem_println("");
     telem_println("---------------------------------------------------------------------------------");
@@ -703,6 +768,9 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
         }
     }
 
+    p.dec_aac = dec_aac;
+    p.mp4 = &mp4;
+
     // Prebuffer inicial de audio para cebar el pipeline DMA (128 KiB = ambos bloques DMA de 64 KiB + margen)
     if (dec_aac && mp4.tiene_audio && modo == MODO_INTERACTIVO) {
         serial_imprimir_linea("[MULTIMEDIA] Precargando buffer de audio AAC (lookahead)...");
@@ -725,10 +793,22 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
             p.telem.ciclos_aac += (rdtsc() - t_aac0);
 
             if (s > 0) {
+                uint32_t pcm_bytes = (uint32_t)(s * sizeof(int16_t));
+                const uint8_t *ptr_pcm = (const uint8_t *)pcm_buf;
+                p.telem.pcm_producido_bytes += pcm_bytes;
+
                 uint64_t t_snd0 = rdtsc();
-                audio_ac97_encolar_pcm(pcm_buf, (uint32_t)(s * sizeof(int16_t)));
+                while (pcm_bytes > 0) {
+                    int esc = audio_ac97_encolar_pcm(ptr_pcm, pcm_bytes);
+                    if (esc > 0) {
+                        ptr_pcm += esc;
+                        pcm_bytes -= (uint32_t)esc;
+                        p.telem.pcm_aceptado_bytes += (uint32_t)esc;
+                    } else {
+                        break;
+                    }
+                }
                 p.telem.ciclos_hda_usb += (rdtsc() - t_snd0);
-                p.telem.avance_dma_bytes += (uint32_t)(s * sizeof(int16_t));
             }
         }
         // Iniciar hardware DMA con datos 100% reales
@@ -766,38 +846,8 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
         if (dt_dv > p.telem.max_ciclos_demux) p.telem.max_ciclos_demux = dt_dv;
         if (siguiente <= 0) { resultado = (h264_resultado)siguiente; break; }
 
-        // 2. Audio AAC (solo en MODO_INTERACTIVO): mantener reserva de al menos 128 KiB en cola
-        if (dec_aac && mp4.tiene_audio && modo == MODO_INTERACTIVO) {
-            const uint8_t *datos_audio;
-            size_t bytes_audio;
-            int64_t pts_audio;
-            while (mp4.a_indice < mp4.a_muestras && audio_ac97_cola_ocupada() < (128 * 1024)) {
-                uint64_t t_da0 = rdtsc();
-                int res_a = mp4_siguiente_audio(&mp4, &datos_audio, &bytes_audio, &pts_audio);
-                uint64_t dt_da = rdtsc() - t_da0;
-                p.telem.ciclos_demux += dt_da;
-                if (dt_da > p.telem.max_ciclos_demux) p.telem.max_ciclos_demux = dt_da;
-                if (res_a <= 0) break;
-
-                const uint8_t *ptr_aac = datos_audio;
-                int rem_aac = (int)bytes_audio;
-                int16_t pcm_buf[2048];
-
-                uint64_t t_aac0 = rdtsc();
-                int s = aac_decodificar(dec_aac, &ptr_aac, &rem_aac, pcm_buf);
-                uint64_t dt_aac = rdtsc() - t_aac0;
-                p.telem.ciclos_aac += dt_aac;
-                if (dt_aac > p.telem.max_ciclos_aac) p.telem.max_ciclos_aac = dt_aac;
-
-                if (s > 0) {
-                    uint64_t t_snd0 = rdtsc();
-                    int res_snd = audio_ac97_encolar_pcm(pcm_buf, (uint32_t)(s * sizeof(int16_t)));
-                    p.telem.ciclos_hda_usb += (rdtsc() - t_snd0);
-                    p.telem.avance_dma_bytes += (uint32_t)(s * sizeof(int16_t));
-                    if (res_snd < 0) p.telem.vaciados_audio++;
-                }
-            }
-        }
+        // 2. Audio AAC: mantener alimentación continua de la cola circular
+        reproductor_alimentar_audio(&p);
 
         // 3. Decodificación de muestra H.264
         resultado = h264_decodificar_muestra_avcc(dec, mp4.v_longitud_nal, datos, bytes, pts);
@@ -806,8 +856,24 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
 
     uint64_t duracion_real_ms = tiempo_obtener_milisegundos() - t_inicio_reproduccion;
 
+    if (dec_aac && !p.cancelado && !p.error) {
+        audio_ac97_drenar();
+        uint64_t t_drenar_ini = tiempo_obtener_milisegundos();
+        while (audio_ac97_esta_reproduciendo() && (tiempo_obtener_milisegundos() - t_drenar_ini < 1500)) {
+            atender(&p);
+            esperar_milisegundos(10);
+        }
+    }
+
     if (dec_aac) {
-        p.telem.vaciados_audio = audio_ac97_obtener_vaciados();
+        if (audio_es_intel_hda()) {
+            const struct estado_hda *st = audio_hda_obtener_estado();
+            p.telem.avance_dma_bytes = st->bytes_dma_totales;
+            p.telem.silencio_insertado_bytes = st->silencio_insertado_bytes;
+            p.telem.vaciados_audio = st->vaciados_audio;
+        } else {
+            p.telem.vaciados_audio = audio_ac97_obtener_vaciados();
+        }
         audio_ac97_detener();
         aac_destruir(dec_aac);
     }

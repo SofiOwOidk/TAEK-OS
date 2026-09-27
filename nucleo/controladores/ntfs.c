@@ -1,6 +1,7 @@
 #include "ntfs.h"
 #include "usb_msc.h"
 #include "consola.h"
+#include "../arquitectura/x86_64/serial.h"
 #include "../base/memoria.h"
 
 // ============================================================================
@@ -78,20 +79,24 @@ void ntfs_desmontar(void) {
 
 // Aplica la secuencia de actualización (USA / Fixups) a un registro MFT de 1024 bytes
 static int ntfs_aplicar_fixups(uint8_t *buffer, uint32_t tamano) {
+    if (!buffer || tamano < 512) return -1;
     struct ntfs_registro_mft *reg = (struct ntfs_registro_mft *)buffer;
     if (reg->magic != NTFS_MAGIC_FILE) return -1;
 
     uint16_t usa_offset = reg->usa_offset;
     uint16_t usa_count = reg->usa_count;
 
-    if (usa_count < 2 || usa_offset + usa_count * 2 > tamano) return -2;
+    if (usa_offset < 40 || (uint32_t)usa_offset + ((uint32_t)usa_count * 2) > tamano) return -2;
 
     uint16_t usa_num = *(uint16_t *)&buffer[usa_offset];
     uint16_t *usa_array = (uint16_t *)&buffer[usa_offset + 2];
 
     uint32_t num_sectores = tamano / 512;
-    for (uint32_t s = 0; s < num_sectores && s < (uint32_t)(usa_count - 1); s++) {
+    if (usa_count < num_sectores + 1) return -2;
+
+    for (uint32_t s = 0; s < num_sectores; s++) {
         uint32_t sector_end_offset = (s + 1) * 512 - 2;
+        if (sector_end_offset + 2 > tamano) return -2;
         uint16_t sector_sig = *(uint16_t *)&buffer[sector_end_offset];
         if (sector_sig != usa_num) {
             // Error de integridad en sector
@@ -104,6 +109,7 @@ static int ntfs_aplicar_fixups(uint8_t *buffer, uint32_t tamano) {
 
 static int ntfs_leer_registro_mft(uint32_t idx_mft, uint8_t *destino) {
     if (!g_vol_ntfs.montado) return -1;
+    if (g_vol_ntfs.tamano_registro_mft > sizeof(g_ntfs_record_buf)) return -1;
 
     uint32_t lba_mft_base = g_vol_ntfs.lba_inicio_particion + (uint32_t)(g_vol_ntfs.lcn_mft * g_vol_ntfs.sectores_por_cluster);
     uint32_t lba_registro = lba_mft_base + idx_mft * g_vol_ntfs.sectores_por_registro_mft;
@@ -291,7 +297,11 @@ int ntfs_montar(uint8_t unidad_msc) {
         g_vol_ntfs.tamano_registro_mft = (uint32_t)vbr->clusters_por_registro_mft * g_vol_ntfs.bytes_por_cluster;
     }
 
-    if (g_vol_ntfs.bytes_por_sector == 0) return -2;
+    if (g_vol_ntfs.bytes_por_sector != 512 || g_vol_ntfs.sectores_por_cluster == 0) return -2;
+    if (g_vol_ntfs.tamano_registro_mft > sizeof(g_ntfs_record_buf) || g_vol_ntfs.tamano_registro_mft < 512) {
+        serial_imprimir_linea("[NTFS ERROR] Tamaño de registro MFT excede el búfer soportado (1024 B).");
+        return -3;
+    }
     g_vol_ntfs.sectores_por_registro_mft = g_vol_ntfs.tamano_registro_mft / g_vol_ntfs.bytes_por_sector;
 
     memcpy(g_vol_ntfs.etiqueta, "NTFS_VOL", 9);
@@ -562,18 +572,30 @@ int ntfs_leer_archivo_texto(const char *ruta) {
                     // Leer clusters correspondientes a este run
                     for (uint64_t c = 0; c < run_len && bytes_restantes > 0; c++) {
                         uint32_t cluster_lba = g_vol_ntfs.lba_inicio_particion + (uint32_t)((curr_lcn + c) * g_vol_ntfs.sectores_por_cluster);
-                        if (usb_msc_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba, g_vol_ntfs.sectores_por_cluster, g_ntfs_cluster_buf) != 0) {
-                            consola_imprimir_linea_color("[Error I/O leyendo cluster NTFS]", COLOR_AVISO_NTFS);
-                            break;
-                        }
+                        uint32_t sec_restantes = g_vol_ntfs.sectores_por_cluster;
+                        uint32_t sec_offset = 0;
 
-                        uint32_t a_leer = (bytes_restantes > g_vol_ntfs.bytes_por_cluster) ? g_vol_ntfs.bytes_por_cluster : (uint32_t)bytes_restantes;
-                        for (uint32_t b = 0; b < a_leer; b++) {
-                            char ch = (char)g_ntfs_cluster_buf[b];
-                            if (ch == '\r') continue;
-                            consola_escribir_caracter(ch);
+                        while (sec_restantes > 0 && bytes_restantes > 0) {
+                            uint32_t sec_a_leer = sec_restantes;
+                            uint32_t max_sec = sizeof(g_ntfs_cluster_buf) / 512;
+                            if (sec_a_leer > max_sec) sec_a_leer = max_sec;
+
+                            if (usb_msc_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba + sec_offset, (uint16_t)sec_a_leer, g_ntfs_cluster_buf) != 0) {
+                                consola_imprimir_linea_color("[Error I/O leyendo cluster NTFS]", COLOR_AVISO_NTFS);
+                                break;
+                            }
+
+                            uint32_t bytes_chunk = sec_a_leer * 512;
+                            uint32_t a_leer = (bytes_restantes > bytes_chunk) ? bytes_chunk : (uint32_t)bytes_restantes;
+                            for (uint32_t b = 0; b < a_leer; b++) {
+                                char ch = (char)g_ntfs_cluster_buf[b];
+                                if (ch == '\r') continue;
+                                consola_escribir_caracter(ch);
+                            }
+                            bytes_restantes -= a_leer;
+                            sec_offset += sec_a_leer;
+                            sec_restantes -= sec_a_leer;
                         }
-                        bytes_restantes -= a_leer;
                     }
                 }
                 consola_imprimir_linea("");
