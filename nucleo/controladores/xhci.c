@@ -1122,6 +1122,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                 else if (ep->es_boot) {
                     mod = buf[0];
                     shift = (mod & 0x02) || (mod & 0x20);
+                    int ctrl = (mod & 0x01) || (mod & 0x10);
 
                     for (int k = 2; k < 8 && k < (int)tam_recibido; k++) {
                         uint8_t scancode = buf[k];
@@ -1137,6 +1138,9 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
                         if (!ya_estaba && scancode < 128) {
                             char c = shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode];
+                            if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                                c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
+                            }
                             if (c != 0) {
                                 uint32_t sig_cabeza = (g_buf_cabeza + 1) % TAM_BUFFER_TECLAS;
                                 if (sig_cabeza != g_buf_cola) {
@@ -1183,6 +1187,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                 else if (tam_recibido >= 8 && (buf[0] == 0x01 || buf[0] == 0x02)) {
                     mod = buf[1];
                     shift = (mod & 0x02) || (mod & 0x20);
+                    int ctrl = (mod & 0x01) || (mod & 0x10);
 
                     for (int k = 2; k < 8 && k < (int)tam_recibido; k++) {
                         uint8_t scancode = buf[k];
@@ -1198,6 +1203,9 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
                         if (!ya_estaba && scancode < 128) {
                             char c = shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode];
+                            if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                                c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
+                            }
                             if (c != 0) {
                                 uint32_t sig_cabeza = (g_buf_cabeza + 1) % TAM_BUFFER_TECLAS;
                                 if (sig_cabeza != g_buf_cola) {
@@ -1215,6 +1223,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                 else if (tam_recibido >= 8) {
                     mod = buf[0];
                     shift = (mod & 0x02) || (mod & 0x20);
+                    int ctrl = (mod & 0x01) || (mod & 0x10);
 
                     for (int k = 2; k < 8 && k < (int)tam_recibido; k++) {
                         uint8_t scancode = buf[k];
@@ -1230,6 +1239,9 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
                         if (!ya_estaba && scancode < 128) {
                             char c = shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode];
+                            if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                                c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
+                            }
                             if (c != 0) {
                                 uint32_t sig_cabeza = (g_buf_cabeza + 1) % TAM_BUFFER_TECLAS;
                                 if (sig_cabeza != g_buf_cola) {

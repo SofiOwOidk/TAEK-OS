@@ -25,12 +25,7 @@ static volatile struct limine_module_request peticion_video = {
     .revision = 0
 };
 
-// Modos de ejecución soportados
-enum modo_reproduccion {
-    MODO_INTERACTIVO   = 0, // Video + Audio + Presentación 100% + Sincronización PTS
-    MODO_PRUEBA_FORENSE = 1, // Hash FNV-1a en 100% de cuadros, presentación 1/100, sin espera PTS
-    MODO_BENCHMARK     = 2  // Rendimiento pico de hardware: presentación 100%, sin espera PTS
-};
+// Modos de ejecución soportados definidos en reproductor.h
 
 typedef struct {
     // Ciclos acumulados por etapa
@@ -133,7 +128,14 @@ static int atender(reproductor *p) {
     xhci_sondeo();
     audio_ac97_actualizar();
     while (teclado_hay_datos()) {
-        if (teclado_leer_caracter() == 27) {
+        char c = teclado_leer_caracter();
+        if (c == 27 || c == 3 || c == 'q' || c == 'Q') {
+            if (p) p->cancelado = 1;
+        }
+    }
+    char cc;
+    while ((cc = consola_leer_caracter()) != 0) {
+        if (cc == 27 || cc == 3 || cc == 'q' || cc == 'Q') {
             if (p) p->cancelado = 1;
         }
     }
@@ -702,35 +704,19 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     serial_imprimir_linea("");
 }
 
-static void reproducir(const char *nombre, enum modo_reproduccion modo) {
-    struct limine_file *archivo = NULL;
-    struct limine_module_response *r = peticion_video.response;
-    if (r) for (uint64_t i = 0; i < r->module_count; i++) {
-        if (iguales(r->modules[i]->cmdline, nombre)) { archivo = r->modules[i]; break; }
-    }
-    if (!archivo) {
-        if (iguales(nombre, "h264:1080p")) {
-            consola_imprimir_linea_color("El video 1080p fue descartado del arranque para reducir el tamaño de TAEK OS.", COLOR_AVISO_DEFAULT);
-            consola_imprimir_linea("Puedes grabarlo en un pendrive USB para probar la lectura con 'disco' y 'cat'.");
-            consola_imprimir_linea("Para probar la decodificación interna, ejecuta: 'h264 360p'.");
-        } else {
-            consola_imprimir_linea_color("No está cargado ese módulo MP4 en memoria.", COLOR_ERROR_DEFAULT);
-            consola_imprimir("Módulo buscado: "); consola_imprimir_linea_color(nombre, COLOR_AVISO_DEFAULT);
-        }
-        serial_imprimir_linea("[MULTIMEDIA] ERROR: módulo MP4 ausente");
-        return;
-    }
+int reproductor_reproducir_memoria(const void *datos, size_t tamano, const char *nombre, enum modo_reproduccion modo) {
+    if (!datos || tamano == 0) return -1;
 
     mp4_contenedor mp4;
-    mp4_resultado res_mp4 = mp4_abrir(&mp4, archivo->address, (size_t)archivo->size);
+    mp4_resultado res_mp4 = mp4_abrir(&mp4, datos, tamano);
     if (res_mp4 != MP4_OK) {
         consola_imprimir_linea("MP4 inválido o contenedor no soportado.");
         serial_imprimir_linea("[MULTIMEDIA] ERROR MP4");
-        return;
+        return -2;
     }
     if (!mp4_tiene_video(&mp4)) {
         consola_imprimir_linea("El archivo MP4 no contiene pista de video compatible.");
-        return;
+        return -3;
     }
 
     reproductor p = {
@@ -751,7 +737,7 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
     if (!dec) {
         consola_imprimir_linea("Memoria insuficiente para H.264.");
         if (p.telem.tiempos_cuadro_us) soltar(&p, p.telem.tiempos_cuadro_us);
-        return;
+        return -4;
     }
 
     aac_decodificador *dec_aac = NULL;
@@ -815,7 +801,7 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
         audio_ac97_iniciar_stream();
     }
 
-    consola_imprimir("Reproductor Multimedia TAEK OS. Presiona ESC para salir...");
+    consola_imprimir("Reproductor Multimedia TAEK OS. Presiona ESC o Ctrl+C para salir...");
     if (modo == MODO_PRUEBA_FORENSE) {
         consola_imprimir_linea_color(" [MODO PRUEBA FORENSE FNV-1a]", COLOR_AVISO_DEFAULT);
     } else if (modo == MODO_BENCHMARK) {
@@ -830,17 +816,17 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
     uint64_t t_inicio_reproduccion = tiempo_obtener_milisegundos();
 
     while (!resultado) {
-        const uint8_t *datos;
-        size_t bytes;
-        int64_t pts;
-        uint32_t duracion;
+        const uint8_t *datos_v;
+        size_t bytes_v;
+        int64_t pts_v;
+        uint32_t duracion_v;
         if (atender(&p)) { resultado = H264_CANCELADO; break; }
 
         if (p.t_inicio_cuadro_ciclos == 0) p.t_inicio_cuadro_ciclos = rdtsc();
 
         // 1. Demux de video
         uint64_t t_dv0 = rdtsc();
-        int siguiente = mp4_siguiente_video(&mp4, &datos, &bytes, &pts, &duracion);
+        int siguiente = mp4_siguiente_video(&mp4, &datos_v, &bytes_v, &pts_v, &duracion_v);
         uint64_t dt_dv = rdtsc() - t_dv0;
         p.telem.ciclos_demux += dt_dv;
         if (dt_dv > p.telem.max_ciclos_demux) p.telem.max_ciclos_demux = dt_dv;
@@ -850,7 +836,7 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
         reproductor_alimentar_audio(&p);
 
         // 3. Decodificación de muestra H.264
-        resultado = h264_decodificar_muestra_avcc(dec, mp4.v_longitud_nal, datos, bytes, pts);
+        resultado = h264_decodificar_muestra_avcc(dec, mp4.v_longitud_nal, datos_v, bytes_v, pts_v);
     }
     if (!resultado) resultado = h264_finalizar(dec);
 
@@ -897,6 +883,30 @@ static void reproducir(const char *nombre, enum modo_reproduccion modo) {
     serial_imprimir_dec((uint64_t)(despues.heap_bytes_en_uso >= antes.heap_bytes_en_uso ?
                         despues.heap_bytes_en_uso - antes.heap_bytes_en_uso : 0));
     serial_imprimir_linea("");
+
+    return p.cancelado ? 1 : 0;
+}
+
+static void reproducir(const char *nombre, enum modo_reproduccion modo) {
+    struct limine_file *archivo = NULL;
+    struct limine_module_response *r = peticion_video.response;
+    if (r) for (uint64_t i = 0; i < r->module_count; i++) {
+        if (iguales(r->modules[i]->cmdline, nombre)) { archivo = r->modules[i]; break; }
+    }
+    if (!archivo) {
+        if (iguales(nombre, "h264:1080p")) {
+            consola_imprimir_linea_color("El video 1080p fue descartado del arranque para reducir el tamaño de TAEK OS.", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("Puedes grabarlo en un pendrive USB para probar la lectura con 'disco' y 'cat'.");
+            consola_imprimir_linea("Para probar la decodificación interna, ejecuta: 'h264 360p'.");
+        } else {
+            consola_imprimir_linea_color("No está cargado ese módulo MP4 en memoria.", COLOR_ERROR_DEFAULT);
+            consola_imprimir("Módulo buscado: "); consola_imprimir_linea_color(nombre, COLOR_AVISO_DEFAULT);
+        }
+        serial_imprimir_linea("[MULTIMEDIA] ERROR: módulo MP4 ausente");
+        return;
+    }
+
+    reproductor_reproducir_memoria(archivo->address, (size_t)archivo->size, nombre, modo);
 }
 
 static void audio_aac_probar(const char *nombre) {

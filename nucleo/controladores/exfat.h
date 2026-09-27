@@ -116,6 +116,7 @@ const struct exfat_volumen *exfat_obtener_volumen(void);
 int  exfat_ejecutar_tree(const char *ruta_inicial);
 int  exfat_listar_directorio(const char *ruta);
 int  exfat_leer_archivo_texto(const char *ruta);
+int  exfat_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out);
 
 // Escritura en exFAT
 int  exfat_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);

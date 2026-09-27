@@ -118,6 +118,9 @@ int  fat32_listar_directorio(const char *ruta);
 // Lee y muestra en pantalla un archivo de texto plano ('cat')
 int  fat32_leer_archivo_texto(const char *ruta);
 
+// Lee un archivo binario completo en memoria desde FAT32
+int  fat32_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out);
+
 // Escritura en FAT32
 int  fat32_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);
 int  fat32_crear_directorio(const char *nombre);

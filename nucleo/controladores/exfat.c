@@ -1,7 +1,9 @@
 #include "exfat.h"
+#include "vfs.h"
 #include "usb_msc.h"
 #include "consola.h"
 #include "../base/memoria.h"
+#include "../base/dma.h"
 
 // ============================================================================
 // TAEK OS - IMPLEMENTACIÓN DEL CONTROLADOR exFAT (Hito 50)
@@ -483,22 +485,55 @@ int exfat_listar_directorio(const char *ruta) {
     struct exfat_nodo *nodos = g_exfat_nodos;
     int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
 
-    consola_imprimir_linea_color("TIPO    TAMAÑO     CLUSTER    NOMBRE", COLOR_AVISO_EXFAT);
-    consola_imprimir_linea_color("----    ------     -------    ------", COLOR_AVISO_EXFAT);
+    vfs_limpiar_catalogo();
+
+    consola_imprimir_linea_color("==================== ARCHIVOS EN DISCO (exFAT) ====================", COLOR_AVISO_EXFAT);
+    consola_imprimir_linea_color("#    TIPO     TAMAÑO        NOMBRE", COLOR_AVISO_EXFAT);
+    consola_imprimir_linea("----------------------------------------------------------------------");
 
     for (int i = 0; i < total; i++) {
+        vfs_agregar_entrada_catalogo(nodos[i].nombre, nodos[i].tamano_bytes, nodos[i].es_directorio ? VFS_NODO_DIRECTORIO : VFS_NODO_ARCHIVO);
+        enum vfs_tipo_archivo tipo = nodos[i].es_directorio ? VFS_TIPO_DIR : vfs_detectar_tipo_archivo(nodos[i].nombre);
+
+        consola_imprimir("[");
+        consola_imprimir_dec(i + 1);
+        consola_imprimir("] ");
+        if (i + 1 < 10) consola_imprimir(" ");
+
         if (nodos[i].es_directorio) {
-            consola_imprimir_color("[DIR]   ", COLOR_DIR_EXFAT);
-            consola_imprimir("   -       ");
+            consola_imprimir_color("<DIR> ", COLOR_DIR_EXFAT);
+            consola_imprimir("      ---       ");
+            consola_imprimir_color(nodos[i].nombre, COLOR_DIR_EXFAT);
+            consola_imprimir_linea("/");
         } else {
-            consola_imprimir_color("[ARCH]  ", COLOR_FILE_EXFAT);
-            consola_imprimir_dec((uint32_t)nodos[i].tamano_bytes);
-            consola_imprimir(" B    ");
+            if (tipo == VFS_TIPO_MP4) {
+                consola_imprimir_color("[MP4] ", COLOR_BIN_EXFAT);
+            } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
+                consola_imprimir_color("[IMG] ", COLOR_DIR_EXFAT);
+            } else if (tipo == VFS_TIPO_TEXTO) {
+                consola_imprimir_color("[TXT] ", COLOR_TXT_EXFAT);
+            } else {
+                consola_imprimir("FILE  ");
+            }
+            if (nodos[i].tamano_bytes >= 1024 * 1024) {
+                consola_imprimir_dec((uint32_t)(nodos[i].tamano_bytes / (1024 * 1024)));
+                consola_imprimir(".");
+                consola_imprimir_dec((uint32_t)((nodos[i].tamano_bytes % (1024 * 1024)) / 100000));
+                consola_imprimir(" MB");
+            } else if (nodos[i].tamano_bytes >= 1024) {
+                consola_imprimir_dec((uint32_t)(nodos[i].tamano_bytes / 1024));
+                consola_imprimir(" KB");
+            } else {
+                consola_imprimir_dec((uint32_t)nodos[i].tamano_bytes);
+                consola_imprimir(" B ");
+            }
+            consola_imprimir("       ");
+            consola_imprimir_linea(nodos[i].nombre);
         }
-        consola_imprimir_dec(nodos[i].cluster_inicio);
-        consola_imprimir("        ");
-        consola_imprimir_linea(nodos[i].nombre);
     }
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_AVISO_EXFAT);
+    consola_imprimir_linea_color("Tip: Escribe 'abrir <n>' (ej: abrir 1) o 'abrir <nombre>' para reproducir o ver.", COLOR_FILE_EXFAT);
+    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_EXFAT);
     return 0;
 }
 
@@ -563,6 +598,76 @@ int exfat_leer_archivo_texto(const char *ruta) {
         }
     }
     consola_imprimir_linea("");
+    return 0;
+}
+
+// Lee un archivo binario completo en memoria desde exFAT
+int exfat_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out) {
+    if (!ruta || !buf_out || !tam_out) return -1;
+    *buf_out = NULL;
+    *tam_out = 0;
+    if (es_dma_out) *es_dma_out = 0;
+
+    if (!g_vol_exfat.montado) {
+        if (exfat_montar(0) != 0) return -2;
+    }
+
+    struct exfat_nodo *nodos = g_exfat_nodos;
+    int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
+
+    int idx = -1;
+    for (int i = 0; i < total; i++) {
+        if (!nodos[i].es_directorio && exfat_str_igual_sin_caso(nodos[i].nombre, ruta)) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx < 0) return -3;
+    uint64_t tam64 = nodos[idx].tamano_bytes;
+    if (tam64 == 0) return -4;
+    size_t tam = (size_t)tam64;
+
+    int es_dma = 0;
+    uint64_t phys_dma = 0;
+    void *buf = asignar_memoria(tam);
+    if (!buf && tam <= (30 * 1024 * 1024)) {
+        buf = dma_asignar_bufer_contiguo(tam, 4096, &phys_dma);
+        if (buf) es_dma = 1;
+    }
+    if (!buf) {
+        consola_imprimir_linea_color("  [exFAT ERROR] Memoria insuficiente para cargar archivo binario.", COLOR_AVISO_EXFAT);
+        return -5;
+    }
+
+    uint32_t curr_cluster = nodos[idx].cluster_inicio;
+    uint64_t restante = tam64;
+    uint8_t sin_fat = nodos[idx].sin_cadena_fat;
+    uint8_t *dest = (uint8_t *)buf;
+
+    while (restante > 0 && curr_cluster != 0xFFFFFFFF && curr_cluster >= 2) {
+        if (exfat_leer_cluster(curr_cluster, g_exfat_cluster_buf) != 0) {
+            consola_imprimir_linea_color("[Error de lectura I/O de cluster en exFAT]", COLOR_AVISO_EXFAT);
+            if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+            else liberar_memoria(buf);
+            return -6;
+        }
+
+        uint32_t a_leer = (restante > g_vol_exfat.bytes_por_cluster) ? g_vol_exfat.bytes_por_cluster : (uint32_t)restante;
+        memcpy(dest, g_exfat_cluster_buf, a_leer);
+        dest += a_leer;
+        restante -= a_leer;
+
+        if (sin_fat) {
+            curr_cluster++;
+        } else {
+            curr_cluster = exfat_siguiente_cluster(curr_cluster);
+        }
+    }
+
+    *buf_out = buf;
+    *tam_out = tam;
+    if (es_dma_out) *es_dma_out = es_dma;
     return 0;
 }
 

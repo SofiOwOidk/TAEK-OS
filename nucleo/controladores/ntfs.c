@@ -1,8 +1,10 @@
 #include "ntfs.h"
+#include "vfs.h"
 #include "usb_msc.h"
 #include "consola.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../base/memoria.h"
+#include "../base/dma.h"
 
 // ============================================================================
 // TAEK OS - IMPLEMENTACIÓN DEL CONTROLADOR NTFS (Hito 50)
@@ -452,24 +454,59 @@ int ntfs_listar_directorio(const char *ruta) {
         }
     }
 
-    consola_imprimir_linea_color("TIPO    TAMAÑO     MFT#    NOMBRE", COLOR_AVISO_NTFS);
-    consola_imprimir_linea_color("----    ------     ----    ------", COLOR_AVISO_NTFS);
+    vfs_limpiar_catalogo();
 
+    consola_imprimir_linea_color("==================== ARCHIVOS EN DISCO (NTFS) ====================", COLOR_AVISO_NTFS);
+    consola_imprimir_linea_color("#    TIPO     TAMAÑO        NOMBRE", COLOR_AVISO_NTFS);
+    consola_imprimir_linea("----------------------------------------------------------------------");
+
+    int num_mostrados = 0;
     for (int i = 0; i < g_total_nodos_ntfs; i++) {
         if (g_ntfs_nodos[i].es_sistema || g_ntfs_nodos[i].padre_mft_idx != 5) continue;
 
+        num_mostrados++;
+        vfs_agregar_entrada_catalogo(g_ntfs_nodos[i].nombre, g_ntfs_nodos[i].tamano_bytes, g_ntfs_nodos[i].es_directorio ? VFS_NODO_DIRECTORIO : VFS_NODO_ARCHIVO);
+        enum vfs_tipo_archivo tipo = g_ntfs_nodos[i].es_directorio ? VFS_TIPO_DIR : vfs_detectar_tipo_archivo(g_ntfs_nodos[i].nombre);
+
+        consola_imprimir("[");
+        consola_imprimir_dec(num_mostrados);
+        consola_imprimir("] ");
+        if (num_mostrados < 10) consola_imprimir(" ");
+
         if (g_ntfs_nodos[i].es_directorio) {
-            consola_imprimir_color("[DIR]   ", COLOR_DIR_NTFS);
-            consola_imprimir("   -       ");
+            consola_imprimir_color("<DIR> ", COLOR_DIR_NTFS);
+            consola_imprimir("      ---       ");
+            consola_imprimir_color(g_ntfs_nodos[i].nombre, COLOR_DIR_NTFS);
+            consola_imprimir_linea("/");
         } else {
-            consola_imprimir_color("[ARCH]  ", COLOR_FILE_NTFS);
-            consola_imprimir_dec((uint32_t)g_ntfs_nodos[i].tamano_bytes);
-            consola_imprimir(" B    ");
+            if (tipo == VFS_TIPO_MP4) {
+                consola_imprimir_color("[MP4] ", COLOR_BIN_NTFS);
+            } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
+                consola_imprimir_color("[IMG] ", COLOR_DIR_NTFS);
+            } else if (tipo == VFS_TIPO_TEXTO) {
+                consola_imprimir_color("[TXT] ", COLOR_TXT_NTFS);
+            } else {
+                consola_imprimir("FILE  ");
+            }
+            if (g_ntfs_nodos[i].tamano_bytes >= 1024 * 1024) {
+                consola_imprimir_dec((uint32_t)(g_ntfs_nodos[i].tamano_bytes / (1024 * 1024)));
+                consola_imprimir(".");
+                consola_imprimir_dec((uint32_t)((g_ntfs_nodos[i].tamano_bytes % (1024 * 1024)) / 100000));
+                consola_imprimir(" MB");
+            } else if (g_ntfs_nodos[i].tamano_bytes >= 1024) {
+                consola_imprimir_dec((uint32_t)(g_ntfs_nodos[i].tamano_bytes / 1024));
+                consola_imprimir(" KB");
+            } else {
+                consola_imprimir_dec((uint32_t)g_ntfs_nodos[i].tamano_bytes);
+                consola_imprimir(" B ");
+            }
+            consola_imprimir("       ");
+            consola_imprimir_linea(g_ntfs_nodos[i].nombre);
         }
-        consola_imprimir_dec(g_ntfs_nodos[i].mft_idx);
-        consola_imprimir("       ");
-        consola_imprimir_linea(g_ntfs_nodos[i].nombre);
     }
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_AVISO_NTFS);
+    consola_imprimir_linea_color("Tip: Escribe 'abrir <n>' (ej: abrir 1) o 'abrir <nombre>' para reproducir o ver.", COLOR_FILE_NTFS);
+    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_NTFS);
     return 0;
 }
 
@@ -608,4 +645,136 @@ int ntfs_leer_archivo_texto(const char *ruta) {
 
     consola_imprimir_linea_color("[Archivo sin flujo de datos $DATA]", COLOR_AVISO_NTFS);
     return 0;
+}
+
+// Lee un archivo binario completo en memoria desde NTFS
+int ntfs_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out) {
+    if (!ruta || !buf_out || !tam_out) return -1;
+    *buf_out = NULL;
+    *tam_out = 0;
+    if (es_dma_out) *es_dma_out = 0;
+
+    if (!g_vol_ntfs.montado) {
+        if (ntfs_montar(0) != 0) return -2;
+    }
+
+    int idx_nodo = -1;
+    for (int i = 0; i < g_total_nodos_ntfs; i++) {
+        if (!g_ntfs_nodos[i].es_directorio && ntfs_str_igual_sin_caso(g_ntfs_nodos[i].nombre, ruta)) {
+            idx_nodo = i;
+            break;
+        }
+    }
+    if (idx_nodo < 0) return -3;
+
+    uint32_t mft_idx = g_ntfs_nodos[idx_nodo].mft_idx;
+    if (ntfs_leer_registro_mft(mft_idx, g_ntfs_record_buf) != 0) return -4;
+
+    struct ntfs_registro_mft *reg = (struct ntfs_registro_mft *)g_ntfs_record_buf;
+    uint32_t offset = reg->primer_atributo_offset;
+    uint32_t tam_usado = reg->tamano_usado;
+    uint64_t tam64 = g_ntfs_nodos[idx_nodo].tamano_bytes;
+    if (tam64 == 0) return -5;
+    size_t tam = (size_t)tam64;
+
+    int es_dma = 0;
+    uint64_t phys_dma = 0;
+    void *buf = asignar_memoria(tam);
+    if (!buf && tam <= (30 * 1024 * 1024)) {
+        buf = dma_asignar_bufer_contiguo(tam, 4096, &phys_dma);
+        if (buf) es_dma = 1;
+    }
+    if (!buf) {
+        consola_imprimir_linea_color("  [NTFS ERROR] Memoria insuficiente para cargar archivo binario.", COLOR_AVISO_NTFS);
+        return -6;
+    }
+
+    uint8_t *dest = (uint8_t *)buf;
+
+    while (offset + sizeof(struct ntfs_atributo_cabecera) <= tam_usado && offset < g_vol_ntfs.tamano_registro_mft) {
+        struct ntfs_atributo_cabecera *attr = (struct ntfs_atributo_cabecera *)&g_ntfs_record_buf[offset];
+        if (attr->tipo == NTFS_ATTR_END || attr->longitud == 0) break;
+
+        if (attr->tipo == NTFS_ATTR_DATA) {
+            if (attr->no_residente == 0) {
+                struct ntfs_atributo_residente *res = (struct ntfs_atributo_residente *)attr;
+                uint8_t *datos = &g_ntfs_record_buf[offset + res->offset_valor];
+                uint32_t len = res->longitud_valor;
+                if (len > tam) len = (uint32_t)tam;
+                memcpy(dest, datos, len);
+                *buf_out = buf;
+                *tam_out = tam;
+                if (es_dma_out) *es_dma_out = es_dma;
+                return 0;
+            } else {
+                struct ntfs_atributo_no_residente *no_res = (struct ntfs_atributo_no_residente *)attr;
+                uint8_t *run_ptr = &g_ntfs_record_buf[offset + no_res->offset_data_runs];
+                uint64_t bytes_restantes = no_res->tamano_real;
+                int64_t prev_lcn = 0;
+
+                while (*run_ptr != 0 && bytes_restantes > 0) {
+                    uint8_t header = *run_ptr++;
+                    uint8_t len_size = header & 0x0F;
+                    uint8_t off_size = (header >> 4) & 0x0F;
+
+                    if (len_size == 0 || len_size > 8 || off_size > 8) break;
+
+                    uint64_t run_len = 0;
+                    for (int k = 0; k < len_size; k++) {
+                        run_len |= ((uint64_t)*run_ptr++) << (k * 8);
+                    }
+
+                    int64_t lcn_delta = 0;
+                    if (off_size > 0) {
+                        for (int k = 0; k < off_size; k++) {
+                            lcn_delta |= ((int64_t)*run_ptr++) << (k * 8);
+                        }
+                        if (*(run_ptr - 1) & 0x80) {
+                            for (int k = off_size; k < 8; k++) {
+                                lcn_delta |= ((int64_t)0xFF) << (k * 8);
+                            }
+                        }
+                    }
+
+                    int64_t curr_lcn = prev_lcn + lcn_delta;
+                    prev_lcn = curr_lcn;
+
+                    for (uint64_t c = 0; c < run_len && bytes_restantes > 0; c++) {
+                        uint32_t cluster_lba = g_vol_ntfs.lba_inicio_particion + (uint32_t)((curr_lcn + c) * g_vol_ntfs.sectores_por_cluster);
+                        uint32_t sec_restantes = g_vol_ntfs.sectores_por_cluster;
+                        uint32_t sec_offset = 0;
+
+                        while (sec_restantes > 0 && bytes_restantes > 0) {
+                            uint32_t sec_a_leer = sec_restantes;
+                            uint32_t max_sec = sizeof(g_ntfs_cluster_buf) / 512;
+                            if (sec_a_leer > max_sec) sec_a_leer = max_sec;
+
+                            if (usb_msc_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba + sec_offset, (uint16_t)sec_a_leer, g_ntfs_cluster_buf) != 0) {
+                                if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+                                else liberar_memoria(buf);
+                                return -7;
+                            }
+
+                            uint32_t bytes_chunk = sec_a_leer * 512;
+                            uint32_t a_copiar = (bytes_restantes > bytes_chunk) ? bytes_chunk : (uint32_t)bytes_restantes;
+                            memcpy(dest, g_ntfs_cluster_buf, a_copiar);
+                            dest += a_copiar;
+                            bytes_restantes -= a_copiar;
+                            sec_offset += sec_a_leer;
+                            sec_restantes -= sec_a_leer;
+                        }
+                    }
+                }
+                *buf_out = buf;
+                *tam_out = tam;
+                if (es_dma_out) *es_dma_out = es_dma;
+                return 0;
+            }
+        }
+        offset += attr->longitud;
+    }
+
+    if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+    else liberar_memoria(buf);
+    return -8;
 }

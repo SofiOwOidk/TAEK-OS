@@ -153,5 +153,6 @@ const struct ntfs_volumen *ntfs_obtener_volumen(void);
 int  ntfs_ejecutar_tree(const char *ruta_inicial);
 int  ntfs_listar_directorio(const char *ruta);
 int  ntfs_leer_archivo_texto(const char *ruta);
+int  ntfs_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out);
 
 #endif // CONTROLADORES_NTFS_H

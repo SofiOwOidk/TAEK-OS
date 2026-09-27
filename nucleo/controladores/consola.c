@@ -231,6 +231,12 @@ int consola_leer_linea(char *buffer, int max_len) {
         // Limpiar el cursor en la posición actual antes de procesar
         pantalla_dibujar_caracter(g_cursor_x, g_cursor_y, ' ', g_color_fg, g_color_bg);
 
+        if (c == 3) { // Ctrl+C
+            buffer[0] = '\0';
+            consola_imprimir_linea_color("^C", COLOR_AVISO_DEFAULT);
+            return 0;
+        }
+
         if (c == '\n' || c == '\r') {
             buffer[idx] = '\0';
             consola_escribir_caracter('\n');

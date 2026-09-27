@@ -2377,3 +2377,56 @@
 * **Pruebas y Verificación:**
   - Compilación y enlace exitosos en WSL Arch Linux (`clang` + `ld.lld`): 0 errores, 0 advertencias.
   - Generación de imagen UEFI FAT32 (`build/taek-os.img`) e ISO híbrida booteable (`build/taek-os.iso`).
+
+---
+
+### Hito 67 - Catálogo Indexado VFS, Selección Rápida y Reproducción Multimedia desde Almacenamiento USB (MP4, BMP, Texto) con Interrupción Limpia (2026-09-27)
+* **Objetivo y Contexto:**
+  - Implementar un flujo interactivo y simplificado para la navegación de discos y apertura/reproducción directa de archivos multimedia desde dispositivos de almacenamiento masivo USB (MSC).
+  - Integrar soporte completo para decodificación y visualización de imágenes BMP en el framebuffer UEFI GOP, auto-escaladas y centradas con cierre temporal o por teclado.
+  - Habilitar la reproducción directa de videos MP4 (H.264 + AAC) almacenados en unidades externas montadas en VFS, reportando la telemetría de rendimiento y ciclos al finalizar.
+  - Proporcionar soporte nativo para combinación de teclas `Ctrl+C` (ASCII 3) y tecla `ESC` (ASCII 27) tanto en el controlador de teclado USB xHCI como en PS/2 y consola, permitiendo cancelar reproducciones o vistas en cualquier instante sin comprometer la estabilidad del sistema ni del subsistema de audio.
+* **Componentes y Mejoras Implementadas:**
+  1. **Detección e Interrupción por Teclado (`Ctrl+C` / ESC):**
+     - En `nucleo/controladores/xhci.c`, se implementó la detección de modificadores de control (`mod & 0x01` o `mod & 0x10`) en los reportes HID de teclado, traduciendo combinaciones alfabéticas (`Ctrl+C` -> código ASCII 3).
+     - En `nucleo/controladores/teclado.c`, se implementó el seguimiento del estado de la tecla Control (scancodes `0x1D` y `0x9D`) en modo nativo PS/2.
+     - En `nucleo/controladores/consola.c`, se integró la captura de `Ctrl+C` en `consola_leer_linea()` con cancelación limpia de línea.
+     - En `nucleo/controladores/multimedia/reproductor/reproductor.c`, el ciclo principal de decodificación y espera de PTS monitoriza activamente `Ctrl+C` (código 3), `ESC` (27) y `'q'`, deteniendo de inmediato la reproducción, apagando el flujo DMA de audio y presentando el reporte acumulado de telemetría sin fugas ni desincronización de hardware.
+  2. **Catálogo VFS Indexado y Lógica Numérica:**
+     - En `nucleo/controladores/vfs.h` y `nucleo/controladores/vfs.c`, se diseñó la estructura unificada `struct vfs_catalogo` y `struct vfs_entrada` con capacidad para 128 entradas, clasificando archivos por tipo (`VFS_TIPO_MP4`, `VFS_TIPO_IMAGEN_BMP`, `VFS_TIPO_TEXTO`, `VFS_TIPO_DIR`).
+     - Se implementaron las funciones `vfs_obtener_catalogo()`, `vfs_obtener_entrada_catalogo()`, `vfs_buscar_entrada_catalogo()`, `vfs_limpiar_catalogo()`, `vfs_agregar_entrada_catalogo()`, `vfs_detectar_tipo_archivo()`.
+     - En los controladores de sistemas de archivos (`fat32.c`, `exfat.c`, `ntfs.c`, `ext4.c`), se adaptaron las funciones de listado de directorios para poblar el catálogo global y mostrar cada entrada con un índice numérico secuencial `[1]`, `[2]`, `[3]`, acompañado de la etiqueta de formato (`[MP4]`, `[IMG]`, `[TXT]`, `<DIR>`).
+  3. **Lectura Binaria de Archivos en VFS:**
+     - Se implementó `vfs_leer_archivo_binario()` y `vfs_liberar_archivo_binario()`, con soporte tanto para el heap del kernel (`asignar_memoria`) como para la arena contigua física DMA (`dma_asignar_bufer_contiguo`) como alternativa de gran escala.
+     - Se añadieron primitivas de lectura binaria en los cuatro sistemas de archivos: `fat32_leer_archivo_binario()`, `exfat_leer_archivo_binario()`, `ntfs_leer_archivo_binario()`, `ext4_leer_archivo_binario()`.
+  4. **Visor de Imágenes BMP en Ring 0 (`terminal.c`):**
+     - Se implementó `visor_imagen_mostrar()` con validación de cabeceras BMP (`BITMAPFILEHEADER` y `BITMAPINFOHEADER`), decodificación de 24 bpp (BGR) y 32 bpp (BGRA), soporte para orientación bottom-up y top-down.
+     - Se incorporó reescalado proporcional automático por interpolación de vecino más cercano cuando las dimensiones de la imagen superan la resolución nativa de la pantalla GOP.
+     - Se implementó temporizador de cierre automático a los 20 segundos y salida inmediata al presionar cualquier tecla, `Ctrl+C` o `ESC`, con restauración limpia del framebuffer de la consola y liberación de memoria.
+  5. **Comandos de Consola `seleccionar`, `abrir`, `retroceder` y Evolución de `leer`:**
+     - `seleccionar <disco>` (alias `select`, `elegir`): Monta la unidad USB seleccionada y lista inmediatamente sus archivos indexados con guía de uso.
+     - `abrir <numero|archivo>` (alias `open`, `play`, `reproducir`): Resuelve tanto números directos (ej: `abrir 1`) como nombres de archivo (ej: `abrir video.mp4`). Detecta automáticamente el tipo de archivo e invoca el motor H.264+AAC, el visor BMP o el visualizador de texto según corresponda.
+     - `retroceder` (alias `atras`, `volver`, `salir`, `back`, `cd ..`, `desmontar`, `umount`, `expulsar`): Desmonta limpiamente la unidad activa, libera los descriptores VFS y el catálogo, y regresa a la raíz de la terminal desplegando el estado actual de dispositivos.
+     - `leer <disco|archivo>`: Actualizado para resolver de forma inteligente índices numéricos del catálogo cuando una unidad está montada, dirigiendo a `abrir`, manteniendo la apertura de discos cuando el argumento es `0` o explícito.
+* **Archivos Modificados:**
+  - `nucleo/controladores/xhci.c`
+  - `nucleo/controladores/teclado.c`
+  - `nucleo/controladores/consola.c`
+  - `nucleo/controladores/multimedia/reproductor/reproductor.h`
+  - `nucleo/controladores/multimedia/reproductor/reproductor.c`
+  - `nucleo/controladores/vfs.h`
+  - `nucleo/controladores/vfs.c`
+  - `nucleo/controladores/fat32.h`
+  - `nucleo/controladores/fat32.c`
+  - `nucleo/controladores/exfat.h`
+  - `nucleo/controladores/exfat.c`
+  - `nucleo/controladores/ntfs.h`
+  - `nucleo/controladores/ntfs.c`
+  - `nucleo/controladores/ext4.h`
+  - `nucleo/controladores/ext4.c`
+  - `nucleo/controladores/terminal.c`
+  - `nucleo/base/version.h`
+  - `BITACORA.md`
+* **Pruebas y Verificación:**
+  - Compilación y enlace exitosos en WSL Arch Linux (`clang` + `ld.lld`): 0 errores, 0 advertencias.
+  - Generación de imagen UEFI FAT32 (`build/taek-os.img`) e ISO híbrida booteable (`build/taek-os.iso`).

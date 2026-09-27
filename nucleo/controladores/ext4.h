@@ -193,6 +193,7 @@ const struct ext4_volumen *ext4_obtener_volumen(void);
 int  ext4_ejecutar_tree(const char *ruta_inicial);
 int  ext4_listar_directorio(const char *ruta);
 int  ext4_leer_archivo_texto(const char *ruta);
+int  ext4_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out);
 
 // Escritura en ext4
 int  ext4_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);

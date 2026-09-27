@@ -6,6 +6,7 @@
 
 static int g_shift = 0;
 static int g_bloq_mayus = 0;
+static int g_ctrl = 0;
 
 // Tabla Scancode Set 1 normal
 static const char g_mapa_normal[128] = {
@@ -147,12 +148,19 @@ char teclado_leer_caracter(void) {
         if (soltada == 0x2A || soltada == 0x36) {
             g_shift = 0;
         }
+        if (soltada == 0x1D) {
+            g_ctrl = 0;
+        }
         return 0;
     }
 
     // Tecla pulsada
     if (scancode == 0x2A || scancode == 0x36) {
         g_shift = 1;
+        return 0;
+    }
+    if (scancode == 0x1D) {
+        g_ctrl = 1;
         return 0;
     }
     if (scancode == 0x3A) {
@@ -175,6 +183,10 @@ char teclado_leer_caracter(void) {
         c = c - 'a' + 'A';
     } else if (g_bloq_mayus && c >= 'A' && c <= 'Z' && g_shift) {
         c = c - 'A' + 'a';
+    }
+
+    if (g_ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+        c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
     }
 
     return c;

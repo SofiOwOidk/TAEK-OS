@@ -1,8 +1,10 @@
 #include "fat32.h"
+#include "vfs.h"
 #include "usb_msc.h"
 #include "consola.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../base/memoria.h"
+#include "../base/dma.h"
 
 // ============================================================================
 // TAEK OS - CONTROLADOR DE SISTEMA DE ARCHIVOS FAT32 (Hito 49)
@@ -622,26 +624,45 @@ int fat32_listar_directorio(const char *ruta) {
     int num_items = 0;
     fat32_leer_entradas_directorio(g_volumen.cluster_raiz, &num_items);
 
-    consola_imprimir_linea_color("==================== LISTADO DE DIRECTORIO FAT32 ====================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("TIPO    TAMAÑO        NOMBRE", COLOR_PROMPT_DEFAULT);
+    vfs_limpiar_catalogo();
+
+    consola_imprimir_linea_color("==================== ARCHIVOS EN DISCO (FAT32) ====================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("#    TIPO     TAMAÑO        NOMBRE", COLOR_PROMPT_DEFAULT);
     consola_imprimir_linea("----------------------------------------------------------------------");
 
     for (int i = 0; i < num_items; i++) {
         const struct fat32_item *it = &g_items_actuales[i];
+        vfs_agregar_entrada_catalogo(it->nombre, it->tamano, it->es_directorio ? VFS_NODO_DIRECTORIO : VFS_NODO_ARCHIVO);
+        enum vfs_tipo_archivo tipo = it->es_directorio ? VFS_TIPO_DIR : vfs_detectar_tipo_archivo(it->nombre);
+
+        consola_imprimir("[");
+        consola_imprimir_dec(i + 1);
+        consola_imprimir("] ");
+        if (i + 1 < 10) consola_imprimir(" ");
+
         if (it->es_directorio) {
-            consola_imprimir_color("<DIR>   ", COLOR_USUARIO_DEFAULT);
-            consola_imprimir("     ---      ");
+            consola_imprimir_color("<DIR> ", COLOR_USUARIO_DEFAULT);
+            consola_imprimir("      ---       ");
             consola_imprimir_color(it->nombre, COLOR_USUARIO_DEFAULT);
             consola_imprimir_linea("/");
         } else {
-            consola_imprimir("FILE    ");
+            if (tipo == VFS_TIPO_MP4) {
+                consola_imprimir_color("[MP4] ", COLOR_EXITO_DEFAULT);
+            } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
+                consola_imprimir_color("[IMG] ", COLOR_USUARIO_DEFAULT);
+            } else if (tipo == VFS_TIPO_TEXTO) {
+                consola_imprimir_color("[TXT] ", COLOR_PROMPT_DEFAULT);
+            } else {
+                consola_imprimir("FILE  ");
+            }
             fat32_imprimir_tamano(it->tamano);
-            // Espaciado
-            consola_imprimir("      ");
+            consola_imprimir("       ");
             consola_imprimir_linea(it->nombre);
         }
     }
 
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'abrir <n>' (ej: abrir 1) o 'abrir <nombre>' para reproducir o ver.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
     return 0;
 }
@@ -742,6 +763,94 @@ int fat32_leer_archivo_texto(const char *nombre_buscado) {
 
     consola_imprimir_linea("");
     consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    return 0;
+}
+
+// Lee un archivo binario completo en memoria desde FAT32
+int fat32_leer_archivo_binario(const char *nombre_buscado, void **buf_out, size_t *tam_out, int *es_dma_out) {
+    if (!nombre_buscado || !buf_out || !tam_out) return -1;
+    *buf_out = NULL;
+    *tam_out = 0;
+    if (es_dma_out) *es_dma_out = 0;
+
+    if (!g_volumen.montado) {
+        if (fat32_montar(0) != 0) return -2;
+    }
+
+    int num_items = 0;
+    fat32_leer_entradas_directorio(g_volumen.cluster_raiz, &num_items);
+
+    const struct fat32_item *objetivo = NULL;
+    for (int i = 0; i < num_items; i++) {
+        int match = 1;
+        int p = 0;
+        while (nombre_buscado[p] && g_items_actuales[i].nombre[p]) {
+            char c1 = nombre_buscado[p];
+            char c2 = g_items_actuales[i].nombre[p];
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+            if (c1 != c2) { match = 0; break; }
+            p++;
+        }
+        if (match && nombre_buscado[p] == '\0' && g_items_actuales[i].nombre[p] == '\0') {
+            objetivo = &g_items_actuales[i];
+            break;
+        }
+    }
+
+    if (!objetivo || objetivo->es_directorio) return -3;
+    uint32_t tam = objetivo->tamano;
+    if (tam == 0) return -4;
+
+    int es_dma = 0;
+    uint64_t phys_dma = 0;
+    void *buf = asignar_memoria(tam);
+    if (!buf && tam <= (30 * 1024 * 1024)) {
+        buf = dma_asignar_bufer_contiguo(tam, 4096, &phys_dma);
+        if (buf) es_dma = 1;
+    }
+    if (!buf) {
+        consola_imprimir_linea_color("  [FAT32 ERROR] Memoria insuficiente para cargar archivo binario.", COLOR_ERROR_DEFAULT);
+        return -5;
+    }
+
+    uint32_t clus = objetivo->cluster_inicio;
+    uint32_t bytes_restantes = tam;
+    uint8_t *dest = (uint8_t *)buf;
+
+    while (clus >= 2 && bytes_restantes > 0) {
+        uint32_t lba_base = fat32_cluster_a_lba(&g_volumen, clus);
+        uint32_t sec_restantes = g_volumen.sectores_por_cluster;
+        uint32_t sec_offset = 0;
+
+        while (sec_restantes > 0 && bytes_restantes > 0) {
+            uint32_t sec_a_leer = sec_restantes;
+            uint32_t max_sec = sizeof(g_cluster_buf) / g_volumen.bytes_por_sector;
+            if (sec_a_leer > max_sec) sec_a_leer = max_sec;
+
+            int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba_base + sec_offset, (uint16_t)sec_a_leer, g_cluster_buf);
+            if (res != 0) {
+                consola_imprimir_linea_color("  [FAT32 ERROR] Error leyendo sectores de datos.", COLOR_ERROR_DEFAULT);
+                if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+                else liberar_memoria(buf);
+                return -6;
+            }
+
+            uint32_t bytes_chunk = sec_a_leer * g_volumen.bytes_por_sector;
+            uint32_t a_copiar = (bytes_restantes < bytes_chunk) ? bytes_restantes : bytes_chunk;
+            memcpy(dest, g_cluster_buf, a_copiar);
+            dest += a_copiar;
+            bytes_restantes -= a_copiar;
+            sec_offset += sec_a_leer;
+            sec_restantes -= sec_a_leer;
+        }
+
+        clus = fat32_siguiente_cluster(&g_volumen, clus);
+    }
+
+    *buf_out = buf;
+    *tam_out = tam;
+    if (es_dma_out) *es_dma_out = es_dma;
     return 0;
 }
 

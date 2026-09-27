@@ -1,8 +1,10 @@
 #include "ext4.h"
+#include "vfs.h"
 #include "usb_msc.h"
 #include "consola.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../base/memoria.h"
+#include "../base/dma.h"
 
 // ============================================================================
 // TAEK OS - CONTROLADOR DE SISTEMA DE ARCHIVOS EXT4 (Hito 51)
@@ -664,30 +666,45 @@ int ext4_listar_directorio(const char *ruta) {
     int num_items = 0;
     ext4_leer_entradas_directorio(inodo_dir, &num_items);
 
-    consola_imprimir_linea_color("==================== LISTADO DE DIRECTORIO EXT4 ====================", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("TIPO    TAMAÑO        INODO    NOMBRE", COLOR_PROMPT_DEFAULT);
+    vfs_limpiar_catalogo();
+
+    consola_imprimir_linea_color("==================== ARCHIVOS EN DISCO (ext4) ====================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("#    TIPO     TAMAÑO        NOMBRE", COLOR_PROMPT_DEFAULT);
     consola_imprimir_linea("----------------------------------------------------------------------");
 
     for (int i = 0; i < num_items; i++) {
         const struct ext4_item *it = &g_items_actuales[i];
+        vfs_agregar_entrada_catalogo(it->nombre, it->tamano, it->es_directorio ? VFS_NODO_DIRECTORIO : VFS_NODO_ARCHIVO);
+        enum vfs_tipo_archivo tipo = it->es_directorio ? VFS_TIPO_DIR : vfs_detectar_tipo_archivo(it->nombre);
+
+        consola_imprimir("[");
+        consola_imprimir_dec(i + 1);
+        consola_imprimir("] ");
+        if (i + 1 < 10) consola_imprimir(" ");
+
         if (it->es_directorio) {
-            consola_imprimir_color("<DIR>   ", COLOR_USUARIO_DEFAULT);
-            consola_imprimir("     ---      ");
-        } else {
-            consola_imprimir("FILE    ");
-            ext4_imprimir_tamano(it->tamano);
-            consola_imprimir("      ");
-        }
-        consola_imprimir_dec(it->inodo);
-        consola_imprimir("   ");
-        if (it->es_directorio) {
+            consola_imprimir_color("<DIR> ", COLOR_USUARIO_DEFAULT);
+            consola_imprimir("      ---       ");
             consola_imprimir_color(it->nombre, COLOR_USUARIO_DEFAULT);
             consola_imprimir_linea("/");
         } else {
+            if (tipo == VFS_TIPO_MP4) {
+                consola_imprimir_color("[MP4] ", COLOR_EXITO_DEFAULT);
+            } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
+                consola_imprimir_color("[IMG] ", COLOR_USUARIO_DEFAULT);
+            } else if (tipo == VFS_TIPO_TEXTO) {
+                consola_imprimir_color("[TXT] ", COLOR_PROMPT_DEFAULT);
+            } else {
+                consola_imprimir("FILE  ");
+            }
+            ext4_imprimir_tamano(it->tamano);
+            consola_imprimir("       ");
             consola_imprimir_linea(it->nombre);
         }
     }
 
+    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'abrir <n>' (ej: abrir 1) o 'abrir <nombre>' para reproducir o ver.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
     return 0;
 }
@@ -754,6 +771,69 @@ int ext4_leer_archivo_texto(const char *ruta) {
 
     consola_imprimir_linea("");
     consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
+    return 0;
+}
+
+// Lee un archivo binario completo en memoria desde ext4
+int ext4_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out) {
+    if (!ruta || !buf_out || !tam_out) return -1;
+    *buf_out = NULL;
+    *tam_out = 0;
+    if (es_dma_out) *es_dma_out = 0;
+
+    if (!g_volumen.montado) {
+        if (ext4_montar(0) != 0) return -2;
+    }
+
+    uint32_t inodo_num = ext4_buscar_inodo_por_ruta(ruta);
+    if (inodo_num == 0) return -3;
+
+    struct ext4_inodo inodo;
+    if (ext4_leer_inodo(inodo_num, &inodo) != 0) return -4;
+    if ((inodo.i_mode & 0xF000) == EXT4_S_IFDIR) return -5;
+
+    uint32_t tam = inodo.i_size_lo;
+    if (tam == 0) return -6;
+
+    int es_dma = 0;
+    uint64_t phys_dma = 0;
+    void *buf = asignar_memoria(tam);
+    if (!buf && tam <= (30 * 1024 * 1024)) {
+        buf = dma_asignar_bufer_contiguo(tam, 4096, &phys_dma);
+        if (buf) es_dma = 1;
+    }
+    if (!buf) {
+        consola_imprimir_linea_color("  [ext4 ERROR] Memoria insuficiente para cargar archivo binario.", COLOR_ERROR_DEFAULT);
+        return -7;
+    }
+
+    uint8_t *dest = (uint8_t *)buf;
+    uint32_t bytes_restantes = tam;
+    uint32_t cant_bloques = (bytes_restantes + g_volumen.tamano_bloque - 1) / g_volumen.tamano_bloque;
+
+    for (uint32_t b = 0; b < cant_bloques && bytes_restantes > 0; b++) {
+        uint32_t bloque_fisico = 0;
+        if (ext4_mapear_bloque_logico(&inodo, b, &bloque_fisico) != 0) {
+            if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+            else liberar_memoria(buf);
+            return -8;
+        }
+
+        if (ext4_leer_bloque(bloque_fisico, g_bloque_buf) != 0) {
+            if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+            else liberar_memoria(buf);
+            return -9;
+        }
+
+        uint32_t a_copiar = (bytes_restantes < g_volumen.tamano_bloque) ? bytes_restantes : g_volumen.tamano_bloque;
+        memcpy(dest, g_bloque_buf, a_copiar);
+        dest += a_copiar;
+        bytes_restantes -= a_copiar;
+    }
+
+    *buf_out = buf;
+    *tam_out = tam;
+    if (es_dma_out) *es_dma_out = es_dma;
     return 0;
 }
 
