@@ -7,6 +7,7 @@ HORA_BUILD  = $(shell date +'%H:%M:%S')
 REVISION_CODIGO = $(shell git describe --always --dirty 2>/dev/null || echo desconocida)
 # Selección explícita para comparaciones de rendimiento; nunca habilitar SIMD
 # en todos los fuentes del núcleo.
+.DEFAULT_GOAL := all
 H264_INTER_ESCALAR ?= 0
 H264_PERFIL_INTER ?= 0
 H264_INTER_SSE2 ?= 1
@@ -75,6 +76,8 @@ C_SRCS    = nucleo/principal.c \
             nucleo/controladores/video/nvidia/gsp/gsp_rpc.c \
             nucleo/controladores/xhci.c \
             nucleo/controladores/usb_msc.c \
+            nucleo/controladores/particiones.c \
+            nucleo/controladores/fat_lector.c \
             nucleo/controladores/fat32.c \
             nucleo/controladores/exfat.c \
             nucleo/controladores/ntfs.c \
@@ -86,8 +89,13 @@ C_SRCS   += $(wildcard nucleo/controladores/multimedia/mp4/*.c) \
             $(wildcard nucleo/controladores/multimedia/h264/*.c) \
             $(wildcard nucleo/controladores/multimedia/aac/*.c) \
             $(wildcard nucleo/controladores/multimedia/mp3/*.c) \
+            $(wildcard nucleo/controladores/multimedia/imagen/*.c) \
             $(wildcard nucleo/controladores/multimedia/reproductor/*.c)
 MULTIMEDIA_HEADERS = $(wildcard nucleo/controladores/multimedia/*/*.h)
+LECTURA_HEADERS = nucleo/controladores/particiones.h nucleo/controladores/fat_lector.h nucleo/controladores/vfs.h
+$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SRCS)): $(LECTURA_HEADERS)
+$(BUILD_DIR)/nucleo/controladores/fat_lector.o: nucleo/controladores/fat_oem850.h
+$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SRCS)): nucleo/controladores/multimedia/mp4/mp4.h
 
 S_SRCS    = nucleo/arquitectura/x86_64/trampas.s nucleo/arquitectura/x86_64/smp_entrada.s
 
@@ -101,7 +109,8 @@ OBJS      = $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS)) \
 
 IMG       = $(BUILD_DIR)/taek-os.img
 KERNEL    = $(BUILD_DIR)/nucleo.elf
-ISO       = $(BUILD_DIR)/taek-os.iso
+ISO_FECHA := $(shell date +'%Y-%m-%d_%H-%M-%S')
+ISO       = $(BUILD_DIR)/taek-os-$(ISO_FECHA).iso
 
 all: $(IMG) $(ISO)
 
@@ -210,10 +219,10 @@ $(IMG): $(KERNEL) boot/limine.conf
 
 $(ISO): $(KERNEL) boot/limine.conf
 	@echo "==> Generando Imagen ISO Booteable UEFI/BIOS Híbrida..."
-	@mkdir -p "build antigua"
+	@mkdir -p "build antigua+"
 	@if ls $(BUILD_DIR)/taek-os-*.iso 1> /dev/null 2>&1; then \
-		echo "==> Archivando compilaciones anteriores en 'build antigua'..."; \
-		cp -u $(BUILD_DIR)/taek-os-*.iso "build antigua/" 2>/dev/null || true; \
+		echo "==> Archivando compilaciones anteriores en 'build antigua+'..."; \
+		mv $(BUILD_DIR)/taek-os-*.iso "build antigua+/"; \
 	fi
 	@mkdir -p $(BUILD_DIR)/iso_root/boot/limine $(BUILD_DIR)/iso_root/EFI/BOOT
 	@rm -f $(BUILD_DIR)/iso_root/boot/video_1080p.mp4
@@ -235,16 +244,13 @@ $(ISO): $(KERNEL) boot/limine.conf
 	@if [ -f boot/limine/limine ]; then \
 		boot/limine/limine bios-install $@ > /dev/null 2>&1; \
 	fi
-	@FECHA_ARCHIVO=$$(date +'%Y-%m-%d_%H-%M-%S'); \
-	cp $@ $(BUILD_DIR)/taek-os-$${FECHA_ARCHIVO}.iso; \
-	echo "==> Imagen ISO principal: $(ISO)"; \
-	echo "==> Copia fechada creada: $(BUILD_DIR)/taek-os-$${FECHA_ARCHIVO}.iso"; \
+	@echo "==> Imagen ISO principal: $(ISO)"; \
 	echo "==> Lista para grabar en USB con Rufus / Ventoy / Etcher!"
 
 clean:
-	@mkdir -p "build antigua"
+	@mkdir -p "build antigua+"
 	@if ls $(BUILD_DIR)/taek-os-*.iso 1> /dev/null 2>&1; then \
-		cp -u $(BUILD_DIR)/taek-os-*.iso "build antigua/" 2>/dev/null || true; \
+		cp -u $(BUILD_DIR)/taek-os-*.iso "build antigua+/"; \
 	fi
 	rm -rf $(BUILD_DIR)
 

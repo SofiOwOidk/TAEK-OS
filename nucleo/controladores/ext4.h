@@ -2,6 +2,7 @@
 #define CONTROLADORES_EXT4_H
 
 #include <stdint.h>
+#include "particiones.h"
 #include <stddef.h>
 
 // ============================================================================
@@ -186,6 +187,7 @@ struct ext4_volumen {
 // --- API PÚBLICA DEL CONTROLADOR EXT4 ---
 void ext4_iniciar(void);
 int  ext4_montar(uint8_t unidad_msc);
+int ext4_montar_particion(const struct particion *);
 void ext4_desmontar(void);
 int  ext4_esta_montado(void);
 const struct ext4_volumen *ext4_obtener_volumen(void);

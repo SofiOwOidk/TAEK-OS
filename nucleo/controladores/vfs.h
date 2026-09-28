@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "particiones.h"
 
 // ============================================================================
 // TAEK OS - CAPA DE SISTEMA DE ARCHIVOS VIRTUAL (VFS) (Hito 67)
@@ -69,7 +70,7 @@ struct vfs_descriptor_archivo {
 #define VFS_MAX_CATALOGO 128
 
 struct vfs_entrada {
-    char                  nombre[256];
+    char                  nombre[1024];
     uint64_t              tamano;
     enum vfs_tipo_nodo    tipo_nodo;
     enum vfs_tipo_archivo tipo_archivo;
@@ -85,6 +86,15 @@ void vfs_iniciar(void);
 
 // Detecta el formato (FAT32, exFAT, NTFS o ext4) y monta el controlador correspondiente
 int  vfs_montar(uint8_t unidad_msc);
+int vfs_montar_particion(uint8_t unidad_msc,unsigned numero);
+const struct particiones *vfs_obtener_particiones(void);
+unsigned vfs_obtener_particion_activa(void);
+int vfs_ultimo_error(void);
+void vfs_notificar_desconexion(uint8_t);
+int vfs_listar_pagina(const char *,unsigned);
+const char *vfs_obtener_ruta_catalogo(void);
+enum vfs_tipo_archivo vfs_inspeccionar_archivo(const char *,int *);
+int vfs_consultar_ruta(const char *,enum vfs_tipo_nodo *);
 
 // Desmonta el volumen actualmente activo
 void vfs_desmontar(void);

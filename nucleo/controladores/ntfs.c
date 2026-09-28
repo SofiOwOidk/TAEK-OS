@@ -1,3 +1,4 @@
+#include "particiones.h"
 #include "ntfs.h"
 #include "vfs.h"
 #include "usb_msc.h"
@@ -18,6 +19,11 @@
 #define COLOR_AVISO_NTFS    0x00FFAA00 // Naranja
 
 static struct ntfs_volumen g_vol_ntfs = {0};
+static struct particion g_particion_ntfs;
+static int ntfs_usb_leer_sectores(uint8_t unidad,uint64_t lba,uint16_t n,void *buf){
+    if(unidad!=g_particion_ntfs.unidad || lba<g_particion_ntfs.inicio)return VOLUMEN_CORRUPTO;
+    return particion_leer(&g_particion_ntfs,lba-g_particion_ntfs.inicio,n,buf,0);
+}
 
 // Búferes estáticos en BSS
 static uint8_t g_ntfs_sector_buf[512] __attribute__((aligned(16)));
@@ -113,10 +119,10 @@ static int ntfs_leer_registro_mft(uint32_t idx_mft, uint8_t *destino) {
     if (!g_vol_ntfs.montado) return -1;
     if (g_vol_ntfs.tamano_registro_mft > sizeof(g_ntfs_record_buf)) return -1;
 
-    uint32_t lba_mft_base = g_vol_ntfs.lba_inicio_particion + (uint32_t)(g_vol_ntfs.lcn_mft * g_vol_ntfs.sectores_por_cluster);
-    uint32_t lba_registro = lba_mft_base + idx_mft * g_vol_ntfs.sectores_por_registro_mft;
+    uint64_t lba_mft_base = g_vol_ntfs.lba_inicio_particion + g_vol_ntfs.lcn_mft * g_vol_ntfs.sectores_por_cluster;
+    uint64_t lba_registro = lba_mft_base + (uint64_t)idx_mft * g_vol_ntfs.sectores_por_registro_mft;
 
-    if (usb_msc_leer_sectores(g_vol_ntfs.unidad_msc, lba_registro, g_vol_ntfs.sectores_por_registro_mft, destino) != 0) {
+    if (ntfs_usb_leer_sectores(g_vol_ntfs.unidad_msc, lba_registro, g_vol_ntfs.sectores_por_registro_mft, destino) != 0) {
         return -2;
     }
 
@@ -202,88 +208,19 @@ static void ntfs_poblar_catalogo(void) {
 }
 
 int ntfs_montar(uint8_t unidad_msc) {
-    g_vol_ntfs.montado = 0;
-    g_vol_ntfs.unidad_msc = unidad_msc;
-
-    // 1. Leer LBA 0 (buscar MBR o Superfloppy)
-    if (usb_msc_leer_sectores(unidad_msc, 0, 1, g_ntfs_sector_buf) != 0) {
-        return -1;
-    }
-
-    uint32_t lba_particion = 0;
-    int encontrado = 0;
-
-    // Caso A: Superfloppy (VBR en LBA 0)
-    if (memcmp(&g_ntfs_sector_buf[3], "NTFS    ", 8) == 0) {
-        lba_particion = 0;
-        encontrado = 1;
-    }
-
-    // Caso B: Partición MBR
-    if (!encontrado && g_ntfs_sector_buf[510] == 0x55 && g_ntfs_sector_buf[511] == 0xAA) {
-        for (int p = 0; p < 4; p++) {
-            uint32_t off = 446 + p * 16;
-            uint8_t tipo = g_ntfs_sector_buf[off + 4];
-            uint32_t inicio_lba = *(uint32_t *)&g_ntfs_sector_buf[off + 8];
-
-            if (tipo != 0 && tipo != 0xEE && inicio_lba != 0) {
-                static uint8_t sector_prueba[512] __attribute__((aligned(16)));
-                if (usb_msc_leer_sectores(unidad_msc, inicio_lba, 1, sector_prueba) == 0) {
-                    if (memcmp(&sector_prueba[3], "NTFS    ", 8) == 0) {
-                        lba_particion = inicio_lba;
-                        memcpy(g_ntfs_sector_buf, sector_prueba, 512);
-                        encontrado = 1;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Caso C: Partición GPT (GUID Partition Table)
-    if (!encontrado) {
-        static uint8_t gpt_buf[512] __attribute__((aligned(16)));
-        if (usb_msc_leer_sectores(unidad_msc, 1, 1, gpt_buf) == 0 &&
-            memcmp(gpt_buf, "EFI PART", 8) == 0) {
-            uint64_t part_lba = *(uint64_t *)&gpt_buf[72];
-            uint32_t num_parts = *(uint32_t *)&gpt_buf[80];
-            uint32_t part_size = *(uint32_t *)&gpt_buf[84];
-            if (part_size != 128) part_size = 128;
-            if (part_lba == 0) part_lba = 2;
-            if (num_parts > 32) num_parts = 32;
-
-            uint32_t sec_actual = 0xFFFFFFFF;
-            for (uint32_t p = 0; p < num_parts; p++) {
-                uint32_t sec = (uint32_t)part_lba + (p * part_size) / 512;
-                uint32_t off = (p * part_size) % 512;
-                if (sec != sec_actual) {
-                    if (usb_msc_leer_sectores(unidad_msc, sec, 1, gpt_buf) != 0) break;
-                    sec_actual = sec;
-                }
-                int guid_valido = 0;
-                for (int g = 0; g < 16; g++) {
-                    if (gpt_buf[off + g] != 0) { guid_valido = 1; break; }
-                }
-                if (!guid_valido) continue;
-
-                uint64_t inicio = *(uint64_t *)&gpt_buf[off + 32];
-                if (inicio > 0 && inicio <= UINT32_MAX) {
-                    static uint8_t sector_prueba[512] __attribute__((aligned(16)));
-                    if (usb_msc_leer_sectores(unidad_msc, (uint32_t)inicio, 1, sector_prueba) == 0) {
-                        if (memcmp(&sector_prueba[3], "NTFS    ", 8) == 0) {
-                            lba_particion = (uint32_t)inicio;
-                            memcpy(g_ntfs_sector_buf, sector_prueba, 512);
-                            encontrado = 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (!encontrado) return -1;
-
+    struct particiones *ps=asignar_memoria(sizeof(*ps));if(!ps)return VOLUMEN_NO_SOPORTADO;
+    int r=particiones_descubrir(unidad_msc,ps);unsigned n=0,e=0;
+    if(!r)for(unsigned i=0;i<ps->total;i++)if(ps->entradas[i].formato==VOLUMEN_NTFS){n++;e=i;}
+    if(!r)r=n==1?ntfs_montar_particion(&ps->entradas[e]):n?VOLUMEN_ELEGIR:VOLUMEN_DESCONOCIDO_ERROR;
+    liberar_memoria(ps);return r;
+}
+int ntfs_montar_particion(const struct particion *particion) {
+    if(!particion || particion->inicio>UINT32_MAX)return VOLUMEN_CORRUPTO;
+    g_particion_ntfs=*particion;
+    uint8_t unidad_msc=particion->unidad;uint32_t lba_particion=(uint32_t)particion->inicio;
+    g_vol_ntfs.montado=0;g_vol_ntfs.unidad_msc=unidad_msc;
+    int res=particion_leer(particion,0,1,g_ntfs_sector_buf,0);if(res)return res;
+    if(memcmp(g_ntfs_sector_buf+3,"NTFS    ",8))return VOLUMEN_DESCONOCIDO_ERROR;
     struct ntfs_vbr *vbr = (struct ntfs_vbr *)g_ntfs_sector_buf;
 
     g_vol_ntfs.lba_inicio_particion = lba_particion;
@@ -292,14 +229,18 @@ int ntfs_montar(uint8_t unidad_msc) {
     g_vol_ntfs.bytes_por_cluster = g_vol_ntfs.bytes_por_sector * g_vol_ntfs.sectores_por_cluster;
     g_vol_ntfs.lcn_mft = vbr->lcn_mft;
     g_vol_ntfs.total_sectores = vbr->total_sectores;
+    if(!vbr->total_sectores || vbr->total_sectores>particion->sectores ||
+       !vbr->sectores_por_cluster || (vbr->sectores_por_cluster&(vbr->sectores_por_cluster-1)) ||
+       vbr->lcn_mft<0 || (uint64_t)vbr->lcn_mft>=vbr->total_sectores/vbr->sectores_por_cluster)return VOLUMEN_CORRUPTO;
 
     if (vbr->clusters_por_registro_mft < 0) {
+        if(-(int)vbr->clusters_por_registro_mft>10)return VOLUMEN_NO_SOPORTADO;
         g_vol_ntfs.tamano_registro_mft = 1U << (-vbr->clusters_por_registro_mft);
     } else {
         g_vol_ntfs.tamano_registro_mft = (uint32_t)vbr->clusters_por_registro_mft * g_vol_ntfs.bytes_por_cluster;
     }
 
-    if (g_vol_ntfs.bytes_por_sector != 512 || g_vol_ntfs.sectores_por_cluster == 0) return -2;
+    if (g_vol_ntfs.bytes_por_sector != 512) return VOLUMEN_SECTOR_NO_SOPORTADO;
     if (g_vol_ntfs.tamano_registro_mft > sizeof(g_ntfs_record_buf) || g_vol_ntfs.tamano_registro_mft < 512) {
         serial_imprimir_linea("[NTFS ERROR] Tamaño de registro MFT excede el búfer soportado (1024 B).");
         return -3;
@@ -621,7 +562,7 @@ int ntfs_leer_archivo_texto(const char *ruta) {
                             uint32_t max_sec = sizeof(g_ntfs_cluster_buf) / 512;
                             if (sec_a_leer > max_sec) sec_a_leer = max_sec;
 
-                            if (usb_msc_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba + sec_offset, (uint16_t)sec_a_leer, g_ntfs_cluster_buf) != 0) {
+                            if (ntfs_usb_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba + sec_offset, (uint16_t)sec_a_leer, g_ntfs_cluster_buf) != 0) {
                                 consola_imprimir_linea_color("[Error I/O leyendo cluster NTFS]", COLOR_AVISO_NTFS);
                                 break;
                             }
@@ -753,7 +694,7 @@ int ntfs_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out,
                             uint32_t max_sec = sizeof(g_ntfs_cluster_buf) / 512;
                             if (sec_a_leer > max_sec) sec_a_leer = max_sec;
 
-                            if (usb_msc_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba + sec_offset, (uint16_t)sec_a_leer, g_ntfs_cluster_buf) != 0) {
+                            if (ntfs_usb_leer_sectores(g_vol_ntfs.unidad_msc, cluster_lba + sec_offset, (uint16_t)sec_a_leer, g_ntfs_cluster_buf) != 0) {
                                 if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
                                 else liberar_memoria(buf);
                                 return -7;

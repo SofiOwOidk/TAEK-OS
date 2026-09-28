@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "particiones.h"
 
 // ============================================================================
 // TAEK OS - CONTROLADOR DE SISTEMA DE ARCHIVOS FAT32 (Hito 49)
@@ -99,6 +100,8 @@ void fat32_iniciar(void);
 
 // Monta el sistema de archivos FAT32 de la unidad USB especificada (escanea MBR y VBR)
 int  fat32_montar(uint8_t unidad_msc);
+int fat32_montar_particion(const struct particion *);
+int fat32_habilitar_escritura_experimental(void);
 
 // Desmonta el volumen actual
 void fat32_desmontar(void);

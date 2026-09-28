@@ -1,3 +1,4 @@
+#include "multimedia/imagen/imagen.h"
 #include "terminal.h"
 #include "consola.h"
 #include "teclado.h"
@@ -248,6 +249,40 @@ static int str_contiene(const char *haystack, const char *needle) {
 static const char *str_saltar_espacios(const char *s) {
     while (s && (*s == ' ' || *s == '\t')) s++;
     return s;
+}
+
+static int parsear_db(const char *texto, int *valor) {
+    const char *p = str_saltar_espacios(texto);
+    int signo = 1;
+    int numero = 0;
+    int tiene_digitos = 0;
+    if (*p == '+' || *p == '-') {
+        if (*p == '-') signo = -1;
+        p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+        // El volumen efectivo se limita a [-60, +6] dB. Rechazar cifras
+        // absurdamente grandes evita un desbordamiento al parsear la orden.
+        if (numero > 1000) return 0;
+        numero = numero * 10 + (*p - '0');
+        tiene_digitos = 1;
+        p++;
+    }
+    if (!tiene_digitos || p[0] != 'd' || p[1] != 'b') return 0;
+    p = str_saltar_espacios(p + 2);
+    if (*p != '\0') return 0;
+    *valor = signo * numero;
+    return 1;
+}
+
+static void imprimir_db(int db) {
+    if (db < 0) {
+        consola_imprimir("-");
+        consola_imprimir_dec((uint64_t)(-db));
+    } else {
+        consola_imprimir_dec((uint64_t)db);
+    }
+    consola_imprimir(" dB");
 }
 
 // Evaluador aritmético simple para el comando 'calc'
@@ -1889,6 +1924,7 @@ static int visor_imagen_mostrar(const void *datos, size_t tamano, const char *no
     int orig_w = cab_info->ancho;
     int orig_h = cab_info->alto;
     int invertido = 1;
+    if(orig_h==INT32_MIN)return VOLUMEN_CORRUPTO;
     if (orig_h < 0) {
         invertido = 0;
         orig_h = -orig_h;
@@ -1907,7 +1943,7 @@ static int visor_imagen_mostrar(const void *datos, size_t tamano, const char *no
         return -1;
     }
 
-    if (cab_info->compresion != 0 && cab_info->compresion != 3) {
+    if (cab_info->compresion != 0) {
         consola_imprimir_linea_color("  [ERROR BMP] Compresión no soportada (sólo BI_RGB sin compresión).", COLOR_ERROR_DEFAULT);
         return -1;
     }
@@ -1920,6 +1956,7 @@ static int visor_imagen_mostrar(const void *datos, size_t tamano, const char *no
 
     const uint8_t *datos_pixeles = (const uint8_t *)datos + offset;
     size_t stride = ((size_t)orig_w * (bpp / 8) + 3) & ~3;
+    if((uint64_t)stride*orig_h>tamano-offset)return VOLUMEN_CORRUPTO;
 
     int fb_w = (int)pantalla_obtener_ancho();
     int fb_h = (int)pantalla_obtener_alto();
@@ -1977,12 +2014,12 @@ static int visor_imagen_mostrar(const void *datos, size_t tamano, const char *no
     pantalla_limpiar(0x00000000);
     pantalla_dibujar_imagen_centrada(dest_w, dest_h, pixeles);
 
-    // Esperar 20 segundos o interrupción temprana por teclado (Ctrl+C, ESC, cualquier tecla)
+    // Esperar 20 segundos o interrupción temprana por Ctrl+C/ESC.
     uint64_t t_inicio = tiempo_obtener_milisegundos();
     while (tiempo_obtener_milisegundos() - t_inicio < 20000) {
         xhci_sondeo();
         char c = consola_leer_caracter();
-        if (c != 0) {
+        if (c == 3 || c == 27) {
             break;
         }
         esperar_milisegundos(20);
@@ -2049,7 +2086,7 @@ static void ejecutar_reproducir_mp4_vfs(const char *nombre) {
     vfs_cerrar(descriptor_audio);
 
     if (resultado < 0) {
-        consola_imprimir_linea_color("==> [ REPRODUCTOR ] No se pudo completar la reproducción progresiva.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color(resultado<=-20 && resultado>=-30?volumen_error(resultado):"==> [ REPRODUCTOR ] No se pudo completar la reproducción progresiva.", COLOR_ERROR_DEFAULT);
     } else {
         consola_imprimir_linea_color("==> [ REPRODUCTOR ] Reproducción finalizada y recursos liberados.", COLOR_EXITO_DEFAULT);
     }
@@ -2057,7 +2094,7 @@ static void ejecutar_reproducir_mp4_vfs(const char *nombre) {
 
 static void ejecutar_mostrar_imagen_vfs(const char *nombre) {
     if (!nombre || *nombre == '\0') {
-        consola_imprimir_linea_color("  [ERROR] Especifica el nombre o número de imagen BMP.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea_color("  [ERROR] Especifica el nombre o número de imagen.", COLOR_ERROR_DEFAULT);
         return;
     }
 
@@ -2082,12 +2119,25 @@ static void ejecutar_mostrar_imagen_vfs(const char *nombre) {
     vfs_liberar_archivo_binario(buffer, tamano, es_dma);
 }
 
+static int visor_imagen_rgb_vfs(const char *ruta){
+    int fd;int r=vfs_abrir(ruta,&fd);if(r)return r;
+    uint32_t *rgb;unsigned w,h;r=imagen_decodificar_vfs(fd,&rgb,&w,&h);vfs_cerrar(fd);if(r)return r;
+    unsigned fw=(unsigned)pantalla_obtener_ancho(),fh=(unsigned)pantalla_obtener_alto(),dw=w,dh=h;
+    if(!fw || !fh){imagen_liberar(rgb);return VOLUMEN_NO_SOPORTADO;}
+    if(dw>fw || dh>fh){if((uint64_t)dw*fh>(uint64_t)dh*fw){dh=(unsigned)((uint64_t)h*fw/w);dw=fw;}else{dw=(unsigned)((uint64_t)w*fh/h);dh=fh;}if(!dw)dw=1;if(!dh)dh=1;}
+    uint32_t *salida=asignar_memoria((uint64_t)dw*dh*4);if(!salida){imagen_liberar(rgb);return VOLUMEN_NO_SOPORTADO;}
+    for(unsigned y=0;y<dh;y++)for(unsigned x=0;x<dw;x++)salida[(size_t)y*dw+x]=rgb[(size_t)((uint64_t)y*h/dh)*w+(uint64_t)x*w/dw];
+    imagen_liberar(rgb);pantalla_limpiar(0);pantalla_dibujar_imagen_centrada(dw,dh,salida);
+    uint64_t inicio=tiempo_obtener_milisegundos();while(tiempo_obtener_milisegundos()-inicio<20000){xhci_sondeo();audio_ac97_actualizar();char tecla=consola_leer_caracter();if(tecla==3 || tecla==27 || !vfs_esta_montado())break;esperar_milisegundos(20);}
+    liberar_memoria(salida);consola_limpiar();return 0;
+}
+
 static void ejecutar_comando_abrir(const char *arg) {
     if (arg) arg = str_saltar_espacios(arg);
 
     if (!arg || *arg == '\0') {
         consola_imprimir_linea_color("Uso: abrir <numero> (ej: abrir 1, abrir 2)", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea_color("     abrir <nombre> (ej: abrir video.mp4, abrir foto.bmp)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("     abrir <nombre> (ej: abrir video.mp4, foto.bmp, foto.jpg, foto.png)", COLOR_PROMPT_DEFAULT);
         if (vfs_esta_montado()) {
             const struct vfs_catalogo *cat = vfs_obtener_catalogo();
             if (cat->total > 0) {
@@ -2164,6 +2214,13 @@ static void ejecutar_comando_abrir(const char *arg) {
         }
     }
 
+    char ruta_completa[4096];const char *base=vfs_obtener_ruta_catalogo();size_t l=0;
+    if(nombre_final[0]!='/' && nombre_final[0]!='\\' && base && *base){while(base[l] && l+2<sizeof(ruta_completa)){ruta_completa[l]=base[l];l++;}if(base[l])return;if(l && ruta_completa[l-1]!='/')ruta_completa[l++]='/';}
+    size_t j=0;while(nombre_final[j] && l+1<sizeof(ruta_completa))ruta_completa[l++]=nombre_final[j++];
+    if(nombre_final[j]){consola_imprimir_linea("Ruta demasiado larga");return;}ruta_completa[l]=0;nombre_final=ruta_completa;
+    int inspeccion=0;if(vfs_consultar_ruta(nombre_final,&nodo)!=0 && nodo==VFS_NODO_DIRECTORIO){consola_imprimir_linea("Directorio no disponible");return;}
+    if(nodo!=VFS_NODO_DIRECTORIO){tipo=vfs_inspeccionar_archivo(nombre_final,&inspeccion);if(inspeccion){consola_imprimir_linea(volumen_error(inspeccion));return;}}
+
     if (nodo == VFS_NODO_DIRECTORIO) {
         consola_imprimir_color("==> Entrando al directorio '", COLOR_PROMPT_DEFAULT);
         consola_imprimir(nombre_final);
@@ -2177,9 +2234,7 @@ static void ejecutar_comando_abrir(const char *arg) {
     } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
         ejecutar_mostrar_imagen_vfs(nombre_final);
     } else if (tipo == VFS_TIPO_IMAGEN_JPEG || tipo == VFS_TIPO_IMAGEN_PNG) {
-        consola_imprimir_color("  [AVISO] Imagen '", COLOR_AVISO_DEFAULT);
-        consola_imprimir(nombre_final);
-        consola_imprimir_linea_color("' identificada, pero el visor aun no soporta JPEG/PNG.", COLOR_AVISO_DEFAULT);
+        int r=visor_imagen_rgb_vfs(nombre_final);if(r)consola_imprimir_linea_color(volumen_error(r),COLOR_ERROR_DEFAULT);
     } else if (tipo == VFS_TIPO_MP3) {
         int descriptor_mp3 = -1;
         if (vfs_abrir(nombre_final, &descriptor_mp3) != 0) {
@@ -2205,48 +2260,20 @@ static void ejecutar_comando_abrir(const char *arg) {
 }
 
 static void ejecutar_comando_seleccionar(const char *arg) {
-    if (arg) arg = str_saltar_espacios(arg);
-
-    if (!arg || *arg == '\0') {
-        consola_imprimir_linea_color("Uso: seleccionar <disco> (ej: seleccionar 0 o seleccionar 1)", COLOR_PROMPT_DEFAULT);
-        listar_discos_y_entradas(0);
-        return;
-    }
-
-    const char *p = arg;
-    if (str_comienza_con(p, "disco ")) p = str_saltar_espacios(p + 6);
-    else if (str_comienza_con(p, "disco")) p = str_saltar_espacios(p + 5);
-    else if (str_comienza_con(p, "usb ")) p = str_saltar_espacios(p + 4);
-    else if ((p[0] == 'd' || p[0] == 'D') && p[1] >= '0' && p[1] <= '9') p = p + 1;
-
-    if (*p >= '0' && *p <= '9') {
-        uint8_t u = (uint8_t)(*p - '0');
-        consola_imprimir_color("==> [ VFS ] Seleccionando DISCO #", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_dec(u);
-        consola_imprimir_linea("...");
-
-        if (vfs_montar(u) == 0) {
-            consola_imprimir_color("==> [EXITO] DISCO #", COLOR_EXITO_DEFAULT);
-            consola_imprimir_dec(u);
-            consola_imprimir(" seleccionado (Sistema: ");
-            consola_imprimir_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
-            consola_imprimir_linea("). Contenido:");
-            vfs_listar_directorio(NULL);
-            consola_imprimir_linea("");
-            consola_imprimir_linea_color("  Comando rápido: escribe 'abrir <numero>' para reproducir o ver un archivo.", COLOR_PROMPT_DEFAULT);
-            consola_imprimir_linea_color("                  (ej: abrir 1)", COLOR_TEXTO_DEFAULT);
-        } else {
-            consola_imprimir_color("  [ERROR] No se pudo montar o leer el DISCO #", COLOR_ERROR_DEFAULT);
-            consola_imprimir_dec(u);
-            consola_imprimir_linea(". Verifica el formato (FAT32, exFAT, NTFS o ext4).");
-            consola_imprimir_linea_color("  Uso: seleccionar <disco> (ej: seleccionar 0)", COLOR_AVISO_DEFAULT);
-            listar_discos_y_entradas(0);
-        }
-        return;
-    }
-
-    consola_imprimir_linea_color("Uso: seleccionar <disco> (ej: seleccionar 0 o seleccionar 1)", COLOR_PROMPT_DEFAULT);
-    listar_discos_y_entradas(0);
+    const char *p=arg?str_saltar_espacios(arg):"";
+    if(str_comienza_con(p,"disco "))p=str_saltar_espacios(p+6);
+    else if(str_comienza_con(p,"usb "))p=str_saltar_espacios(p+4);
+    unsigned unidad=0,particion=0;int digitos=0;
+    while(*p>='0' && *p<='9'){if(unidad>255)goto uso;unidad=unidad*10+(*p++-'0');digitos=1;}
+    if(!digitos || unidad>=USB_MSC_MAX_DISPOSITIVOS)goto uso;
+    p=str_saltar_espacios(p);if(str_comienza_con(p,"particion "))p=str_saltar_espacios(p+10);
+    if(*p){digitos=0;while(*p>='0' && *p<='9'){if(particion>4096/10)goto uso;particion=particion*10+(*p++-'0');digitos=1;}if(!digitos || !particion || particion>4096 || *str_saltar_espacios(p))goto uso;}
+    int r=vfs_montar_particion((uint8_t)unidad,particion);
+    if(!r)vfs_listar_directorio(NULL);
+    else{consola_imprimir_linea_color(volumen_error(r),COLOR_AVISO_DEFAULT);if(r==VOLUMEN_ELEGIR)consola_imprimir_linea("Uso: seleccionar <usb> <particion>, por ejemplo seleccionar 0 2");}
+    return;
+uso:
+    consola_imprimir_linea("Uso: seleccionar <usb> [particion], por ejemplo seleccionar 0 2");listar_discos_y_entradas(0);
 }
 
 static void ejecutar_comando_leer(const char *arg) {
@@ -2333,7 +2360,7 @@ static void ejecutar_comando_leer(const char *arg) {
         return;
     }
 
-    // 4. Caso: leer <archivo> (MP4, BMP o texto)
+    // 4. Caso: leer <archivo> (MP4, BMP, JPEG, PNG o texto)
     ejecutar_comando_abrir(arg);
 }
 
@@ -2980,7 +3007,7 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_color("  seleccionar <d>  ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Selecciona un disco USB y lista sus archivos indexados ('seleccionar 0').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  abrir <num|arch> ", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea_color(": Abre o reproduce por número o nombre (MP4, BMP, texto; ej: 'abrir 1').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Abre o reproduce por número o nombre (MP4, BMP, JPEG, PNG, texto; ej: 'abrir 1').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  leer <disco|arch>", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Abre un disco ('leer 0') o muestra/reproduce un archivo ('leer 1').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  montar <disco>   ", COLOR_PROMPT_DEFAULT);
@@ -3003,6 +3030,8 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  audio [opción] ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Audio DMA ('audio corto', 'audio cangrejo', 'audio intro', 'audio bucle', 'audio estado', 'audio trazas', 'audio detener').");
+        consola_imprimir_color("  volumen [acción] ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Ajusta el volumen en dB ('volumen subir +10db', 'volumen bajar -10db', 'volumen estado').");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la animación de Don Cangrejo explotando.");
         consola_imprimir_color("  h264 [opción]  ", COLOR_PROMPT_DEFAULT);
@@ -3421,6 +3450,33 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: volumen subir/bajar <db>
+    if (str_igual(linea, "volumen") || str_comienza_con(linea, "volumen ")) {
+        const char *arg = str_igual(linea, "volumen") ? "" : str_saltar_espacios(linea + 8);
+        if (str_igual(arg, "estado")) {
+            consola_imprimir("Volumen: ");
+            imprimir_db(audio_obtener_volumen_db());
+            consola_imprimir_linea("");
+            return;
+        }
+
+        int delta_db = 0;
+        int es_subir = str_comienza_con(arg, "subir ");
+        int es_bajar = str_comienza_con(arg, "bajar ");
+        if ((es_subir || es_bajar) && parsear_db(arg + 6, &delta_db)) {
+            if (es_subir && delta_db < 0) delta_db = -delta_db;
+            if (es_bajar && delta_db > 0) delta_db = -delta_db;
+            int volumen = audio_ajustar_volumen_db(delta_db);
+            consola_imprimir("Volumen ajustado a ");
+            imprimir_db(volumen);
+            consola_imprimir_linea("");
+            return;
+        }
+
+        consola_imprimir_linea_color("Uso: volumen subir +10db | volumen bajar -10db", COLOR_PROMPT_DEFAULT);
+        return;
+    }
+
     // COMANDO: musica / audio
     if (str_igual(linea, "musica") || str_comienza_con(linea, "musica ") ||
         str_igual(linea, "audio") || str_comienza_con(linea, "audio ")) {
@@ -3647,6 +3703,12 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "dir ")) arg = str_saltar_espacios(linea + 4);
         else if (str_comienza_con(linea, "archivos ")) arg = str_saltar_espacios(linea + 9);
 
+        if(arg && str_comienza_con(arg,"pagina ")){
+            const char *p=str_saltar_espacios(arg+7);unsigned pagina=0;int n=0;
+            while(*p>='0' && *p<='9'){if(pagina>1000000){consola_imprimir_linea("Pagina fuera de rango");return;}pagina=pagina*10+(*p++-'0');n=1;}
+            if(!n || *str_saltar_espacios(p)){consola_imprimir_linea("Uso: ls pagina <numero desde 0>");return;}
+            int r=vfs_listar_pagina(NULL,pagina);if(r)consola_imprimir_linea(volumen_error(r));return;
+        }
         // Si el usuario escribió "ls disco 1", "dir 1" o "ls 1"
         if (arg && (str_comienza_con(arg, "disco ") || (*arg >= '0' && *arg <= '9' && (*(arg + 1) == '\0' || *(arg + 1) == ' ')))) {
             ejecutar_comando_leer(arg);

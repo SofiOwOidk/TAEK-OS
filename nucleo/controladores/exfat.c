@@ -1,3 +1,4 @@
+#include "fat_lector.h"
 #include "exfat.h"
 #include "vfs.h"
 #include "usb_msc.h"
@@ -66,6 +67,7 @@ const struct exfat_volumen *exfat_obtener_volumen(void) {
 
 void exfat_desmontar(void) {
     g_vol_exfat.montado = 0;
+    fat_lector_desmontar(&fat_lector_exfat);
 }
 
 static uint32_t exfat_cluster_a_lba(uint32_t cluster) {
@@ -98,153 +100,11 @@ static int exfat_leer_cluster(uint32_t cluster, uint8_t *destino) {
 }
 
 int exfat_montar(uint8_t unidad_msc) {
-    memset(&g_vol_exfat, 0, sizeof(g_vol_exfat));
-    g_vol_exfat.unidad_msc = unidad_msc;
-
-    // 1. Leer LBA 0 (buscar MBR o Superfloppy)
-    if (usb_msc_leer_sectores(unidad_msc, 0, 1, g_exfat_sector_buf) != 0) {
-        return -1;
-    }
-
-    uint32_t lba_particion = 0;
-    int encontrado = 0;
-
-    // Caso A: Superfloppy (VBR en LBA 0)
-    if (memcmp(&g_exfat_sector_buf[3], "EXFAT   ", 8) == 0) {
-        lba_particion = 0;
-        encontrado = 1;
-    }
-
-    // Caso B: Partición MBR
-    if (!encontrado && g_exfat_sector_buf[510] == 0x55 && g_exfat_sector_buf[511] == 0xAA) {
-        for (int p = 0; p < 4; p++) {
-            uint32_t off = 446 + p * 16;
-            uint8_t tipo = g_exfat_sector_buf[off + 4];
-            uint32_t inicio_lba = *(uint32_t *)&g_exfat_sector_buf[off + 8];
-
-            if (tipo != 0 && tipo != 0xEE && inicio_lba != 0) {
-                static uint8_t sector_prueba[512] __attribute__((aligned(16)));
-                if (usb_msc_leer_sectores(unidad_msc, inicio_lba, 1, sector_prueba) == 0) {
-                    if (memcmp(&sector_prueba[3], "EXFAT   ", 8) == 0) {
-                        lba_particion = inicio_lba;
-                        memcpy(g_exfat_sector_buf, sector_prueba, 512);
-                        encontrado = 1;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Caso C: Partición GPT (GUID Partition Table)
-    if (!encontrado) {
-        static uint8_t gpt_buf[512] __attribute__((aligned(16)));
-        if (usb_msc_leer_sectores(unidad_msc, 1, 1, gpt_buf) == 0 &&
-            memcmp(gpt_buf, "EFI PART", 8) == 0) {
-            uint64_t part_lba = *(uint64_t *)&gpt_buf[72];
-            uint32_t num_parts = *(uint32_t *)&gpt_buf[80];
-            uint32_t part_size = *(uint32_t *)&gpt_buf[84];
-            if (part_size != 128) part_size = 128;
-            if (part_lba == 0) part_lba = 2;
-            if (num_parts > 32) num_parts = 32;
-
-            uint32_t sec_actual = 0xFFFFFFFF;
-            for (uint32_t p = 0; p < num_parts; p++) {
-                uint32_t sec = (uint32_t)part_lba + (p * part_size) / 512;
-                uint32_t off = (p * part_size) % 512;
-                if (sec != sec_actual) {
-                    if (usb_msc_leer_sectores(unidad_msc, sec, 1, gpt_buf) != 0) break;
-                    sec_actual = sec;
-                }
-                int guid_valido = 0;
-                for (int g = 0; g < 16; g++) {
-                    if (gpt_buf[off + g] != 0) { guid_valido = 1; break; }
-                }
-                if (!guid_valido) continue;
-
-                uint64_t inicio = *(uint64_t *)&gpt_buf[off + 32];
-                if (inicio > 0 && inicio <= UINT32_MAX) {
-                    static uint8_t sector_prueba[512] __attribute__((aligned(16)));
-                    if (usb_msc_leer_sectores(unidad_msc, (uint32_t)inicio, 1, sector_prueba) == 0) {
-                        if (memcmp(&sector_prueba[3], "EXFAT   ", 8) == 0) {
-                            lba_particion = (uint32_t)inicio;
-                            memcpy(g_exfat_sector_buf, sector_prueba, 512);
-                            encontrado = 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (!encontrado) return -1;
-
-    struct exfat_vbr *vbr = (struct exfat_vbr *)g_exfat_sector_buf;
-
-    g_vol_exfat.lba_inicio_particion = lba_particion;
-    if (vbr->shift_bytes_por_sector != 9 || vbr->shift_sectores_por_cluster > 6 ||
-        vbr->num_fats != 1 || vbr->conteo_clusters == 0 ||
-        (vbr->desplazamiento_particion != 0 &&
-         vbr->desplazamiento_particion != lba_particion) ||
-        vbr->conteo_clusters > UINT32_MAX - 2 || vbr->cluster_raiz < 2 ||
-        vbr->cluster_raiz - 2 >= vbr->conteo_clusters) return -2;
-    g_vol_exfat.escritura_habilitada = (vbr->banderas_volumen & 0x0006) == 0;
-    g_vol_exfat.bytes_por_sector = 1U << vbr->shift_bytes_por_sector;
-    g_vol_exfat.sectores_por_cluster = 1U << vbr->shift_sectores_por_cluster;
-    g_vol_exfat.bytes_por_cluster = g_vol_exfat.bytes_por_sector * g_vol_exfat.sectores_por_cluster;
-    const struct usb_msc_dispositivo *dev = usb_msc_obtener_dispositivo(unidad_msc);
-    uint64_t fin_heap = (uint64_t)vbr->desplazamiento_heap +
-                        (uint64_t)vbr->conteo_clusters * g_vol_exfat.sectores_por_cluster;
-    if (!dev || !dev->listo || lba_particion >= dev->sectores_totales ||
-        vbr->longitud_volumen > dev->sectores_totales - (uint64_t)lba_particion ||
-        fin_heap > vbr->longitud_volumen ||
-        (uint64_t)vbr->longitud_fat * 512 < ((uint64_t)vbr->conteo_clusters + 2) * 4 ||
-        (uint64_t)vbr->desplazamiento_fat + vbr->longitud_fat > vbr->desplazamiento_heap ||
-        (uint64_t)lba_particion + fin_heap > UINT32_MAX) return -2;
-    g_vol_exfat.lba_fat = lba_particion + vbr->desplazamiento_fat;
-    g_vol_exfat.lba_heap = lba_particion + vbr->desplazamiento_heap;
-    g_vol_exfat.cluster_raiz = vbr->cluster_raiz;
-    g_vol_exfat.total_clusters = vbr->conteo_clusters;
-    memcpy(g_vol_exfat.etiqueta, "EXFAT_VOL", 10);
-
-    // Validación básica de coherencia
-    if (g_vol_exfat.bytes_por_sector == 0 || g_vol_exfat.bytes_por_cluster > sizeof(g_exfat_cluster_buf)) {
-        return -2;
-    }
-
-    // El bitmap es la autoridad de asignación. La raíz puede ocupar más de un cluster.
-    uint32_t raiz = g_vol_exfat.cluster_raiz;
-    for (uint32_t visitados = 0; visitados < g_vol_exfat.total_clusters; visitados++) {
-        if (exfat_leer_cluster(raiz, g_exfat_cluster_buf) != 0) return -2;
-        int fin_directorio = 0;
-        for (uint32_t i = 0; i < g_vol_exfat.bytes_por_cluster / 32; i++) {
-            uint8_t *e = &g_exfat_cluster_buf[i * 32];
-            if (e[0] == 0) { fin_directorio = 1; break; }
-            if (e[0] == EXFAT_TIPO_BITMAP && (e[1] & 1) == 0) {
-                uint32_t c;
-                uint64_t n;
-                memcpy(&c, e + 20, sizeof(c));
-                memcpy(&n, e + 24, sizeof(n));
-                if (c >= 2 && c - 2 < g_vol_exfat.total_clusters &&
-                    n >= ((uint64_t)g_vol_exfat.total_clusters + 7) / 8 &&
-                    n <= g_vol_exfat.bytes_por_cluster) {
-                    g_vol_exfat.cluster_bitmap = c;
-                    g_vol_exfat.longitud_bitmap = n;
-                }
-                break;
-            }
-        }
-        if (g_vol_exfat.cluster_bitmap || fin_directorio) break;
-        raiz = exfat_siguiente_cluster(raiz);
-        if (raiz == 0xFFFFFFFF) break;
-    }
-    if (!g_vol_exfat.cluster_bitmap) return -2;
-    // El escritor actual sólo modifica el primer cluster de la raíz.
-    if (exfat_siguiente_cluster(g_vol_exfat.cluster_raiz) != 0xFFFFFFFF)
-        g_vol_exfat.escritura_habilitada = 0;
-    g_vol_exfat.montado = 1;
-    return 0;
+    struct particiones *ps=asignar_memoria(sizeof(*ps));if(!ps)return VOLUMEN_NO_SOPORTADO;
+    int r=particiones_descubrir(unidad_msc,ps);unsigned candidatos=0,elegida=0;
+    if(!r)for(unsigned i=0;i<ps->total;i++)if(ps->entradas[i].formato==VOLUMEN_EXFAT){elegida=i;candidatos++;}
+    if(!r)r=candidatos==1?exfat_montar_particion(&ps->entradas[elegida]):candidatos?VOLUMEN_ELEGIR:VOLUMEN_DESCONOCIDO_ERROR;
+    liberar_memoria(ps);return r;
 }
 
 static int exfat_leer_entradas_directorio(uint32_t cluster_dir, uint8_t sin_fat,
@@ -429,255 +289,20 @@ static void exfat_tree_recursivo(uint32_t cluster_dir, uint8_t sin_fat, uint64_t
 }
 
 int exfat_ejecutar_tree(const char *ruta_inicial) {
-    (void)ruta_inicial;
-    if (!g_vol_exfat.montado) {
-        if (exfat_montar(0) != 0) {
-            consola_imprimir_linea_color("Error: No se encontró volumen exFAT montable en la unidad USB.", COLOR_AVISO_EXFAT);
-            return -1;
-        }
-    }
-
-    consola_imprimir_linea_color("================== ÁRBOL DE ARCHIVOS exFAT (USB MSC) ==================", COLOR_AVISO_EXFAT);
-    consola_imprimir("Unidad USB: ");
-    consola_imprimir_color(g_vol_exfat.etiqueta, COLOR_DIR_EXFAT);
-    consola_imprimir("  (Cluster Raíz: ");
-    consola_imprimir_dec(g_vol_exfat.cluster_raiz);
-    consola_imprimir_linea(")");
-
-    consola_imprimir_linea_color(".", COLOR_DIR_EXFAT);
-
-    g_tree_exfat_directorios = 0;
-    g_tree_exfat_archivos = 0;
-    g_tree_exfat_bytes_totales = 0;
-
-    exfat_tree_recursivo(g_vol_exfat.cluster_raiz, 0, 0, "", 1);
-
-    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_AVISO_EXFAT);
-    consola_imprimir("Resumen: ");
-    consola_imprimir_dec(g_tree_exfat_directorios);
-    consola_imprimir(" directorios, ");
-    consola_imprimir_dec(g_tree_exfat_archivos);
-    consola_imprimir(" archivos (Total: ");
-    if (g_tree_exfat_bytes_totales < 1024) {
-        consola_imprimir_dec((uint32_t)g_tree_exfat_bytes_totales);
-        consola_imprimir(" B)");
-    } else if (g_tree_exfat_bytes_totales < 1024 * 1024) {
-        consola_imprimir_dec((uint32_t)(g_tree_exfat_bytes_totales / 1024));
-        consola_imprimir(" KB)");
-    } else {
-        consola_imprimir_dec((uint32_t)(g_tree_exfat_bytes_totales / (1024 * 1024)));
-        consola_imprimir(" MB)");
-    }
-    consola_imprimir_linea("");
-    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_EXFAT);
-    return 0;
+    return fat_lector_tree(&fat_lector_exfat,ruta_inicial);
 }
 
 int exfat_listar_directorio(const char *ruta) {
-    (void)ruta;
-    if (!g_vol_exfat.montado) {
-        if (exfat_montar(0) != 0) {
-            consola_imprimir_linea_color("Error: No se encontró volumen exFAT montable.", COLOR_AVISO_EXFAT);
-            return -1;
-        }
-    }
-
-    struct exfat_nodo *nodos = g_exfat_nodos;
-    int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
-
-    vfs_limpiar_catalogo();
-
-    consola_imprimir_linea_color("==================== ARCHIVOS EN DISCO (exFAT) ====================", COLOR_AVISO_EXFAT);
-    consola_imprimir_linea_color("#    TIPO     TAMAÑO        NOMBRE", COLOR_AVISO_EXFAT);
-    consola_imprimir_linea("----------------------------------------------------------------------");
-
-    for (int i = 0; i < total; i++) {
-        vfs_agregar_entrada_catalogo(nodos[i].nombre, nodos[i].tamano_bytes, nodos[i].es_directorio ? VFS_NODO_DIRECTORIO : VFS_NODO_ARCHIVO);
-        enum vfs_tipo_archivo tipo = nodos[i].es_directorio ? VFS_TIPO_DIR : vfs_detectar_tipo_archivo(nodos[i].nombre);
-
-        consola_imprimir("[");
-        consola_imprimir_dec(i + 1);
-        consola_imprimir("] ");
-        if (i + 1 < 10) consola_imprimir(" ");
-
-        if (nodos[i].es_directorio) {
-            consola_imprimir_color("<DIR> ", COLOR_DIR_EXFAT);
-            consola_imprimir("      ---       ");
-            consola_imprimir_color(nodos[i].nombre, COLOR_DIR_EXFAT);
-            consola_imprimir_linea("/");
-        } else {
-            if (tipo == VFS_TIPO_MP4) {
-                consola_imprimir_color("[MP4] ", COLOR_BIN_EXFAT);
-            } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
-                consola_imprimir_color("[IMG] ", COLOR_DIR_EXFAT);
-            } else if (tipo == VFS_TIPO_TEXTO) {
-                consola_imprimir_color("[TXT] ", COLOR_TXT_EXFAT);
-            } else {
-                consola_imprimir("FILE  ");
-            }
-            if (nodos[i].tamano_bytes >= 1024 * 1024) {
-                consola_imprimir_dec((uint32_t)(nodos[i].tamano_bytes / (1024 * 1024)));
-                consola_imprimir(".");
-                consola_imprimir_dec((uint32_t)((nodos[i].tamano_bytes % (1024 * 1024)) / 100000));
-                consola_imprimir(" MB");
-            } else if (nodos[i].tamano_bytes >= 1024) {
-                consola_imprimir_dec((uint32_t)(nodos[i].tamano_bytes / 1024));
-                consola_imprimir(" KB");
-            } else {
-                consola_imprimir_dec((uint32_t)nodos[i].tamano_bytes);
-                consola_imprimir(" B ");
-            }
-            consola_imprimir("       ");
-            consola_imprimir_linea(nodos[i].nombre);
-        }
-    }
-    consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_AVISO_EXFAT);
-    consola_imprimir_linea_color("Tip: Escribe 'abrir <n>' (ej: abrir 1) o 'abrir <nombre>' para reproducir o ver.", COLOR_FILE_EXFAT);
-    consola_imprimir_linea_color("======================================================================", COLOR_AVISO_EXFAT);
-    return 0;
+    return fat_lector_listar(&fat_lector_exfat,ruta,0);
 }
 
 int exfat_leer_archivo_texto(const char *ruta) {
-    if (!ruta || ruta[0] == '\0') {
-        consola_imprimir_linea_color("Uso: cat <archivo> (ej. cat notas.txt)", COLOR_AVISO_EXFAT);
-        return -1;
-    }
-
-    if (!g_vol_exfat.montado) {
-        if (exfat_montar(0) != 0) {
-            consola_imprimir_linea_color("Error: No hay volumen exFAT montado.", COLOR_AVISO_EXFAT);
-            return -1;
-        }
-    }
-
-    struct exfat_nodo *nodos = g_exfat_nodos;
-    int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
-
-    int idx = -1;
-    for (int i = 0; i < total; i++) {
-        if (!nodos[i].es_directorio && exfat_str_igual_sin_caso(nodos[i].nombre, ruta)) {
-            idx = i;
-            break;
-        }
-    }
-
-    if (idx < 0) {
-        consola_imprimir_color("Archivo no encontrado en exFAT: ", COLOR_AVISO_EXFAT);
-        consola_imprimir_linea(ruta);
-        return -2;
-    }
-
-    consola_imprimir("==> [ exFAT: ");
-    consola_imprimir(nodos[idx].nombre);
-    consola_imprimir(" (");
-    consola_imprimir_dec((uint32_t)nodos[idx].tamano_bytes);
-    consola_imprimir_linea(" bytes) ] <==");
-
-    uint32_t curr_cluster = nodos[idx].cluster_inicio;
-    uint64_t restante = nodos[idx].tamano_bytes;
-    uint8_t sin_fat = nodos[idx].sin_cadena_fat;
-
-    while (restante > 0 && curr_cluster != 0xFFFFFFFF && curr_cluster >= 2) {
-        if (exfat_leer_cluster(curr_cluster, g_exfat_cluster_buf) != 0) {
-            consola_imprimir_linea_color("[Error de lectura I/O de cluster en exFAT]", COLOR_AVISO_EXFAT);
-            break;
-        }
-
-        uint32_t a_leer = (restante > g_vol_exfat.bytes_por_cluster) ? g_vol_exfat.bytes_por_cluster : (uint32_t)restante;
-        for (uint32_t b = 0; b < a_leer; b++) {
-            char c = (char)g_exfat_cluster_buf[b];
-            if (c == '\r') continue;
-            consola_escribir_caracter(c);
-        }
-        restante -= a_leer;
-
-        if (sin_fat) {
-            curr_cluster++;
-        } else {
-            curr_cluster = exfat_siguiente_cluster(curr_cluster);
-        }
-    }
-    consola_imprimir_linea("");
-    return 0;
+    return vfs_leer_archivo_texto(ruta);
 }
 
 // Lee un archivo binario completo en memoria desde exFAT
 int exfat_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out) {
-    if (!ruta || !buf_out || !tam_out) return -1;
-    *buf_out = NULL;
-    *tam_out = 0;
-    if (es_dma_out) *es_dma_out = 0;
-
-    if (!g_vol_exfat.montado) {
-        if (exfat_montar(0) != 0) return -2;
-    }
-
-    struct exfat_nodo *nodos = g_exfat_nodos;
-    int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
-
-    int idx = -1;
-    for (int i = 0; i < total; i++) {
-        if (!nodos[i].es_directorio && exfat_str_igual_sin_caso(nodos[i].nombre, ruta)) {
-            idx = i;
-            break;
-        }
-    }
-
-    if (idx < 0) return -3;
-    uint64_t tam64 = nodos[idx].tamano_bytes;
-    if (tam64 == 0) return -4;
-    size_t tam = (size_t)tam64;
-
-    int es_dma = 0;
-    uint64_t phys_dma = 0;
-    void *buf = asignar_memoria(tam);
-    if (!buf && tam <= (30 * 1024 * 1024)) {
-        buf = dma_asignar_bufer_contiguo(tam, 4096, &phys_dma);
-        if (buf) es_dma = 1;
-    }
-    if (!buf) {
-        consola_imprimir_linea_color("  [exFAT ERROR] Memoria insuficiente para cargar archivo binario.", COLOR_AVISO_EXFAT);
-        return -5;
-    }
-
-    uint32_t curr_cluster = nodos[idx].cluster_inicio;
-    uint64_t restante = tam64;
-    uint8_t sin_fat = nodos[idx].sin_cadena_fat;
-    uint8_t *dest = (uint8_t *)buf;
-
-    while (restante > 0 && curr_cluster != 0xFFFFFFFF && curr_cluster >= 2) {
-        if (exfat_leer_cluster(curr_cluster, g_exfat_cluster_buf) != 0) {
-            consola_imprimir_linea_color("[Error de lectura I/O de cluster en exFAT]", COLOR_AVISO_EXFAT);
-            if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
-            else liberar_memoria(buf);
-            return -6;
-        }
-
-        uint32_t a_leer = (restante > g_vol_exfat.bytes_por_cluster) ? g_vol_exfat.bytes_por_cluster : (uint32_t)restante;
-        memcpy(dest, g_exfat_cluster_buf, a_leer);
-        dest += a_leer;
-        restante -= a_leer;
-
-        if (sin_fat) {
-            curr_cluster++;
-        } else {
-            curr_cluster = exfat_siguiente_cluster(curr_cluster);
-        }
-    }
-
-    if (restante != 0) {
-        consola_imprimir_linea_color(
-            "  [exFAT ERROR] Cadena de clusters truncada: lectura incompleta.",
-            COLOR_AVISO_EXFAT);
-        if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
-        else liberar_memoria(buf);
-        return -7;
-    }
-
-    *buf_out = buf;
-    *tam_out = tam;
-    if (es_dma_out) *es_dma_out = es_dma;
-    return 0;
+    return vfs_leer_archivo_binario(ruta,buf_out,tam_out,es_dma_out);
 }
 
 // Escribe un cluster completo en disco
@@ -848,7 +473,7 @@ static int exfat_insertar_entrada_directorio(uint32_t cluster_dir, const char *n
     // 2. Entrada 0xC0 (Stream Extension)
     struct exfat_entrada_flujo *e_stream = (struct exfat_entrada_flujo *)&set_ptr[32];
     e_stream->tipo_entrada = EXFAT_TIPO_FLUJO;
-    e_stream->banderas = EXFAT_FLUJO_NO_FAT;
+    e_stream->banderas = 1u | (tamano?EXFAT_FLUJO_NO_FAT:0u); // AllocationPossible; vacío sin extensión contigua.
     e_stream->longitud_nombre = (uint8_t)nom_len;
     e_stream->hash_nombre = exfat_hash_nombre_str(nombre);
     e_stream->primer_cluster = cluster_inicio;
@@ -981,107 +606,11 @@ static uint32_t exfat_sig_cluster_stream(struct exfat_cursor_archivo *cur) {
 }
 
 int exfat_abrir_stream(const char *ruta, void *fd_generico) {
-    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
-    if (!g_vol_exfat.montado) {
-        if (exfat_montar(0) != 0) return -2;
-    }
-
-    struct exfat_nodo *nodos = g_exfat_nodos;
-    int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
-
-    int idx = -1;
-    for (int i = 0; i < total; i++) {
-        if (!nodos[i].es_directorio && exfat_str_igual_sin_caso(nodos[i].nombre, ruta)) {
-            idx = i;
-            break;
-        }
-    }
-
-    if (idx < 0) return -3;
-
-    struct exfat_nodo *objetivo = &nodos[idx];
-    fd->tamano = objetivo->tamano_bytes;
-    fd->posicion = 0;
-
-    struct exfat_cursor_archivo *cur = (struct exfat_cursor_archivo *)fd->cursor;
-    cur->cluster_inicio = objetivo->cluster_inicio;
-    cur->cluster_actual = objetivo->cluster_inicio;
-    cur->indice_cluster = 0;
-    cur->bytes_por_cluster = g_vol_exfat.bytes_por_cluster;
-    cur->sectores_por_cluster = g_vol_exfat.sectores_por_cluster;
-    cur->bytes_por_sector = g_vol_exfat.bytes_por_sector;
-    cur->lba_heap = g_vol_exfat.lba_heap;
-    cur->lba_fat = g_vol_exfat.lba_fat;
-    cur->unidad_msc = g_vol_exfat.unidad_msc;
-    cur->sin_cadena_fat = objetivo->sin_cadena_fat;
-
-    if (!g_vol_exfat.bytes_por_cluster || g_vol_exfat.bytes_por_cluster > VFS_STREAM_CACHE_MAX) return -6;
-    fd->bufer_cache = (uint8_t *)asignar_memoria(g_vol_exfat.bytes_por_cluster);
-    if (!fd->bufer_cache) return -5;
-
-    fd->bufer_tamano = g_vol_exfat.bytes_por_cluster;
-    fd->bufer_unidad_logica = 0xFFFFFFFF;
-    fd->bufer_bytes_validos = 0;
-
-    return 0;
+    return fat_lector_abrir_stream(&fat_lector_exfat,ruta,fd_generico);
 }
 
 int64_t exfat_leer_stream(void *fd_generico, void *buf, size_t cantidad) {
-    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
-    struct exfat_cursor_archivo *cur = (struct exfat_cursor_archivo *)fd->cursor;
-
-    if (fd->posicion >= fd->tamano) return 0;
-    uint64_t restante = fd->tamano - fd->posicion;
-    if (cantidad > restante) cantidad = (size_t)restante;
-
-    size_t bytes_leidos = 0;
-    uint8_t *dest = (uint8_t *)buf;
-
-    while (cantidad > 0) {
-        if (fd->cancelado) return bytes_leidos ? (int64_t)bytes_leidos : -3;
-        uint32_t target_cluster_idx = (uint32_t)(fd->posicion / cur->bytes_por_cluster);
-        uint32_t offset_in_cluster = (uint32_t)(fd->posicion % cur->bytes_por_cluster);
-
-        if (target_cluster_idx != fd->bufer_unidad_logica) {
-            if (target_cluster_idx < cur->indice_cluster) {
-                cur->cluster_actual = cur->cluster_inicio;
-                cur->indice_cluster = 0;
-            }
-
-            while (cur->indice_cluster < target_cluster_idx) {
-                uint32_t sig = exfat_sig_cluster_stream(cur);
-                if (sig == 0xFFFFFFFF) return bytes_leidos > 0 ? (int64_t)bytes_leidos : -1;
-                cur->cluster_actual = sig;
-                cur->indice_cluster++;
-            }
-
-            uint64_t lba64 = (uint64_t)cur->lba_heap +
-                             (uint64_t)(cur->cluster_actual - 2) * cur->sectores_por_cluster;
-            if (lba64 > UINT32_MAX) return bytes_leidos ? (int64_t)bytes_leidos : -4;
-            uint32_t lba = (uint32_t)lba64;
-            if (vfs_usb_leer_sectores(fd, lba, cur->sectores_por_cluster, fd->bufer_cache) != 0) {
-                return bytes_leidos > 0 ? (int64_t)bytes_leidos : -2;
-            }
-
-            fd->bufer_unidad_logica = target_cluster_idx;
-            uint64_t bytes_en_cluster_logico = fd->tamano - ((uint64_t)target_cluster_idx * cur->bytes_por_cluster);
-            fd->bufer_bytes_validos = (bytes_en_cluster_logico < cur->bytes_por_cluster) ? (uint32_t)bytes_en_cluster_logico : cur->bytes_por_cluster;
-        }
-
-        uint32_t disponible_en_bufer = fd->bufer_bytes_validos - offset_in_cluster;
-        uint32_t a_copiar = (cantidad < disponible_en_bufer) ? (uint32_t)cantidad : disponible_en_bufer;
-
-        for (uint32_t i = 0; i < a_copiar; i++) {
-            dest[i] = fd->bufer_cache[offset_in_cluster + i];
-        }
-
-        fd->posicion += a_copiar;
-        dest += a_copiar;
-        cantidad -= a_copiar;
-        bytes_leidos += a_copiar;
-    }
-
-    return (int64_t)bytes_leidos;
+    return fat_lector_leer_stream(&fat_lector_exfat,fd_generico,buf,cantidad);
 }
 
 int64_t exfat_buscar_stream(void *fd_generico, int64_t offset, int origen) {
@@ -1115,4 +644,21 @@ void exfat_cerrar_stream(void *fd_generico) {
     fd->bufer_bytes_validos = 0;
     fd->bufer_unidad_logica = 0xFFFFFFFF;
     fd->en_uso = 0;
+}
+
+int exfat_habilitar_escritura_experimental(void){
+    if(!g_vol_exfat.montado || fat_lector_exfat.respaldo || g_vol_exfat.bytes_por_cluster>sizeof(g_exfat_cluster_buf) ||
+       g_vol_exfat.longitud_bitmap>g_vol_exfat.bytes_por_cluster)return VOLUMEN_NO_SOPORTADO;
+    uint8_t s[512];int r=particion_leer(&fat_lector_exfat.particion,0,1,s,0);if(r)return r;
+    if((s[106]&6) || exfat_siguiente_cluster(g_vol_exfat.cluster_raiz)!=0xffffffff)return VOLUMEN_NO_SOPORTADO;
+    g_vol_exfat.escritura_habilitada=1;return 0;
+}
+int exfat_montar_particion(const struct particion *p){
+    exfat_desmontar();int r=fat_lector_montar(&fat_lector_exfat,p);if(r)return r;
+    struct fat_lector_volumen *v=&fat_lector_exfat;memset(&g_vol_exfat,0,sizeof(g_vol_exfat));
+    g_vol_exfat.montado=1;g_vol_exfat.unidad_msc=p->unidad;g_vol_exfat.lba_inicio_particion=(uint32_t)p->inicio;
+    g_vol_exfat.bytes_por_sector=512;g_vol_exfat.sectores_por_cluster=v->sectores_cluster;g_vol_exfat.bytes_por_cluster=v->bytes_cluster;
+    g_vol_exfat.lba_fat=(uint32_t)(p->inicio+v->fat);g_vol_exfat.lba_heap=(uint32_t)(p->inicio+v->datos);
+    g_vol_exfat.cluster_raiz=v->raiz;g_vol_exfat.total_clusters=v->clusters;g_vol_exfat.cluster_bitmap=v->cluster_bitmap;g_vol_exfat.longitud_bitmap=v->longitud_bitmap;
+    memcpy(g_vol_exfat.etiqueta,"EXFAT_VOL",10);return 0;
 }

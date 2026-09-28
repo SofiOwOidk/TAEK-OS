@@ -1,3 +1,7 @@
+#include "fat_lector.h"
+#include "teclado.h"
+#include "xhci.h"
+#include "audio_ac97.h"
 #include "vfs.h"
 #include "fat32.h"
 #include "exfat.h"
@@ -16,11 +20,22 @@
 
 static enum vfs_tipo_fs g_tipo_activo = VFS_FS_NINGUNO;
 static uint8_t g_unidad_activa = 0;
+static struct particiones g_particiones;
+static struct particion g_particion_activa;
+static int g_error_volumen,g_desconectado;
+static char g_ruta_catalogo[4096];
 static struct vfs_catalogo g_catalogo_vfs = {0};
 
 // --- TABLA DE DESCRIPTORES DE ARCHIVO (Hito 68) ---
 static struct vfs_descriptor_archivo g_descriptores[VFS_MAX_FDS] = {{0}};
 static uint32_t g_generacion_descriptores = 1;
+static int g_cancelacion_lectura;
+static int servir_lectura(void){
+    xhci_sondeo();audio_ac97_actualizar();
+    if(consola_sondear_cancelacion())g_cancelacion_lectura=1;
+    if(g_cancelacion_lectura)for(unsigned i=0;i<VFS_MAX_FDS;i++)if(g_descriptores[i].en_uso)g_descriptores[i].cancelado=1;
+    return g_cancelacion_lectura;
+}
 
 static uint32_t vfs_generacion_siguiente(uint32_t actual) {
     const uint32_t maximo = (uint32_t)INT32_MAX >> 3;
@@ -38,7 +53,10 @@ void vfs_iniciar(void) {
 }
 
 int vfs_esta_montado(void) {
-    return (g_tipo_activo != VFS_FS_NINGUNO);
+    if(g_tipo_activo==VFS_FS_NINGUNO || g_desconectado)return 0;
+    const struct usb_msc_dispositivo *d=usb_msc_obtener_dispositivo(g_unidad_activa);
+    if(!d || !d->activo || !d->listo || d->generacion!=g_particion_activa.generacion_msc){vfs_notificar_desconexion(g_unidad_activa);return 0;}
+    return 1;
 }
 
 uint8_t vfs_obtener_unidad_activa(void) {
@@ -72,48 +90,14 @@ void vfs_desmontar(void) {
     else if (g_tipo_activo == VFS_FS_NTFS) ntfs_desmontar();
     else if (g_tipo_activo == VFS_FS_EXT4) ext4_desmontar();
     g_tipo_activo = VFS_FS_NINGUNO;
+    g_desconectado=0;g_ruta_catalogo[0]=0;
     g_unidad_activa = 0xFF;
     g_catalogo_vfs.total = 0;
     g_generacion_descriptores = vfs_generacion_siguiente(g_generacion_descriptores);
 }
 
 int vfs_montar(uint8_t unidad_msc) {
-    vfs_desmontar();
-    g_unidad_activa = unidad_msc;
-
-    // 1. Probar NTFS
-    if (ntfs_montar(unidad_msc) == 0) {
-        g_tipo_activo = VFS_FS_NTFS;
-        return 0;
-    }
-
-    // 2. Probar exFAT. Un -2 significa que se identifico exFAT pero
-    // fallo una validacion; no se debe reinterpretar esa misma unidad como FAT32.
-    int resultado_exfat = exfat_montar(unidad_msc);
-    if (resultado_exfat == 0) {
-        g_tipo_activo = VFS_FS_EXFAT;
-        return 0;
-    }
-    if (resultado_exfat == -2) {
-        consola_imprimir_linea_color(
-            "Error: se identifico exFAT, pero su geometria o metadatos no son compatibles.",
-            0x00FFAA00);
-        return -2;
-    }
-
-    // 3. Probar ext4 (Linux)
-    if (ext4_montar(unidad_msc) == 0) {
-        g_tipo_activo = VFS_FS_EXT4;
-        return 0;
-    }
-
-    // 4. Probar FAT32
-    if (fat32_montar(unidad_msc) == 0) {
-        g_tipo_activo = VFS_FS_FAT32;
-        return 0;
-    }
-
-    return -1;
+    return vfs_montar_particion(unidad_msc,0);
 }
 
 // --- GESTIÓN DEL CATÁLOGO INDEXADO ---
@@ -214,7 +198,7 @@ void vfs_agregar_entrada_catalogo(const char *nombre, uint64_t tamano, enum vfs_
 
     struct vfs_entrada *e = &g_catalogo_vfs.entradas[g_catalogo_vfs.total++];
     int i = 0;
-    while (nombre[i] && i < 255) {
+    while (nombre[i] && i < (int)sizeof(e->nombre)-1) {
         e->nombre[i] = nombre[i];
         i++;
     }
@@ -242,54 +226,26 @@ int vfs_ejecutar_tree(const char *ruta_inicial) {
 }
 
 int vfs_listar_directorio(const char *ruta) {
-    if (!vfs_esta_montado()) {
-        if (vfs_montar(g_unidad_activa) != 0) {
-            consola_imprimir_linea_color("Error: No hay sistema de archivos montado.", 0x00FFAA00);
-            return -1;
-        }
-    }
-
-    switch (g_tipo_activo) {
-        case VFS_FS_NTFS:  return ntfs_listar_directorio(ruta);
-        case VFS_FS_EXFAT: return exfat_listar_directorio(ruta);
-        case VFS_FS_FAT32: return fat32_listar_directorio(ruta);
-        case VFS_FS_EXT4:  return ext4_listar_directorio(ruta);
-        default:           return -1;
-    }
+    return vfs_listar_pagina(ruta,0);
 }
 
 int vfs_leer_archivo_texto(const char *ruta) {
-    if (!vfs_esta_montado()) {
-        if (vfs_montar(g_unidad_activa) != 0) {
-            consola_imprimir_linea_color("Error: No hay sistema de archivos montado.", 0x00FFAA00);
-            return -1;
-        }
+    int fd;int r=vfs_abrir(ruta,&fd);if(r)return r;
+    uint8_t buf[512];uint64_t total=0;int64_t n;
+    while(total<65536 && (n=vfs_leer(fd,buf,sizeof(buf)))>0){
+        for(int64_t i=0;i<n;i++){uint8_t c=buf[i];if(c=='\n')consola_escribir_caracter('\n');else if(c=='\t')consola_imprimir("    ");else if(c=='\r')continue;else if(c>=32 && c!=127)consola_escribir_caracter((char)c);else consola_escribir_caracter('.');}total+=(uint64_t)n;
     }
-
-    switch (g_tipo_activo) {
-        case VFS_FS_NTFS:  return ntfs_leer_archivo_texto(ruta);
-        case VFS_FS_EXFAT: return exfat_leer_archivo_texto(ruta);
-        case VFS_FS_FAT32: return fat32_leer_archivo_texto(ruta);
-        case VFS_FS_EXT4:  return ext4_leer_archivo_texto(ruta);
-        default:           return -1;
-    }
+    if(total>=65536)consola_imprimir_linea("\n[Texto limitado a 64 KiB]");
+    r=total<65536 && n<0?(int)n:0;vfs_cerrar(fd);return r;
 }
 
 int vfs_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out) {
-    if (!vfs_esta_montado()) {
-        if (vfs_montar(g_unidad_activa) != 0) {
-            consola_imprimir_linea_color("Error: No hay sistema de archivos montado.", 0x00FFAA00);
-            return -1;
-        }
-    }
-
-    switch (g_tipo_activo) {
-        case VFS_FS_NTFS:  return ntfs_leer_archivo_binario(ruta, buf_out, tam_out, es_dma_out);
-        case VFS_FS_EXFAT: return exfat_leer_archivo_binario(ruta, buf_out, tam_out, es_dma_out);
-        case VFS_FS_FAT32: return fat32_leer_archivo_binario(ruta, buf_out, tam_out, es_dma_out);
-        case VFS_FS_EXT4:  return ext4_leer_archivo_binario(ruta, buf_out, tam_out, es_dma_out);
-        default:           return -1;
-    }
+    if(!buf_out || !tam_out || !es_dma_out)return -1;*buf_out=0;*tam_out=0;*es_dma_out=0;
+    int fd;int r=vfs_abrir(ruta,&fd);if(r)return r;uint64_t n=vfs_tamano_fd(fd);
+    if(n>32u*1024*1024){vfs_cerrar(fd);return VOLUMEN_NO_SOPORTADO;}
+    void *buf=asignar_memoria(n?(size_t)n:1);if(!buf){vfs_cerrar(fd);return -1;}
+    uint64_t hechos=0;while(hechos<n){size_t k=n-hechos>65536?65536:(size_t)(n-hechos);int64_t leidos=vfs_leer(fd,(uint8_t *)buf+hechos,k);if(leidos!=(int64_t)k){liberar_memoria(buf);vfs_cerrar(fd);return leidos<0?(int)leidos:VOLUMEN_CORRUPTO;}hechos+=(uint64_t)leidos;}
+    vfs_cerrar(fd);*buf_out=buf;*tam_out=(size_t)n;return 0;
 }
 
 void vfs_liberar_archivo_binario(void *buf, size_t tam, int es_dma) {
@@ -317,6 +273,7 @@ struct vfs_descriptor_archivo *vfs_obtener_descriptor(int fd) {
 int vfs_usb_leer_sectores(struct vfs_descriptor_archivo *fd, uint32_t lba,
                           uint32_t sectores, void *destino) {
     if (!fd || !fd->en_uso || !destino) return -1;
+    if(lba<g_particion_activa.inicio || (uint64_t)lba-g_particion_activa.inicio>g_particion_activa.sectores || sectores>g_particion_activa.sectores-((uint64_t)lba-g_particion_activa.inicio))return VOLUMEN_CORRUPTO;
     uint8_t *p = (uint8_t *)destino;
     while (sectores) {
         if (fd->cancelado) return -2;
@@ -334,6 +291,7 @@ int vfs_usb_leer_sectores(struct vfs_descriptor_archivo *fd, uint32_t lba,
 }
 
 int vfs_abrir(const char *ruta, int *fd_out) {
+    g_cancelacion_lectura=0;
     if (!ruta || !fd_out) return -1;
     *fd_out = -1;
 
@@ -389,16 +347,19 @@ int vfs_abrir(const char *ruta, int *fd_out) {
 
 int64_t vfs_leer(int fd, void *buf, size_t cantidad) {
     struct vfs_descriptor_archivo *desc = vfs_obtener_descriptor(fd);
-    if (!desc || !buf || cantidad == 0) return -1;
-    if (desc->cancelado) return -3;
+    if (!desc || !buf) return -1;
+    if(!cantidad)return 0;
+    if (desc->cancelado) return g_desconectado?VOLUMEN_DESCONECTADO:VOLUMEN_CANCELADO;
     const struct usb_msc_dispositivo *dispositivo = usb_msc_obtener_dispositivo(desc->unidad_msc);
     if (!dispositivo || !dispositivo->activo || !dispositivo->listo) {
         desc->cancelado = 1;
-        return -4;
+        vfs_notificar_desconexion(desc->unidad_msc);
+        return VOLUMEN_DESCONECTADO;
     }
     if (dispositivo->generacion != desc->generacion_msc) {
         desc->cancelado = 1;
-        return -4;
+        vfs_notificar_desconexion(desc->unidad_msc);
+        return VOLUMEN_DESCONECTADO;
     }
 
     int64_t leidos;
@@ -419,7 +380,8 @@ int64_t vfs_leer(int fd, void *buf, size_t cantidad) {
 
 int64_t vfs_leer_en(int fd, uint64_t offset, void *buf, size_t cantidad) {
     struct vfs_descriptor_archivo *desc = vfs_obtener_descriptor(fd);
-    if (!desc || !buf || !cantidad) return -1;
+    if (!desc || !buf) return -1;
+    if(!cantidad)return 0;
     if (offset > desc->tamano) return 0;
     uint64_t posicion_anterior = desc->posicion;
     desc->posicion = offset;
@@ -492,52 +454,88 @@ void vfs_cerrar(int fd) {
 }
 
 int vfs_crear_archivo(const char *nombre, const char *contenido) {
-    if (!vfs_esta_montado()) {
-        if (vfs_montar(g_unidad_activa) != 0) {
-            consola_imprimir_linea_color("Error: No hay sistema de archivos montado para escribir.", 0x00FFAA00);
-            return -1;
-        }
-    }
-
-    uint32_t len = 0;
-    if (contenido) {
-        while (contenido[len]) len++;
-    }
-
-    switch (g_tipo_activo) {
-        case VFS_FS_EXT4:
-            return ext4_crear_archivo(nombre, (const uint8_t *)contenido, len);
-        case VFS_FS_FAT32:
-            return fat32_crear_archivo(nombre, (const uint8_t *)contenido, len);
-        case VFS_FS_EXFAT:
-            return exfat_crear_archivo(nombre, (const uint8_t *)contenido, len);
-        case VFS_FS_NTFS:
-            consola_imprimir_linea_color("  [!] NTFS montado en modo SOLO LECTURA. No es posible escribir en esta versión.", 0x00FFAA00);
-            return -2;
-        default:
-            return -3;
-    }
+    (void)nombre;(void)contenido;
+    consola_imprimir_linea("Volumen abierto en solo lectura; escritor experimental fuera de este montaje.");
+    return VOLUMEN_SOLO_LECTURA;
 }
-
 int vfs_crear_directorio(const char *nombre) {
-    if (!vfs_esta_montado()) {
-        if (vfs_montar(g_unidad_activa) != 0) {
-            consola_imprimir_linea_color("Error: No hay sistema de archivos montado para crear directorio.", 0x00FFAA00);
-            return -1;
+    (void)nombre;return VOLUMEN_SOLO_LECTURA;
+}
+const struct particiones *vfs_obtener_particiones(void){return &g_particiones;}
+unsigned vfs_obtener_particion_activa(void){return g_particion_activa.numero;}
+int vfs_ultimo_error(void){return g_error_volumen;}
+const char *vfs_obtener_ruta_catalogo(void){return g_ruta_catalogo;}
+void vfs_notificar_desconexion(uint8_t unidad){
+    if(unidad!=g_unidad_activa)return;g_desconectado=1;g_catalogo_vfs.total=0;g_ruta_catalogo[0]=0;
+    for(unsigned i=0;i<VFS_MAX_FDS;i++)if(g_descriptores[i].en_uso && g_descriptores[i].unidad_msc==unidad)g_descriptores[i].cancelado=1;
+    /* No liberar buffers desde el callback de hotplug: el consumidor aún los posee. */
+}
+int vfs_montar_particion(uint8_t unidad,unsigned numero){
+    g_cancelacion_lectura=0;particiones_configurar_servicio(servir_lectura);
+    vfs_desmontar();g_unidad_activa=unidad;g_error_volumen=particiones_descubrir(unidad,&g_particiones);
+    if(g_error_volumen)goto fallo;
+    unsigned candidatas=0,elegida=0;
+    for(unsigned i=0;i<g_particiones.total;i++){
+        struct particion *p=&g_particiones.entradas[i];
+        if(!p->resultado && (p->formato==VOLUMEN_FAT32 || p->formato==VOLUMEN_EXFAT)){
+            struct fat_lector_volumen *prueba=asignar_memoria_cero(sizeof(*prueba));
+            if(!prueba)p->resultado=VOLUMEN_NO_SOPORTADO;
+            else {p->resultado=fat_lector_montar(prueba,p);fat_lector_desmontar(prueba);liberar_memoria(prueba);}
         }
+        consola_imprimir("USB ");consola_imprimir_dec(unidad);consola_imprimir(" · Particion ");consola_imprimir_dec(p->numero);
+        consola_imprimir(" · ");consola_imprimir(volumen_nombre(p->formato));consola_imprimir(" · ");consola_imprimir_linea(volumen_error(p->resultado));
+        if(numero && p->numero==numero){candidatas=1;elegida=i;break;}
+        if(!numero && p->formato!=VOLUMEN_DESCONOCIDO && !p->resultado){candidatas++;elegida=i;}
     }
-
-    switch (g_tipo_activo) {
-        case VFS_FS_EXT4:
-            return ext4_crear_directorio(nombre);
-        case VFS_FS_FAT32:
-            return fat32_crear_directorio(nombre);
-        case VFS_FS_EXFAT:
-            return exfat_crear_directorio(nombre);
-        case VFS_FS_NTFS:
-            consola_imprimir_linea_color("  [!] NTFS montado en modo SOLO LECTURA.", 0x00FFAA00);
-            return -2;
-        default:
-            return -3;
+    if(candidatas!=1){g_error_volumen=candidatas?VOLUMEN_ELEGIR:VOLUMEN_DESCONOCIDO_ERROR;
+        if(!candidatas && g_particiones.total==1)g_error_volumen=g_particiones.entradas[0].resultado;goto fallo;}
+    struct particion *p=&g_particiones.entradas[elegida];
+    if(p->resultado){g_error_volumen=p->resultado;goto fallo;}
+    switch(p->formato){
+        case VOLUMEN_FAT32:g_error_volumen=fat32_montar_particion(p);break;
+        case VOLUMEN_EXFAT:g_error_volumen=exfat_montar_particion(p);break;
+        case VOLUMEN_NTFS:g_error_volumen=ntfs_montar_particion(p);break;
+        case VOLUMEN_EXT4:g_error_volumen=ext4_montar_particion(p);break;
+        default:g_error_volumen=VOLUMEN_DESCONOCIDO_ERROR;
     }
+    p->resultado=g_error_volumen;if(g_error_volumen)goto fallo;
+    g_particion_activa=*p;g_tipo_activo=(enum vfs_tipo_fs)p->formato;g_desconectado=0;
+    consola_imprimir("USB ");consola_imprimir_dec(unidad);consola_imprimir(" · Particion ");consola_imprimir_dec(p->numero);consola_imprimir(" · ");consola_imprimir(vfs_obtener_nombre_fs());consola_imprimir_linea(" · Solo lectura");
+    if(p->formato==VOLUMEN_EXFAT && fat_lector_exfat.respaldo)consola_imprimir_linea(fat_lector_exfat.respaldo==1?"Recuperacion de lectura: se usa el arranque de respaldo; disco sin reparar.":"Arranque principal valido; respaldo invalido, sin reparacion.");
+    return 0;
+fallo:
+    g_catalogo_vfs.total=0;consola_imprimir_linea(volumen_error(g_error_volumen));return g_error_volumen;
+}
+int vfs_listar_pagina(const char *ruta,unsigned pagina){
+    g_cancelacion_lectura=0;
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    char copia[sizeof(g_ruta_catalogo)];if(!ruta)ruta=g_ruta_catalogo;
+    size_t len=0;while(ruta[len]){if(len+1==sizeof(copia))return VOLUMEN_NO_SOPORTADO;copia[len]=ruta[len];len++;}copia[len]=0;
+    int r;
+    switch(g_tipo_activo){
+        case VFS_FS_FAT32:r=fat_lector_listar(&fat_lector_fat32,copia,pagina);break;
+        case VFS_FS_EXFAT:r=fat_lector_listar(&fat_lector_exfat,copia,pagina);break;
+        case VFS_FS_NTFS:r=pagina?VOLUMEN_NO_SOPORTADO:ntfs_listar_directorio(copia);break;
+        case VFS_FS_EXT4:r=pagina?VOLUMEN_NO_SOPORTADO:ext4_listar_directorio(copia);break;
+        default:r=VOLUMEN_NO_ENCONTRADO;
+    }
+    if(!r)memcpy(g_ruta_catalogo,copia,len+1);else vfs_limpiar_catalogo();return r;
+}
+enum vfs_tipo_archivo vfs_inspeccionar_archivo(const char *ruta,int *error){
+    uint8_t prefijo[512];int fd;int r=vfs_abrir(ruta,&fd);if(r){if(error)*error=r;return VFS_TIPO_OTRO;}
+    int64_t n=vfs_leer(fd,prefijo,sizeof(prefijo));vfs_cerrar(fd);if(error)*error=n<0?(int)n:0;if(n<0)return VFS_TIPO_OTRO;
+    if(n>=8 && !memcmp(prefijo,"\x89PNG\r\n\x1a\n",8))return VFS_TIPO_IMAGEN_PNG;
+    if(n>=3 && prefijo[0]==255 && prefijo[1]==216 && prefijo[2]==255)return VFS_TIPO_IMAGEN_JPEG;
+    if(n>=2 && prefijo[0]=='B' && prefijo[1]=='M')return VFS_TIPO_IMAGEN_BMP;
+    if(n>=12 && !memcmp(prefijo+4,"ftyp",4))return VFS_TIPO_MP4;
+    if(n>=10 && !memcmp(prefijo,"ID3",3))return VFS_TIPO_MP3;
+    if(n>=4 && prefijo[0]==255 && (prefijo[1]&0xe0)==0xe0 && (prefijo[1]&6)==2 && (prefijo[1]&0x18)!=8 && (prefijo[2]&0xf0)!=0 && (prefijo[2]&0xf0)!=0xf0 && (prefijo[2]&12)!=12)return VFS_TIPO_MP3;
+    enum vfs_tipo_archivo t=vfs_detectar_tipo_archivo(ruta);
+    if(t==VFS_TIPO_TEXTO){for(int64_t i=0;i<n;i++)if((prefijo[i]<32 && prefijo[i]!='\t' && prefijo[i]!='\r' && prefijo[i]!='\n') || prefijo[i]==127)return VFS_TIPO_OTRO;return t;}
+    return VFS_TIPO_OTRO;
+}
+int vfs_consultar_ruta(const char *ruta,enum vfs_tipo_nodo *tipo){
+    struct fat_lector_volumen *v=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:g_tipo_activo==VFS_FS_EXFAT?&fat_lector_exfat:0;
+    if(!v || !tipo)return VOLUMEN_NO_SOPORTADO;
+    g_cancelacion_lectura=0;struct fat_lector_nodo n;int r=fat_lector_resolver(v,ruta,&n,0);if(!r)*tipo=n.directorio?VFS_NODO_DIRECTORIO:VFS_NODO_ARCHIVO;return r;
 }

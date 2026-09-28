@@ -21,6 +21,8 @@ static uint64_t g_base_fisica  = 0;
 static uint64_t g_base_virtual = 0;
 static int g_iniciado = 0;
 static int g_usar_hda = 0;
+static int g_volumen_db = -24;
+static int g_silenciado = 0;
 
 // Variables de estado del flujo de audio
 static const uint8_t *g_audio_datos          = 0;
@@ -304,4 +306,43 @@ void audio_ac97_detener(void) {
     g_audio_en_bucle       = 0;
     g_entradas_en_cola     = 0;
     g_audio_cursor         = 0;
+}
+
+int audio_obtener_volumen_db(void) {
+    if (g_usar_hda) return audio_hda_obtener_volumen_db();
+    return g_volumen_db;
+}
+
+int audio_fijar_volumen_db(int db) {
+    if (g_usar_hda) return audio_hda_fijar_volumen_db(db);
+    if (db > 6) db = 6;
+    if (db < -60) db = -60;
+    g_volumen_db = db;
+    if (g_iniciado) {
+        int atenuacion = db < 0 ? ((-db) * 2 + 1) / 3 : 0;
+        if (atenuacion > 31) atenuacion = 31;
+        uint16_t valor = (uint16_t)atenuacion | (uint16_t)(atenuacion << 8);
+        if (g_silenciado) valor |= 0x8000;
+        escribir_puerto_w(g_nambar + 0x02, valor);
+        escribir_puerto_w(g_nambar + 0x18, valor);
+    }
+    return g_volumen_db;
+}
+
+int audio_ajustar_volumen_db(int delta_db) {
+    return audio_fijar_volumen_db(audio_obtener_volumen_db() + delta_db);
+}
+
+int audio_esta_silenciado(void) {
+    if (g_usar_hda) return audio_hda_esta_silenciado();
+    return g_silenciado;
+}
+
+void audio_fijar_silencio(int silenciar) {
+    if (g_usar_hda) {
+        audio_hda_fijar_silencio(silenciar);
+        return;
+    }
+    g_silenciado = silenciar ? 1 : 0;
+    audio_fijar_volumen_db(g_volumen_db);
 }

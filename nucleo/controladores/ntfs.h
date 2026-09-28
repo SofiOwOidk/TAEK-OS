@@ -2,6 +2,7 @@
 #define CONTROLADORES_NTFS_H
 
 #include <stdint.h>
+#include "particiones.h"
 #include <stddef.h>
 
 // ============================================================================
@@ -146,6 +147,7 @@ struct ntfs_volumen {
 // --- API PÚBLICA DEL CONTROLADOR NTFS ---
 void ntfs_iniciar(void);
 int  ntfs_montar(uint8_t unidad_msc);
+int ntfs_montar_particion(const struct particion *);
 void ntfs_desmontar(void);
 int  ntfs_esta_montado(void);
 const struct ntfs_volumen *ntfs_obtener_volumen(void);

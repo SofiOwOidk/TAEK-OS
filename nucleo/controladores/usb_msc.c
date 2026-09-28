@@ -1,3 +1,4 @@
+#include "vfs.h"
 #include "usb_msc.h"
 #include "xhci.h"
 #include "consola.h"
@@ -297,6 +298,7 @@ void usb_msc_desregistrar_dispositivo(uint8_t slot_id) {
         if (g_msc_dispositivos[i].activo && g_msc_dispositivos[i].slot_id == slot_id) {
             g_msc_dispositivos[i].activo = 0;
             g_msc_dispositivos[i].listo = 0;
+            vfs_notificar_desconexion((uint8_t)i);
             serial_imprimir("  [USB MSC] Unidad en Slot ");
             serial_imprimir_dec(slot_id);
             serial_imprimir_linea(" desregistrada (dispositivo desconectado).");

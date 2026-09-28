@@ -9,7 +9,8 @@ typedef enum {
     MP4_DATOS_INVALIDOS = -1,
     MP4_NO_SOPORTADO = -2,
     MP4_SIN_MEMORIA = -3,
-    MP4_LIMITE_EXCEDIDO = -4
+    MP4_LIMITE_EXCEDIDO = -4,
+    MP4_ERROR_LECTURA = -5
 } mp4_resultado;
 
 typedef int64_t (*mp4_lectura_posicional)(void *contexto, int pista, uint64_t offset,
@@ -27,6 +28,7 @@ typedef struct {
     size_t metadatos_bytes;
     mp4_lectura_posicional leer_fuente;
     void *fuente_contexto;
+    int64_t ultimo_error_lectura; /* Código original de la fuente; no confundir USB con corrupción MP4. */
     uint8_t *muestra_video_buffer;
     size_t muestra_video_capacidad;
     uint8_t *muestra_audio_buffer;

@@ -1110,7 +1110,8 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     consola_imprimir(p.cancelado ? "Reproducción cancelada por usuario. " :
                      resultado || p.error ? "Error durante reproducción: " :
                      "Reproducción finalizada con éxito. ");
-    if (resultado && !p.cancelado) consola_imprimir(h264_error(dec));
+    if(p.mp4->ultimo_error_lectura){int64_t e=p.mp4->ultimo_error_lectura;consola_imprimir(e<=-20 && e>=-30?volumen_error((int)e):"Lectura MP4 incompleta");}
+    else if (resultado && !p.cancelado) consola_imprimir(h264_error(dec));
     consola_imprimir_linea("");
 
     // Generar e imprimir informe integral de telemetría y benchmark
@@ -1126,7 +1127,8 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
                         despues.heap_bytes_en_uso - antes.heap_bytes_en_uso : 0));
     serial_imprimir_linea("");
 
-    return p.cancelado ? 1 : 0;
+    if(p.mp4->ultimo_error_lectura)return (int)p.mp4->ultimo_error_lectura;
+    return p.cancelado ? 1 : resultado || p.error ? -1 : 0;
 }
 
 int reproductor_reproducir_memoria(const void *datos, size_t tamano, const char *nombre, enum modo_reproduccion modo) {
@@ -1165,11 +1167,14 @@ int reproductor_reproducir_fuente(mp4_lectura_posicional leer, void *contexto,
     int resultado = r == MP4_OK ? reproductor_ejecutar(&mp4, nombre, modo,
                                                        descriptor_vfs_video, descriptor_vfs_audio) : -3;
     if (r != MP4_OK) {
-        consola_imprimir_linea(r == MP4_LIMITE_EXCEDIDO ?
+        int64_t e=mp4.ultimo_error_lectura;
+        consola_imprimir_linea(e?(e<=-20 && e>=-30?volumen_error((int)e):"Lectura MP4 incompleta"):
+            r == MP4_LIMITE_EXCEDIDO ?
             "El índice MP4 excede el límite de memoria configurado." :
             "MP4 inválido o contenedor no soportado.");
         serial_imprimir_linea("[MULTIMEDIA] ERROR MP4 STREAM");
     }
+    if(mp4.ultimo_error_lectura)resultado=(int)mp4.ultimo_error_lectura;
     liberar_memoria(muestra_audio);
     liberar_memoria(muestra_video);
     liberar_memoria(metadatos);

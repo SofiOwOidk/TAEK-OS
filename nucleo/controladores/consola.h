@@ -28,6 +28,7 @@ void consola_imprimir_dec(uint64_t valor);
 void consola_imprimir_hex(uint64_t valor);
 
 char consola_leer_caracter(void);
+int consola_sondear_cancelacion(void);
 int  consola_leer_linea(char *buffer, int max_len);
 
 #endif // CONTROLADORES_CONSOLA_H

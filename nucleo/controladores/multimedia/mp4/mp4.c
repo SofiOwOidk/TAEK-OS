@@ -275,6 +275,13 @@ mp4_resultado mp4_abrir(mp4_contenedor *m, const void *datos, size_t bytes) {
     return mp4_parsear_moov(m, moov);
 }
 
+static mp4_resultado mp4_leer_exacto(mp4_contenedor *m,int pista,uint64_t offset,void *destino,size_t cantidad){
+    int64_t r=m->leer_fuente(m->fuente_contexto,pista,offset,destino,cantidad);
+    if(r==(int64_t)cantidad)return MP4_OK;
+    m->ultimo_error_lectura=r<0?r:MP4_ERROR_LECTURA;
+    return MP4_ERROR_LECTURA;
+}
+
 mp4_resultado mp4_abrir_fuente(mp4_contenedor *m, uint64_t bytes,
                                mp4_lectura_posicional leer, void *contexto,
                                uint8_t *metadatos, size_t metadatos_capacidad,
@@ -295,12 +302,13 @@ mp4_resultado mp4_abrir_fuente(mp4_contenedor *m, uint64_t bytes,
     uint64_t offset = 0;
     while (offset <= bytes - 8) {
         uint8_t h[16];
-        if (leer(contexto, MP4_FUENTE_VIDEO, offset, h, 8) != 8) return MP4_DATOS_INVALIDOS;
+        if (mp4_leer_exacto(m,MP4_FUENTE_VIDEO,offset,h,8)!=MP4_OK)return MP4_ERROR_LECTURA;
         uint64_t tam = be32(h);
         uint32_t t = be32(h + 4);
         size_t cabecera = 8;
         if (tam == 1) {
-            if (bytes - offset < 16 || leer(contexto, MP4_FUENTE_VIDEO, offset, h, 16) != 16) return MP4_DATOS_INVALIDOS;
+            if (bytes - offset < 16)return MP4_DATOS_INVALIDOS;
+            if(mp4_leer_exacto(m,MP4_FUENTE_VIDEO,offset,h,16)!=MP4_OK)return MP4_ERROR_LECTURA;
             tam = be64(h + 8);
             cabecera = 16;
         } else if (tam == 0) {
@@ -309,8 +317,8 @@ mp4_resultado mp4_abrir_fuente(mp4_contenedor *m, uint64_t bytes,
         if (tam < cabecera || tam > bytes - offset) return MP4_DATOS_INVALIDOS;
         if (t == TIPO('m','o','o','v')) {
             if (tam > metadatos_capacidad || tam > SIZE_MAX) return MP4_LIMITE_EXCEDIDO;
-            if (leer(contexto, MP4_FUENTE_VIDEO, offset, metadatos, (size_t)tam) != (int64_t)tam)
-                return MP4_DATOS_INVALIDOS;
+            if (mp4_leer_exacto(m,MP4_FUENTE_VIDEO,offset,metadatos,(size_t)tam)!=MP4_OK)
+                return MP4_ERROR_LECTURA;
             m->metadatos = metadatos;
             m->metadatos_bytes = (size_t)tam;
             vista resto = {metadatos, (size_t)tam}, contenido;
@@ -329,8 +337,8 @@ static int mp4_leer_muestra(mp4_contenedor *m, int pista, uint64_t offset, size_
     if (offset > m->bytes || (uint64_t)tam > m->bytes - offset) return MP4_DATOS_INVALIDOS;
     if (m->leer_fuente) {
         if (!buffer || tam > capacidad) return MP4_LIMITE_EXCEDIDO;
-        if (m->leer_fuente(m->fuente_contexto, pista, offset, buffer, tam) != (int64_t)tam)
-            return MP4_DATOS_INVALIDOS;
+        if (mp4_leer_exacto(m,pista,offset,buffer,tam)!=MP4_OK)
+            return MP4_ERROR_LECTURA;
         *datos = buffer;
     } else {
         *datos = m->archivo + (size_t)offset;

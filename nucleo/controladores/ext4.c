@@ -1,3 +1,4 @@
+#include "particiones.h"
 #include "ext4.h"
 #include "vfs.h"
 #include "usb_msc.h"
@@ -12,6 +13,11 @@
 // ============================================================================
 
 static struct ext4_volumen g_volumen = {0};
+static struct particion g_particion_ext4;
+static int ext4_usb_leer_sectores(uint8_t unidad,uint64_t lba,uint16_t n,void *buf){
+    if(unidad!=g_particion_ext4.unidad || lba<g_particion_ext4.inicio)return VOLUMEN_CORRUPTO;
+    return particion_leer(&g_particion_ext4,lba-g_particion_ext4.inicio,n,buf,0);
+}
 static int g_ext4_inicializado = 0;
 
 // Búferes estáticos en BSS para evitar desbordar la pila del kernel
@@ -65,7 +71,7 @@ static int ext4_leer_bloque(uint32_t bloque, void *destino) {
     uint64_t lba = (uint64_t)g_volumen.lba_inicio_particion +
                    (uint64_t)bloque * g_volumen.sectores_por_bloque;
     if (lba > UINT32_MAX) return -1;
-    return usb_msc_leer_sectores(g_volumen.unidad_msc, (uint32_t)lba,
+    return ext4_usb_leer_sectores(g_volumen.unidad_msc, (uint32_t)lba,
                                  (uint16_t)g_volumen.sectores_por_bloque, destino);
 }
 
@@ -91,7 +97,7 @@ static int ext4_leer_descriptor_grupo(uint32_t grupo, struct ext4_grupo_descript
     uint64_t lba_gdt = (uint64_t)g_volumen.lba_bloque_descriptores +
                        bloque_gdt * g_volumen.sectores_por_bloque;
     if (lba_gdt > UINT32_MAX || offset_en_bloque + 32 > g_volumen.tamano_bloque) return -2;
-    int res = usb_msc_leer_sectores(g_volumen.unidad_msc, (uint32_t)lba_gdt,
+    int res = ext4_usb_leer_sectores(g_volumen.unidad_msc, (uint32_t)lba_gdt,
                                    (uint16_t)g_volumen.sectores_por_bloque, g_bloque_aux);
     if (res != 0) return -3;
 
@@ -114,7 +120,7 @@ static int ext4_escribir_descriptor_grupo(uint32_t grupo, const struct ext4_grup
     uint32_t offset_en_bloque = offset_bytes % g_volumen.tamano_bloque;
 
     uint32_t lba_gdt = g_volumen.lba_bloque_descriptores + (bloque_gdt * g_volumen.sectores_por_bloque);
-    int res = usb_msc_leer_sectores(g_volumen.unidad_msc, lba_gdt, (uint16_t)g_volumen.sectores_por_bloque, g_bloque_aux);
+    int res = ext4_usb_leer_sectores(g_volumen.unidad_msc, lba_gdt, (uint16_t)g_volumen.sectores_por_bloque, g_bloque_aux);
     if (res != 0) return -3;
 
     uint8_t *dst = &g_bloque_aux[offset_en_bloque];
@@ -249,116 +255,20 @@ static int ext4_mapear_bloque_logico(const struct ext4_inodo *inodo, uint32_t bl
 
 // Monta el sistema de archivos ext4 escaneando MBR o Superfloppy
 int ext4_montar(uint8_t unidad_msc) {
-    if (!g_ext4_inicializado) ext4_iniciar();
-
-    if (unidad_msc >= USB_MSC_MAX_DISPOSITIVOS) return -1;
-    const struct usb_msc_dispositivo *dev = usb_msc_obtener_dispositivo(unidad_msc);
-    if (!dev || !dev->activo || !dev->listo) return -2;
-
-    if (g_volumen.montado && g_volumen.unidad_msc == unidad_msc) return 0;
-    g_volumen.montado = 0;
-
-    // 1. Leer LBA 0 para detectar MBR
-    uint8_t mbr[512];
-    int res = usb_msc_leer_sectores(unidad_msc, 0, 1, mbr);
-    if (res != 0) return -3;
-
-    uint32_t lba_particion = 0;
-    int particion_encontrada = 0;
-
-    if (mbr[510] == 0x55 && mbr[511] == 0xAA) {
-        for (int p = 0; p < 4; p++) {
-            uint32_t p_off = 446 + (p * 16);
-            uint8_t tipo = mbr[p_off + 4];
-            uint32_t inicio_lba = (uint32_t)mbr[p_off + 8] |
-                                 ((uint32_t)mbr[p_off + 9] << 8) |
-                                 ((uint32_t)mbr[p_off + 10] << 16) |
-                                 ((uint32_t)mbr[p_off + 11] << 24);
-            uint32_t cant_sec = (uint32_t)mbr[p_off + 12] |
-                                ((uint32_t)mbr[p_off + 13] << 8) |
-                                ((uint32_t)mbr[p_off + 14] << 16) |
-                                ((uint32_t)mbr[p_off + 15] << 24);
-
-            if (cant_sec > 0 && inicio_lba > 0 && tipo != 0 && tipo != 0xEE) {
-                if (usb_msc_leer_sectores(unidad_msc, inicio_lba + 2, 2, g_bloque_buf) == 0) {
-                    const struct ext4_superbloque *test_sb = (const struct ext4_superbloque *)g_bloque_buf;
-                    if (test_sb->s_magic == EXT4_SUPER_MAGIC) {
-                        lba_particion = inicio_lba;
-                        particion_encontrada = 1;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // GPT para ext4
-    if (!particion_encontrada) {
-        static uint8_t gpt_buf[512];
-        if (usb_msc_leer_sectores(unidad_msc, 1, 1, gpt_buf) == 0 &&
-            memcmp(gpt_buf, "EFI PART", 8) == 0) {
-            uint64_t part_lba = *(uint64_t *)&gpt_buf[72];
-            uint32_t num_parts = *(uint32_t *)&gpt_buf[80];
-            uint32_t part_size = *(uint32_t *)&gpt_buf[84];
-            if (part_size != 128) part_size = 128;
-            if (part_lba == 0) part_lba = 2;
-            if (num_parts > 32) num_parts = 32;
-
-            uint32_t sec_actual = 0xFFFFFFFF;
-            for (uint32_t p = 0; p < num_parts; p++) {
-                uint32_t sec = (uint32_t)part_lba + (p * part_size) / 512;
-                uint32_t off = (p * part_size) % 512;
-                if (sec != sec_actual) {
-                    if (usb_msc_leer_sectores(unidad_msc, sec, 1, gpt_buf) != 0) break;
-                    sec_actual = sec;
-                }
-                int guid_valido = 0;
-                for (int g = 0; g < 16; g++) {
-                    if (gpt_buf[off + g] != 0) { guid_valido = 1; break; }
-                }
-                if (!guid_valido) continue;
-
-                uint64_t inicio = *(uint64_t *)&gpt_buf[off + 32];
-                if (inicio > 0 && inicio <= UINT32_MAX) {
-                    if (usb_msc_leer_sectores(unidad_msc, (uint32_t)inicio + 2, 2, g_bloque_buf) == 0) {
-                        const struct ext4_superbloque *test_sb = (const struct ext4_superbloque *)g_bloque_buf;
-                        if (test_sb->s_magic == EXT4_SUPER_MAGIC) {
-                            lba_particion = (uint32_t)inicio;
-                            particion_encontrada = 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Probar el Superbloque ext4 en offset 1024 bytes (LBA particion + 2)
-    uint32_t lba_sb = (particion_encontrada ? lba_particion : 0) + 2;
-    res = usb_msc_leer_sectores(unidad_msc, lba_sb, 2, g_bloque_buf);
-    if (res != 0) return -4;
-
+    struct particiones *ps=asignar_memoria(sizeof(*ps));if(!ps)return VOLUMEN_NO_SOPORTADO;
+    int r=particiones_descubrir(unidad_msc,ps);unsigned n=0,e=0;
+    if(!r)for(unsigned i=0;i<ps->total;i++)if(ps->entradas[i].formato==VOLUMEN_EXT4){n++;e=i;}
+    if(!r)r=n==1?ext4_montar_particion(&ps->entradas[e]):n?VOLUMEN_ELEGIR:VOLUMEN_DESCONOCIDO_ERROR;
+    liberar_memoria(ps);return r;
+}
+int ext4_montar_particion(const struct particion *particion) {
+    if(!particion || particion->inicio>UINT32_MAX)return VOLUMEN_CORRUPTO;
+    g_particion_ext4=*particion;
+    uint8_t unidad_msc=particion->unidad;uint32_t lba_particion=(uint32_t)particion->inicio;
+    g_volumen.montado=0;const struct usb_msc_dispositivo *dev=usb_msc_obtener_dispositivo(unidad_msc);
+    int res=particion_leer(particion,2,2,g_bloque_buf,0);if(res)return res;
     const struct ext4_superbloque *sb = (const struct ext4_superbloque *)g_bloque_buf;
-    if (sb->s_magic != EXT4_SUPER_MAGIC) {
-        // Si no se encontró en la partición MBR, probar directamente en LBA 2 (Superfloppy)
-        if (particion_encontrada) {
-            lba_sb = 2;
-            res = usb_msc_leer_sectores(unidad_msc, lba_sb, 2, g_bloque_buf);
-            if (res != 0 || sb->s_magic != EXT4_SUPER_MAGIC) {
-                return -5; // No es ext4
-            }
-            lba_particion = 0;
-        } else {
-            return -5;
-        }
-    }
-
-    // Solo se admiten geometrías y formatos que este lector sabe interpretar.
-    // Las rutas de escritura aún no mantienen journal, checksums ni contadores
-    // del superbloque, y por tanto permanecen deshabilitadas.
-    // RO_COMPAT_BIGALLOC cambia la unidad de los extents; METADATA_CSUM
-    // exige validar checksums antes de confiar en inodos/GDT/directorios.
-    // Este lector acepta sólo las variantes que interpreta íntegramente.
+    if(sb->s_magic!=0xef53)return VOLUMEN_DESCONOCIDO_ERROR;
     const uint32_t ro_compat_lectura = 0x1U | 0x2U | 0x8U | 0x20U | 0x40U | 0x1000U;
     uint32_t tamano_bloque = sb->s_log_block_size <= 2 ? 1024U << sb->s_log_block_size : 0;
     uint32_t sectores_por_bloque = tamano_bloque / 512;
@@ -370,7 +280,7 @@ int ext4_montar(uint8_t unidad_msc) {
         (sb->s_feature_ro_compat & ~ro_compat_lectura) != 0 ||
         (sb->s_feature_incompat & ~(0x2U | 0x40U | 0x80U | 0x200U)) != 0 ||
         sb->s_blocks_count_hi != 0 || sb->s_blocks_count_lo == 0 ||
-        (uint64_t)lba_particion + (uint64_t)sb->s_blocks_count_lo * sectores_por_bloque > dev->sectores_totales ||
+        (uint64_t)sb->s_blocks_count_lo * sectores_por_bloque > particion->sectores ||
         sb->s_inode_size < 128 || sb->s_inode_size > tamano_bloque ||
         tamano_bloque % sb->s_inode_size != 0 ||
         ((sb->s_feature_incompat & 0x80U) && sb->s_desc_size != 64)) {
@@ -383,14 +293,11 @@ int ext4_montar(uint8_t unidad_msc) {
     g_volumen.unidad_msc = unidad_msc;
     g_volumen.lba_inicio_particion = lba_particion;
     g_volumen.tamano_bloque = 1024U << sb->s_log_block_size;
-    if (g_volumen.tamano_bloque < 1024 || g_volumen.tamano_bloque > 4096) {
-        g_volumen.tamano_bloque = 4096;
-    }
     g_volumen.sectores_por_bloque = g_volumen.tamano_bloque / 512;
     g_volumen.total_bloques = sb->s_blocks_count_lo;
     g_volumen.bloques_por_grupo = sb->s_blocks_per_group;
     g_volumen.inodos_por_grupo = sb->s_inodes_per_group;
-    g_volumen.tamano_inodo = sb->s_inode_size ? sb->s_inode_size : 256;
+    g_volumen.tamano_inodo = sb->s_inode_size;
 
     if (sb->s_feature_incompat & 0x80) {
         g_volumen.tamano_descriptor_grupo = sb->s_desc_size;

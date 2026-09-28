@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "particiones.h"
 
 // ============================================================================
 // TAEK OS - CONTROLADOR DE SISTEMA DE ARCHIVOS exFAT (Hito 50)
@@ -109,6 +110,8 @@ struct exfat_volumen {
 // --- API PÚBLICA DEL CONTROLADOR exFAT ---
 void exfat_iniciar(void);
 int  exfat_montar(uint8_t unidad_msc);
+int exfat_montar_particion(const struct particion *);
+int exfat_habilitar_escritura_experimental(void);
 void exfat_desmontar(void);
 int  exfat_esta_montado(void);
 const struct exfat_volumen *exfat_obtener_volumen(void);

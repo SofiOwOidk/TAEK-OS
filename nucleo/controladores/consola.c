@@ -19,6 +19,9 @@ static uint32_t g_color_bg = COLOR_FONDO_DEFAULT;
 // Estado del decodificador UTF-8 para cadenas continuas
 static uint32_t g_utf8_codepunto = 0;
 static int      g_utf8_restantes = 0;
+/* Teclas escritas mientras el VFS trabaja: conservarlas para la terminal. */
+static char g_entrada_pendiente[128];
+static unsigned g_entrada_inicio,g_entrada_total;
 
 void consola_iniciar(void) {
     uint64_t ancho = pantalla_obtener_ancho();
@@ -179,7 +182,7 @@ void consola_imprimir_hex(uint64_t valor) {
     }
 }
 
-char consola_leer_caracter(void) {
+static char consola_leer_caracter_directo(void) {
     // 1. En Modo Nativo (modo=ps2), leer exclusivamente del teclado PS/2 (i8042 / EC)
     if (teclado_es_modo_nativo()) {
         char c = teclado_leer_caracter();
@@ -198,6 +201,20 @@ char consola_leer_caracter(void) {
     }
 
     return 0;
+}
+
+char consola_leer_caracter(void) {
+    if(g_entrada_total){char c=g_entrada_pendiente[g_entrada_inicio];g_entrada_inicio=(g_entrada_inicio+1)%128;g_entrada_total--;return c;}
+    return consola_leer_caracter_directo();
+}
+int consola_sondear_cancelacion(void) {
+    int cancelar=0;
+    while(g_entrada_total<128){
+        char c=consola_leer_caracter_directo();if(!c)break;
+        if(c==3 || c==27){cancelar=1;continue;}
+        g_entrada_pendiente[(g_entrada_inicio+g_entrada_total)%128]=c;g_entrada_total++;
+    }
+    return cancelar;
 }
 
 int consola_leer_linea(char *buffer, int max_len) {

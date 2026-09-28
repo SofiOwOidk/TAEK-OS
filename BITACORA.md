@@ -2605,3 +2605,62 @@
   - ISO final para pruebas físicas/manuales: [taek-os-2026-09-27_21-13-56.iso](build/taek-os-2026-09-27_21-13-56.iso), menú normal xHCI con ambos videos, máximo cuatro núcleos, **sin límite de 32 muestras**. SHA-256 ISO `e8242241a25874737d9513d08e29ed965589f63dd4906f660fd2871a4e9f8541`; ELF `884518adc989431054821fb175feb983e63647440053af7c5a9ab4d4337736d1`. Registro `build/h264/entrega-p5.sha256.json`. Revisar los nombres/hash en ese manifiesto al mover archivos; los artefactos anteriores se conservan.
   - Quedan **pendientes de validación física** arranque AP/IRQ/XMM/TLB en i7-8650U, ambos videos completos con USB/HDA, progresión LPIB/DPIB/BCIS, duración PCM/captura por bloques de 100 ms, ausencia de vaciados durante pista, continuidad de onda, máximos de servicio y reloj monótono. No hay datos de audio continuo ni de DMA físico nuevos en esta entrega. La meta física no se marca cumplida por tiempos host o QEMU. P3–P5 están implementados con evidencia host y la integración funcional de kernel indicada; la aceptación posterior de hardware permanece abierta.
   - No se activa AVX2/YMM ni se declara una ganancia hipotética; tampoco SMT. El pool se usa de forma síncrona con coordinador único, sin scheduler general, mappings concurrentes o asignación AP. Parser trabaja por slice completo antes de publicar; no se solapa con trabajadores que consumen ese slice y no depende de múltiples slices por archivo. No se paralelizan deblocking, DPB o cuadros dependientes. >8192 MB conserva decoder combinado; presupuesto/semántica de formatos originales se mantienen. Cancelación dentro de dependencias se libera cooperativamente; latencia bajo USB síncrono y hardware real aún requiere captura.
+
+---
+
+### Hito 73 - Control Interactivo de Volumen en dB para HDA y AC'97 (2026-09-27)
+
+* **Objetivo y Contexto:**
+  - Incorporar en la terminal Ring 0 un control explícito y relativo de ganancia para las dos rutas de audio disponibles: Intel HDA y AC'97. La interfaz solicitada es `volumen subir +10db` y `volumen bajar -10db`; debe conservar el estado entre comandos, aplicar la modificación al dispositivo de audio activo y mostrar el nivel resultante con signo correcto.
+  - El valor lógico de salida se restringe a [-60, +6] dB. El límite inferior corresponde al mínimo manejado por la conversión AC'97 de 5 bits y el límite superior evita solicitar ganancia por encima del techo de la política actual del controlador. El valor inicial sigue siendo -24 dB, coherente con la atenuación de confort ya programada durante el arranque.
+
+* **Causas Raíz Identificadas e Inspección Forense de Código:**
+  - La terminal no tenía una rama que interpretara la palabra `volumen`; por tanto, aunque `audio_hda.c` ya mantenía `g_hda_volumen_db` y emitía verbos de amplificador, no existía un camino de entrada desde teclado que transformara `+10db` o `-10db` en una actualización de la ganancia.
+  - En la ruta AC'97, `audio_ac97_iniciar()` sólo escribía los literales iniciales `0x1010` en Master Volume (offset NAM `0x02`) y PCM Out Volume (offset NAM `0x18`). Los dos bytes contienen 5 bits de atenuación por canal; sin un estado lógico común, cada cambio posterior habría tenido que duplicar la selección HDA/AC'97 y podía desincronizar ambos registros.
+  - `consola_imprimir_dec()` recibe un `uint64_t`. Convertir directamente un volumen negativo, por ejemplo -14 dB, a ese tipo habría impreso `18446744073709551602` en vez de `-14`, ocultando el nivel efectivo y haciendo imposible verificar el límite inferior desde `volumen estado`.
+  - Un parser decimal ingenuo puede envolver `int` al aceptar una secuencia arbitrariamente larga de dígitos. Dado que el buffer de terminal admite texto no confiable y que el ajuste es relativo, el parser debe rechazar magnitudes anómalas antes de la multiplicación decimal, sin dejar que el cálculo `g_volumen_db + delta_db` dependa de un valor envuelto.
+
+* **Soluciones de Ingeniería Implementadas:**
+  - `terminal.c` incorpora `parsear_db()`: acepta signo opcional, una secuencia decimal y el sufijo exacto `db`, permite espacios finales y rechaza argumentos incompletos, texto adicional o magnitudes anómalas. El despachador normaliza el signo por acción: `subir -10db` equivale a +10 dB y `bajar +10db` equivale a -10 dB, evitando que el verbo y el signo se contradigan.
+  - La rama `volumen` invoca `audio_ajustar_volumen_db(delta_db)` y expone `volumen estado`. `imprimir_db()` emite el signo menos por separado y sólo convierte el valor absoluto a `uint64_t`, preservando una representación visible correcta para todos los niveles admitidos. La sintaxis se publica además en el menú `ayuda`.
+  - `audio_ac97.c` mantiene `g_volumen_db` y `g_silenciado`, delega a `audio_hda_*` cuando `g_usar_hda=1` y, para AC'97, convierte dB negativos a pasos de 1,5 dB mediante `((-db) * 2 + 1) / 3`. Replica el resultado de 5 bits en los canales izquierdo/derecho y preserva el bit de mute `0x8000`. Las funciones unificadas `audio_obtener_volumen_db()`, `audio_fijar_volumen_db()` y `audio_ajustar_volumen_db()` mantienen una única semántica para la terminal.
+
+* **Pruebas y Verificación Forense (Datos Duros):**
+  - Se ejecutó `wsl.exe bash -lc 'cd /mnt/c/Users/Pat/AndroidStudioProjects/taek-os && make'` el 2026-09-27. Clang recompiló `nucleo/controladores/terminal.c`, LLD enlazó `build/nucleo.elf` con código de salida 0 y la receta generó `build/taek-os.img`, `build/taek-os.iso` y la copia fechada `build/taek-os-2026-09-27_21-52-34.iso`.
+  - La revisión estática confirmó que los tres puntos de terminal están conectados: parser en `terminal.c:253`, despacho en `terminal.c:3460` y llamada a `audio_ajustar_volumen_db()` en `terminal.c:3476`; la ruta AC'97 se limita antes de programar NAM en `audio_ac97.c:316-329`. La compilación no produjo diagnósticos de esta modificación.
+  - No se ejecutó QEMU, no se abrió ni escribió un disco físico y no se capturó audio. En consecuencia no existen muestras PCM, ventanas de 100 ms, eventos BCIS/LPIB/DPIB, mediciones de amplitud ni confirmación de que el códec físico recibió los verbos/valores nuevos. El enlace correcto no se presenta como prueba acústica.
+
+* **Archivos Modificados y Límites Conocidos:**
+  - `nucleo/controladores/terminal.c`: parser, salida con signo, comando `volumen` y documentación de ayuda.
+  - `nucleo/controladores/audio_ac97.c`: estado y API unificada de volumen, conversión AC'97 y preservación de silencio. La cabecera existente `nucleo/controladores/audio_ac97.h` ya expone dicha API al consumidor de terminal.
+  - `BITACORA.md`: este Hito 73. Se preservaron los cambios ajenos presentes en el árbol de trabajo; no se hizo commit ni push.
+  - Pendiente de validación en perfiles físicos: ejecutar `volumen estado`, `volumen subir +10db` y `volumen bajar -10db` durante PCM continuo, registrar el nivel informado, lecturas/verbos de códec y una captura de salida. El límite lógico no garantiza calibración acústica absoluta: cada códec HDA puede declarar distinto número, paso y offset de ganancia, y la conversión AC'97 aproxima 1,5 dB por paso.
+
+---
+
+### Hito 74 - Visor VFS de JPEG/PNG con Permanencia Acotada y Cancelación Ctrl+C (2026-09-27)
+
+* **Objetivo y Contexto:**
+  - Extender `abrir <archivo>` y `leer <archivo>` para que las extensiones `.jpg`, `.jpeg` y `.png`, ya catalogadas por VFS, se decodifiquen y presenten en el framebuffer GOP en vez de terminar en un aviso de formato identificado sin visor.
+  - La imagen debe conservarse visible 20.000 ms, con salida anticipada sólo por Ctrl+C, ESC o pérdida del volumen. Se mantiene el mismo comportamiento temporal para BMP y se evita que una pulsación ordinaria cierre accidentalmente una imagen recién abierta.
+  - El presupuesto de la ruta es deliberadamente acotado: archivo de entrada <=32 MiB, dimensiones <=8192 por eje, <=16.777.216 píxeles y asignaciones del decodificador <=128 MiB. Esto protege heap Ring 0 frente a cabeceras maliciosas o imágenes comprimidas que se expanden de forma desproporcionada.
+
+* **Causas Raíz Identificadas e Inspección Forense de Código:**
+  - `vfs_detectar_tipo_archivo()` ya clasificaba `jpg/jpeg` como `VFS_TIPO_IMAGEN_JPEG` y `png` como `VFS_TIPO_IMAGEN_PNG`, pero el despachador de `ejecutar_comando_abrir()` no tenía antes un decodificador asociado. BMP disponía de un recorrido de píxeles BI_RGB de 24/32 bpp; JPEG y PNG no pueden reutilizarlo porque sus datos están DCT/Huffman y Deflate/filtrados respectivamente.
+  - Cargar el archivo completo como BMP no resuelve el problema ni es seguro para medios USB: una lectura de VFS puede terminar con error de dispositivo, una cabecera puede anunciar dimensiones imposibles y los chunks PNG pueden estar truncados. El acceso debe conservar el descriptor VFS, validar el tamaño real y propagar el estado de cancelación/error antes de entregar bytes al decodificador.
+  - La espera del visor BMP comprobaba `c != 0`; por ello cualquier tecla, incluso una tecla residual no destinada a cancelar, cerraba la imagen. El teclado traduce Ctrl+C a carácter ASCII 3 en `teclado_leer_caracter()`/xHCI y ESC a 27, que son las dos señales inequívocas adecuadas para este bucle de 20 ms.
+
+* **Soluciones de Ingeniería Implementadas:**
+  - Se añadió `nucleo/controladores/multimedia/imagen/imagen.c/.h`, que integra `stb_image` en configuración freestanding: `STBI_NO_STDIO`, `STBI_NO_STD_HEADERS`, sin SIMD, sin HDR/linear y limitado exclusivamente a JPEG y PNG. Sus asignadores `STBI_MALLOC`, `STBI_REALLOC` y `STBI_FREE` se enlazan con `asignar_memoria`/`reasignar_memoria`/`liberar_memoria` mediante una cabecera de tamaño, contabilizando el presupuesto y el pico de memoria.
+  - `imagen_decodificar_vfs()` entrega a `stbi_info_from_callbacks()` y `stbi_load_from_callbacks()` callbacks de `vfs_leer`, `vfs_buscar`, `vfs_posicion_fd` y `vfs_tamano_fd`; no se usa libc ni una copia completa adicional del archivo. PNG valida firma, estructura y CRC de cada chunk con lectura posicional en ventanas de 4096 B antes de decodificar. JPEG exige SOI `FF D8` y EOI `FF D9` dentro del tamaño del descriptor.
+  - `visor_imagen_rgb_vfs()` escala RGB opaco proporcionalmente al framebuffer, muestra el resultado y sondea xHCI/audio cada 20 ms. La condición temprana es ahora `tecla==3 || tecla==27 || !vfs_esta_montado()`. La espera de BMP se ajustó al mismo contrato Ctrl+C/ESC. El menú y comentario de `leer` documentan JPEG/PNG.
+
+* **Pruebas y Verificación Forense (Datos Duros):**
+  - Se ejecutó `make all` en WSL el 2026-09-27. Clang compiló `nucleo/controladores/multimedia/imagen/imagen.c` y `terminal.c`; LLD enlazó `build/nucleo.elf` con código 0. La receta produjo `build/taek-os.img`, actualizó `build/taek-os.iso` (68.581.376 bytes, 22:13:58) y creó `build/taek-os-2026-09-27_22-13-58.iso` (68.581.376 bytes, 22:13:59).
+  - La comprobación focal `git diff --check -- BITACORA.md nucleo/controladores/terminal.c nucleo/controladores/multimedia/imagen/imagen.c nucleo/controladores/multimedia/imagen/imagen.h` terminó con código 0. El chequeo global aún informa espacios finales preexistentes en fuentes ajenas AAC/H.264 y no se usa como evidencia del visor. La revisión estática confirma: configuración JPEG/PNG en `imagen.c:26-27`, validación PNG en `imagen.c:38`, entrada VFS en `imagen.c:53`, ruta de visor en `terminal.c:2122` y comprobación Ctrl+C/ESC en `terminal.c:2131`.
+  - No se ejecutó QEMU ni hardware físico con un JPEG/PNG de USB en esta entrega. No hay captura del framebuffer, telemetría de MSC ni medida de 20.000 ms en un teclado físico; el enlace no sustituye esta validación funcional.
+
+* **Archivos Modificados y Límites Conocidos:**
+  - `nucleo/controladores/multimedia/imagen/imagen.c`, `imagen.h` y `stb_image.h`: decodificación y dependencias JPEG/PNG freestanding; `Makefile` descubre este subdirectorio como fuente multimedia.
+  - `nucleo/controladores/terminal.c`: apertura de imágenes JPEG/PNG, escalado, ventana de 20 segundos, cancelación Ctrl+C/ESC y ayuda. `BITACORA.md`: este Hito 74.
+  - Se preservan BMP 24/32 bpp BI_RGB y los límites existentes. Quedan pendientes pruebas de JPEG baseline/progressive, PNG con transparencia/paleta/interlace, archivo corrupto y desconexión USB durante decode en QEMU y en los perfiles físicos. No se afirma soporte de otros formatos ni éxito visual hasta capturar esas pruebas.
