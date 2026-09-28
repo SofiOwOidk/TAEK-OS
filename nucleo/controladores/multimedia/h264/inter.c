@@ -1,4 +1,23 @@
 #include "decodificador.h"
+#include "inter_kernels.h"
+
+#ifndef H264_PERFIL_INTER
+#define H264_PERFIL_INTER 0
+#endif
+#if H264_PERFIL_INTER
+static uint64_t reloj_inter(void) {
+    uint32_t lo,hi;
+    __asm__ volatile("lfence; rdtsc; lfence" : "=a"(lo), "=d"(hi) : : "memory");
+    return ((uint64_t)hi<<32)|lo;
+}
+static void medir_inter(h264_telemetria *t,int etapa,uint64_t inicio,int pixeles) {
+    if(t) {
+        t->ciclos_inter_etapa[etapa]+=reloj_inter()-inicio;
+        t->bloques_inter_etapa[etapa]++;
+        t->pixeles_inter_etapa[etapa]+=(unsigned)pixeles;
+    }
+}
+#endif
 
 static unsigned bin(h264_decodificador *d,unsigned ctx) { return h264_cabac_bin(&d->cabac,ctx); }
 static int wrap(h264_decodificador *d,h264_foto *f) {
@@ -65,7 +84,7 @@ static movimiento vecino_mv(h264_decodificador *d,int x,int y,int l) {
     movimiento r={-2,0,0};
     if (!m) return r;
     int i=y*4+x;
-    if (m==&d->actual->mb[d->mb_actual] && !(m->movimiento_listo[l]&(1u<<i))) return r;
+    if (m==h264_mb_actual(d) && !(m->movimiento_listo[l]&(1u<<i))) return r;
     r.ref=m->ref[l][i];r.x=m->mv[l][i][0];r.y=m->mv[l][i][1];
     return r;
 }
@@ -127,7 +146,7 @@ static int leer_mvd(h264_decodificador *d,int x,int y,int l,int eje) {
 }
 
 static void guardar_mv(h264_decodificador *d,int x,int y,int w,int h,int l,int ref,int vx,int vy,int dx,int dy) {
-    h264_mb *m=&d->actual->mb[d->mb_actual];
+    h264_mb *m=h264_mb_actual(d);
     int foto=ref<0?-1:(int)(d->sl.lista[l][ref]-d->fotos);
     for (int j=y;j<y+h;j++) for (int i=x;i<x+w;i++) {
         int k=j*4+i;
@@ -177,8 +196,233 @@ static int interpolar(const h264_foto *f,int plano,int xx,int yy) {
     return (medio_h(f,x,y+(dy==3))+medio_v(f,x+(dx==3),y)+1)>>1;
 }
 
-static int compensar(h264_decodificador *d) {
-    h264_mb *m=&d->actual->mb[d->mb_actual];h264_foto *f=d->actual;
+/* Descriptor inmutable durante una compensación: los valores dependientes del
+ * bloque se calculan una vez, fuera de los recorridos de píxeles. */
+typedef struct {
+    const h264_foto *foto;
+    const uint8_t *plano;
+    int ancho,alto,paso,base_x,base_y,mvx,mvy,den,dx,dy;
+    unsigned componente;
+    h264_telemetria *medicion;
+    int sse2;
+} pred_bloque;
+
+static void preparar_pred(const h264_foto *f,int plano,int x,int y,int mvx,int mvy,pred_bloque *p) {
+    p->foto=f;p->medicion=NULL;p->sse2=0;p->componente=(unsigned)plano;p->ancho=(int)f->w/(plano?2:1);
+    p->alto=(int)f->h/(plano?2:1);p->paso=p->ancho;
+    size_t base=plano?(size_t)f->w*f->h*(3+plano)/4:0;
+    p->plano=f->pixeles+base;p->den=plano?8:4;p->mvx=mvx;p->mvy=mvy;
+    int xx=x*p->den+mvx,yy=y*p->den+mvy;
+    p->base_x=xx>> (plano?3:2);p->base_y=yy>>(plano?3:2);
+    p->dx=xx&(p->den-1);p->dy=yy&(p->den-1);
+}
+
+static int filtro_h(const uint8_t *q) {
+    return (int)q[-2]-5*(int)q[-1]+20*(int)q[0]+20*(int)q[1]-5*(int)q[2]+q[3];
+}
+static int filtro_v(const uint8_t *q,int paso) {
+    return (int)q[-2*paso]-5*(int)q[-paso]+20*(int)q[0]+20*(int)q[paso]-5*(int)q[2*paso]+q[3*paso];
+}
+
+/* Kernel escalar: origen apunta al píxel entero del bloque; luma <=16x16,
+ * croma <=8x8, sin alineación exigida. Márgenes: luma -2/+3 si hay filtro
+ * en ese eje; croma +1 sólo en ejes fraccionarios. salida es del llamador.
+ * Intermedios con signo de 32 bits: no recortar antes del filtro diagonal. */
+static void pred_kernel(const uint8_t *src,int paso,int w,int h,int dx,int dy,
+                        int croma,uint8_t *salida) {
+    if (!dx&&!dy) {
+        for (int j=0;j<h;j++) h264_copiar(salida+j*w,src+j*paso,(size_t)w);
+        return;
+    }
+    if (croma) {
+            for (int j=0;j<h;j++) for (int i=0;i<w;i++) {
+                const uint8_t *q=src+j*paso+i;
+                int a=q[0],b=dx?q[1]:a,c=dy?q[paso]:a;
+                int d=dx&&dy?q[paso+1]:a;
+                salida[j*w+i]=(uint8_t)(((8-dx)*(8-dy)*a+dx*(8-dy)*b+(8-dx)*dy*c+dx*dy*d+32)>>6);
+            }
+        return;
+    }
+    if (!dy) {
+        for (int j=0;j<h;j++) for (int i=0;i<w;i++) {
+            const uint8_t *q=src+j*paso+i;
+            int medio=h264_recortar((filtro_h(q)+16)>>5,0,255);
+            salida[j*w+i]=(uint8_t)(dx==2?medio:(medio+q[dx==3]+1)>>1);
+        }
+        return;
+    }
+    if (!dx) {
+        for (int j=0;j<h;j++) for (int i=0;i<w;i++) {
+            const uint8_t *q=src+j*paso+i;
+            int medio=h264_recortar((filtro_v(q,paso)+16)>>5,0,255);
+            salida[j*w+i]=(uint8_t)(dy==2?medio:(medio+q[dy==3?paso:0]+1)>>1);
+        }
+        return;
+    }
+    /* Interpolación diagonal: una fila horizontal intermedia se calcula una
+     * sola vez para cada coordenada usada por todo el bloque. */
+    int32_t horizontal[21][16];
+    if (dx==2 || dy==2) {
+        int filas=h+5;
+        for (int j=0;j<filas;j++) for (int i=0;i<w;i++) {
+            const uint8_t *q=src+(j-2)*paso+i;
+            horizontal[j][i]=filtro_h(q);
+        }
+    }
+    for (int j=0;j<h;j++) for (int i=0;i<w;i++) {
+        const uint8_t *q=src+j*paso+i;
+        int valor;
+            if(dx==2||dy==2) {
+                int diag=horizontal[j][i]-5*horizontal[j+1][i]+20*horizontal[j+2][i]+
+                         20*horizontal[j+3][i]-5*horizontal[j+4][i]+horizontal[j+5][i];
+                diag=h264_recortar((diag+512)>>10,0,255);
+                if (dx==2&&dy==2) valor=diag;
+                else if (dx==2) {
+                    int medio=h264_recortar((horizontal[j+2+(dy==3)][i]+16)>>5,0,255);
+                    valor=(diag+medio+1)>>1;
+                } else {
+                    const uint8_t *c=q+(dx==3);
+                    int medio=h264_recortar((filtro_v(c,paso)+16)>>5,0,255);
+                    valor=(diag+medio+1)>>1;
+                }
+            } else {
+                const uint8_t *r=q+(dy==3?paso:0),*c=q+(dx==3);
+                int vh=filtro_v(c,paso),hh=filtro_h(r);
+                valor=(h264_recortar((hh+16)>>5,0,255)+h264_recortar((vh+16)>>5,0,255)+1)>>1;
+            }
+        salida[j*w+i]=(uint8_t)valor;
+    }
+}
+
+static int pred_necesita_borde(const pred_bloque *p,int w,int h) {
+    int izq=p->componente||!p->dx?0:2,arr=p->componente||!p->dy?0:2;
+    int der=!p->dx?0:p->componente?1:3,abajo=!p->dy?0:p->componente?1:3;
+    return p->base_x-izq<0||p->base_y-arr<0||
+           p->base_x+w-1+der>=p->ancho||p->base_y+h-1+abajo>=p->alto;
+}
+
+static int pred_inter_bloque(const pred_bloque *p,int w,int h,uint8_t *salida) {
+    if (w<1||h<1||w>(p->componente?8:16)||h>(p->componente?8:16)) return 0;
+#if H264_PERFIL_INTER
+    int etapa=p->componente?H264_INTER_CROMA:!p->dx&&!p->dy?H264_INTER_ENTERO:
+              !p->dy?H264_INTER_HORIZONTAL:!p->dx?H264_INTER_VERTICAL:H264_INTER_DIAGONAL;
+    uint64_t inicio;
+#endif
+    if (!pred_necesita_borde(p,w,h)) {
+#if H264_PERFIL_INTER
+        inicio=reloj_inter();
+#endif
+        const uint8_t *src=p->plano+(size_t)p->base_y*p->paso+p->base_x;
+        if(!p->sse2||!h264_pred_sse2(src,p->paso,w,h,p->dx,p->dy,p->componente!=0,salida))
+            pred_kernel(src,p->paso,w,h,p->dx,p->dy,p->componente!=0,salida);
+    } else {
+        /* Extensión acotada en stack: como máximo 21x21 bytes. Cada clamp se
+         * resuelve una vez por muestra fuente, fuera del filtro interior. */
+        uint8_t extendido[21*21];
+#if H264_PERFIL_INTER
+        uint64_t borde_inicio=reloj_inter();
+#endif
+        int izq=p->componente||!p->dx?0:2,arr=p->componente||!p->dy?0:2;
+        int der=!p->dx?0:p->componente?1:3,abajo=!p->dy?0:p->componente?1:3;
+        int ew=w+izq+der,eh=h+arr+abajo;
+        for (int j=0;j<eh;j++) {
+            int y=h264_recortar(p->base_y+j-arr,0,p->alto-1);
+            for (int i=0;i<ew;i++) {
+                int x=h264_recortar(p->base_x+i-izq,0,p->ancho-1);
+                extendido[j*ew+i]=p->plano[(size_t)y*p->paso+x];
+            }
+        }
+#if H264_PERFIL_INTER
+        medir_inter(p->medicion,H264_INTER_BORDES,borde_inicio,ew*eh);
+        inicio=reloj_inter();
+#endif
+        const uint8_t *src=extendido+arr*ew+izq;
+        if(!p->sse2||!h264_pred_sse2(src,ew,w,h,p->dx,p->dy,p->componente!=0,salida))
+            pred_kernel(src,ew,w,h,p->dx,p->dy,p->componente!=0,salida);
+    }
+#if H264_PERFIL_INTER
+    medir_inter(p->medicion,etapa,inicio,w*h);
+#endif
+    return 1;
+}
+
+/* El modo de combinación se despacha una vez por bloque. El destino avanza
+ * por filas; no se divide ni calcula módulo por cada píxel. */
+static void combinar_bloque(uint8_t *dst,int paso,int w,int h,const uint8_t *a,
+                            const uint8_t *b,int modo,int peso0,int peso1,int den,int offset) {
+#define COMBINAR(expr) do { \
+    for (int y=0;y<h;y++) { \
+        for (int x=0;x<w;x++) dst[x]=(uint8_t)h264_recortar((expr),0,255); \
+        dst+=paso;a+=w;b+=w; \
+    } \
+} while (0)
+    switch (modo) {
+        case 0: for(int y=0;y<h;y++) {h264_copiar(dst,a,(size_t)w);dst+=paso;a+=w;} break;
+        case 1: COMBINAR((a[x]+b[x]+1)>>1);break;
+        case 2: {int redondeo=den?1<<(den-1):0;COMBINAR(((peso0*a[x]+redondeo)>>den)+offset);break;}
+        case 3: {int redondeo=1<<den;COMBINAR(((peso0*a[x]+peso1*b[x]+redondeo)>>(den+1))+offset);break;}
+        case 4: COMBINAR(((64-peso1)*a[x]+peso1*b[x]+32)>>6);break;
+    }
+#undef COMBINAR
+}
+
+static int __attribute__((unused)) compensar_bloques(h264_decodificador *d) {
+    h264_mb *m=h264_mb_actual(d);h264_foto *f=d->actual;
+    uint16_t cubiertos=0;unsigned mx=d->mb_actual%d->s->ancho_mb,my=d->mb_actual/d->s->ancho_mb;
+    for (int semilla=0;semilla<16;semilla++) {
+        if (cubiertos&(1u<<semilla)) continue;
+        int r0=m->ref[0][semilla],r1=m->ref[1][semilla];
+        if (r0<0&&r1<0) return 0;
+        int tx=semilla%4,ty=semilla/4,tw=1,th=1;
+        while (tx+tw<4) { int k=ty*4+tx+tw;if(cubiertos&(1u<<k))break;
+            if (m->ref[0][k]!=r0||m->ref[1][k]!=r1||m->mv[0][k][0]!=m->mv[0][semilla][0]||m->mv[0][k][1]!=m->mv[0][semilla][1]||m->mv[1][k][0]!=m->mv[1][semilla][0]||m->mv[1][k][1]!=m->mv[1][semilla][1]) break;tw++; }
+        while (ty+th<4) { int bien=1;for(int xx=0;xx<tw;xx++){int k=(ty+th)*4+tx+xx;
+            if((cubiertos&(1u<<k))||m->ref[0][k]!=r0||m->ref[1][k]!=r1||m->mv[0][k][0]!=m->mv[0][semilla][0]||m->mv[0][k][1]!=m->mv[0][semilla][1]||m->mv[1][k][0]!=m->mv[1][semilla][0]||m->mv[1][k][1]!=m->mv[1][semilla][1])bien=0;}if(!bien)break;th++; }
+        for(int yy=0;yy<th;yy++)for(int xx=0;xx<tw;xx++)cubiertos|=(uint16_t)(1u<<((ty+yy)*4+tx+xx));
+        for (int p=0;p<3;p++) {
+            int factor=p?2:4,w=(int)f->w/(p?2:1),x=(int)mx*16+tx*4,y=(int)my*16+ty*4;
+            int ox=p?x/2:x,oy=p?y/2:y,bw=tw*factor,bh=th*factor;
+            size_t base=p?(size_t)f->w*f->h*(3+p)/4:0;uint8_t pred[2][256];
+            int refs[2]={r0,r1};
+            for(int l=0;l<2;l++)if(refs[l]>=0){
+                h264_foto *ref=d->sl.lista[l][(unsigned)refs[l]];pred_bloque pb;
+                preparar_pred(ref,p,ox,oy,m->mv[l][semilla][0],m->mv[l][semilla][1],&pb);
+                pb.medicion=&d->telemetria;
+                pb.sse2=d->inter_sse2;
+                if(!pred_inter_bloque(&pb,bw,bh,pred[l]))
+                    for(int yy=0;yy<bh;yy++)for(int xx=0;xx<bw;xx++)pred[l][yy*bw+xx]=(uint8_t)interpolar(ref,p,(ox+xx)*(p?8:4)+m->mv[l][semilla][0],(oy+yy)*(p?8:4)+m->mv[l][semilla][1]);
+            }
+            int den=d->sl.denom[p],ponderar=(d->p->ponderado&&d->sl.tipo==0)||(d->p->bipred==1&&d->sl.tipo==1);
+            int peso0=0,peso1=0,offset=0,impl=0;
+            if(ponderar){
+                if(r0>=0&&r1>=0){peso0=d->sl.peso[0][r0][p];peso1=d->sl.peso[1][r1][p];offset=(d->sl.offset[0][r0][p]+d->sl.offset[1][r1][p]+1)>>1;}
+                else {int l=r0<0,r=l?r1:r0;peso0=d->sl.peso[l][r][p];offset=d->sl.offset[l][r][p];}
+            } else if(r0>=0&&r1>=0&&d->sl.tipo==1&&d->p->bipred==2){
+                h264_foto *a=d->sl.lista[0][r0],*b=d->sl.lista[1][r1];int td=h264_recortar(b->poc-a->poc,-128,127),tb=h264_recortar(f->poc-a->poc,-128,127),w1=32;
+                if(td&&a->larga<0&&b->larga<0){int t=(16384+h264_abs(td/2))/td,ds=h264_recortar((tb*t+32)>>6,-1024,1023);if((ds>>2)>=-64&&(ds>>2)<=128)w1=ds>>2;}impl=w1;
+            }
+            int doble=r0>=0&&r1>=0,modo=doble?1:0;
+            if(ponderar)modo=doble?3:2;
+            else if(doble&&d->sl.tipo==1&&d->p->bipred==2){modo=4;peso1=impl;}
+#if H264_PERFIL_INTER
+            uint64_t mezcla_inicio=reloj_inter();
+#endif
+            uint8_t *dst=f->pixeles+base+(size_t)oy*w+ox;
+            if(!d->inter_sse2||!h264_combinar_sse2(dst,w,bw,bh,pred[r0<0?1:0],pred[1],modo,peso0,peso1,den,offset))
+                combinar_bloque(dst,w,bw,bh,pred[r0<0?1:0],pred[1],modo,peso0,peso1,den,offset);
+#if H264_PERFIL_INTER
+            medir_inter(&d->telemetria,modo>=2?H264_INTER_PONDERADA:
+                        doble?H264_INTER_DOBLE:H264_INTER_SIMPLE,mezcla_inicio,bw*bh);
+#endif
+        }
+    }
+    return 1;
+}
+
+/* Oráculo escalar compilable con -DH264_INTER_ESCALAR para contrastar la ruta
+ * por bloques con el comportamiento previo, sin cambiar el flujo CABAC. */
+static int __attribute__((unused)) compensar_escalar(h264_decodificador *d) {
+    h264_mb *m=h264_mb_actual(d);h264_foto *f=d->actual;
     for (int k=0;k<16;k++) {
         int r0=m->ref[0][k],r1=m->ref[1][k];
         if (r0<0&&r1<0) return 0;
@@ -198,18 +442,11 @@ static int compensar(h264_decodificador *d) {
                     int den=d->sl.denom[p];
                     if (r0>=0&&r1>=0) valor=((d->sl.peso[0][r0][p]*v[0]+d->sl.peso[1][r1][p]*v[1]+(1<<den))>>(den+1))+
                          ((d->sl.offset[0][r0][p]+d->sl.offset[1][r1][p]+1)>>1);
-                    else {
-                        int l=r0<0,r=l?r1:r0;
-                        valor=((d->sl.peso[l][r][p]*v[l]+(den?(1<<(den-1)):0))>>den)+d->sl.offset[l][r][p];
-                    }
+                    else { int l=r0<0,r=l?r1:r0;valor=((d->sl.peso[l][r][p]*v[l]+(den?(1<<(den-1)):0))>>den)+d->sl.offset[l][r][p]; }
                 } else if (r0>=0&&r1>=0&&d->sl.tipo==1&&d->p->bipred==2) {
                     h264_foto *a=d->sl.lista[0][r0],*b=d->sl.lista[1][r1];
                     int td=h264_recortar(b->poc-a->poc,-128,127),tb=h264_recortar(f->poc-a->poc,-128,127),w1=32;
-                    if (td && a->larga<0&&b->larga<0) {
-                        int tx=(16384+h264_abs(td/2))/td;
-                        int ds=h264_recortar((tb*tx+32)>>6,-1024,1023);
-                        if ((ds>>2)>=-64&&(ds>>2)<=128) w1=ds>>2;
-                    }
+                    if (td&&a->larga<0&&b->larga<0) { int tx=(16384+h264_abs(td/2))/td,ds=h264_recortar((tb*tx+32)>>6,-1024,1023);if((ds>>2)>=-64&&(ds>>2)<=128)w1=ds>>2; }
                     valor=((64-w1)*v[0]+w1*v[1]+32)>>6;
                 }
                 f->pixeles[base+(size_t)(y+by)*w+x+bx]=(uint8_t)h264_recortar(valor,0,255);
@@ -219,10 +456,18 @@ static int compensar(h264_decodificador *d) {
     return 1;
 }
 
+int h264_compensar(h264_decodificador *d) {
+#ifdef H264_INTER_ESCALAR
+    return compensar_escalar(d);
+#else
+    return compensar_bloques(d);
+#endif
+}
+
 static int directo(h264_decodificador *d,int gx,int gy,int gw,int gh) {
     if (!d->sl.lista[1][0] || !d->sl.lista[0][0]) return 0;
     h264_foto *col=d->sl.lista[1][0];
-    h264_mb *cm=&col->mb[d->mb_actual],*m=&d->actual->mb[d->mb_actual];
+    h264_mb *cm=&col->mb[d->mb_actual],*m=h264_mb_actual(d);
     int refs[2]={-1,-1},cero=0;movimiento pred[2];
     if (d->sl.directo_espacial) {
         for (int l=0;l<2;l++) {
@@ -285,7 +530,7 @@ static int sub_tipo(h264_decodificador *d) {
 }
 
 int h264_inter(h264_decodificador *d,unsigned tipo,int salto) {
-    h264_mb *m=&d->actual->mb[d->mb_actual];
+    h264_mb *m=h264_mb_actual(d);
     m->salto=(uint8_t)salto;m->directo=d->sl.tipo==1 && (salto||tipo==0);
     int permite8=1;
     if (salto && d->sl.tipo==0) {
@@ -357,7 +602,7 @@ int h264_inter(h264_decodificador *d,unsigned tipo,int salto) {
             }
         }
     }
-    if (d->bits.error || !compensar(d)) return 0;
+    if (d->bits.error || (!d->separar && !h264_compensar(d))) return 0;
     if (!salto) {
         m->cbp=(uint8_t)h264_leer_cbp(d);
         if ((m->cbp&15)&&d->p->transformada8&&permite8) {

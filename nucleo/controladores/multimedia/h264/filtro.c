@@ -1,4 +1,5 @@
 #include "decodificador.h"
+#include "etapas_sse2.h"
 
 /* Tablas 8-16/17 de ITU-T H.264, profundidad de ocho bits. */
 static const uint8_t alfa[52]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,4,5,6,7,8,9,10,12,13,15,17,20,22,25,28,32,36,40,45,50,56,63,71,80,90,101,113,127,144,162,182,203,226,255,255};
@@ -80,7 +81,8 @@ void h264_desbloquear(h264_decodificador *d) {
                     if (plano) qpc=(h264_qp_croma(p->qp,d->p->qp_c[plano-1])+h264_qp_croma(q->qp,d->p->qp_c[plano-1])+1)/2;
                     int ia=h264_recortar(qpc+q->alfa,0,51),ib=h264_recortar(qpc+q->beta,0,51);
                     uint8_t *dst=f->pixeles+base+(size_t)y*paso+x;
-                    for (int t=0;t<n;t++) filtrar(dst+t*(horizontal?1:paso),horizontal?paso:1,fuerza,ia,ib,plano!=0);
+                    if(d->inter_sse2 && (d->etapas_sse2&1))h264_filtro_sse2(dst,horizontal?paso:1,horizontal?1:paso,n,fuerza,alfa[ia],beta[ib],fuerza<4?tc[fuerza-1][ia]:0);
+                    else for (int t=0;t<n;t++) filtrar(dst+t*(horizontal?1:paso),horizontal?paso:1,fuerza,ia,ib,plano!=0);
                 }
             }
         }

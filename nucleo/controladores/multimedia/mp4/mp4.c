@@ -158,6 +158,15 @@ static mp4_resultado pista_video(mp4_contenedor *m, vista trak) {
         if (cuenta != m->v_muestras) return MP4_DATOS_INVALIDOS;
     }
 
+    m->v_duracion_ticks = 0;
+    for (uint32_t i = 0; i < be32(m->v_stts + 4); i++) {
+        uint64_t n = be32(m->v_stts + 8 + (size_t)i * 8);
+        uint64_t delta = be32(m->v_stts + 12 + (size_t)i * 8);
+        if (delta && n > (UINT64_MAX - m->v_duracion_ticks) / delta) return MP4_LIMITE_EXCEDIDO;
+        m->v_duracion_ticks += n * delta;
+    }
+    if (!m->v_duracion_ticks) return MP4_DATOS_INVALIDOS;
+
     m->tiene_video = 1;
     return MP4_OK;
 }
@@ -235,15 +244,8 @@ static mp4_resultado pista_audio(mp4_contenedor *m, vista trak) {
     return MP4_OK;
 }
 
-mp4_resultado mp4_abrir(mp4_contenedor *m, const void *datos, size_t bytes) {
-    if (!m || !datos || bytes < 8) return MP4_DATOS_INVALIDOS;
-    mp4_cero(m, sizeof(*m));
-    m->archivo = (const uint8_t *)datos;
-    m->bytes = bytes;
-
-    vista todo = { (const uint8_t *)datos, bytes }, moov, trak;
-    if (buscar(todo, TIPO('m','o','o','v'), &moov) != 1) return MP4_DATOS_INVALIDOS;
-
+static mp4_resultado mp4_parsear_moov(mp4_contenedor *m, vista moov) {
+    vista trak;
     uint32_t tipo;
     int r;
     while ((r = caja(&moov, &tipo, &trak)) > 0) {
@@ -262,6 +264,80 @@ mp4_resultado mp4_abrir(mp4_contenedor *m, const void *datos, size_t bytes) {
     return MP4_OK;
 }
 
+mp4_resultado mp4_abrir(mp4_contenedor *m, const void *datos, size_t bytes) {
+    if (!m || !datos || bytes < 8) return MP4_DATOS_INVALIDOS;
+    mp4_cero(m, sizeof(*m));
+    m->archivo = (const uint8_t *)datos;
+    m->bytes = bytes;
+    vista moov;
+    if (buscar((vista){(const uint8_t *)datos, bytes}, TIPO('m','o','o','v'), &moov) != 1)
+        return MP4_DATOS_INVALIDOS;
+    return mp4_parsear_moov(m, moov);
+}
+
+mp4_resultado mp4_abrir_fuente(mp4_contenedor *m, uint64_t bytes,
+                               mp4_lectura_posicional leer, void *contexto,
+                               uint8_t *metadatos, size_t metadatos_capacidad,
+                               uint8_t *muestra_video, size_t muestra_video_capacidad,
+                               uint8_t *muestra_audio, size_t muestra_audio_capacidad) {
+    if (!m || !leer || !metadatos || metadatos_capacidad < 8 || bytes < 8 ||
+        !muestra_video || !muestra_video_capacidad || !muestra_audio || !muestra_audio_capacidad)
+        return MP4_DATOS_INVALIDOS;
+    mp4_cero(m, sizeof(*m));
+    m->bytes = bytes;
+    m->leer_fuente = leer;
+    m->fuente_contexto = contexto;
+    m->muestra_video_buffer = muestra_video;
+    m->muestra_video_capacidad = muestra_video_capacidad;
+    m->muestra_audio_buffer = muestra_audio;
+    m->muestra_audio_capacidad = muestra_audio_capacidad;
+
+    uint64_t offset = 0;
+    while (offset <= bytes - 8) {
+        uint8_t h[16];
+        if (leer(contexto, MP4_FUENTE_VIDEO, offset, h, 8) != 8) return MP4_DATOS_INVALIDOS;
+        uint64_t tam = be32(h);
+        uint32_t t = be32(h + 4);
+        size_t cabecera = 8;
+        if (tam == 1) {
+            if (bytes - offset < 16 || leer(contexto, MP4_FUENTE_VIDEO, offset, h, 16) != 16) return MP4_DATOS_INVALIDOS;
+            tam = be64(h + 8);
+            cabecera = 16;
+        } else if (tam == 0) {
+            tam = bytes - offset;
+        }
+        if (tam < cabecera || tam > bytes - offset) return MP4_DATOS_INVALIDOS;
+        if (t == TIPO('m','o','o','v')) {
+            if (tam > metadatos_capacidad || tam > SIZE_MAX) return MP4_LIMITE_EXCEDIDO;
+            if (leer(contexto, MP4_FUENTE_VIDEO, offset, metadatos, (size_t)tam) != (int64_t)tam)
+                return MP4_DATOS_INVALIDOS;
+            m->metadatos = metadatos;
+            m->metadatos_bytes = (size_t)tam;
+            vista resto = {metadatos, (size_t)tam}, contenido;
+            uint32_t tipo_moov;
+            if (caja(&resto, &tipo_moov, &contenido) != 1 || tipo_moov != TIPO('m','o','o','v'))
+                return MP4_DATOS_INVALIDOS;
+            return mp4_parsear_moov(m, contenido);
+        }
+        offset += tam;
+    }
+    return MP4_DATOS_INVALIDOS;
+}
+
+static int mp4_leer_muestra(mp4_contenedor *m, int pista, uint64_t offset, size_t tam,
+                            uint8_t *buffer, size_t capacidad, const uint8_t **datos) {
+    if (offset > m->bytes || (uint64_t)tam > m->bytes - offset) return MP4_DATOS_INVALIDOS;
+    if (m->leer_fuente) {
+        if (!buffer || tam > capacidad) return MP4_LIMITE_EXCEDIDO;
+        if (m->leer_fuente(m->fuente_contexto, pista, offset, buffer, tam) != (int64_t)tam)
+            return MP4_DATOS_INVALIDOS;
+        *datos = buffer;
+    } else {
+        *datos = m->archivo + (size_t)offset;
+    }
+    return 1;
+}
+
 int mp4_tiene_video(const mp4_contenedor *m) {
     return m ? m->tiene_video : 0;
 }
@@ -272,7 +348,7 @@ int mp4_tiene_audio(const mp4_contenedor *m) {
 
 int mp4_siguiente_video(mp4_contenedor *m, const uint8_t **datos, size_t *bytes,
                         int64_t *presentacion, uint32_t *duracion) {
-    if (!m || !m->archivo || !m->tiene_video || !datos || !bytes || !presentacion || !duracion)
+    if (!m || (!m->archivo && !m->leer_fuente) || !m->tiene_video || !datos || !bytes || !presentacion || !duracion)
         return MP4_DATOS_INVALIDOS;
     if (m->v_indice == m->v_muestras) return 0;
 
@@ -288,8 +364,7 @@ int mp4_siguiente_video(mp4_contenedor *m, const uint8_t **datos, size_t *bytes,
 
     uint32_t tam = be32(m->v_stsz + 4);
     if (!tam) tam = be32(m->v_stsz + 12 + (size_t)m->v_indice * 4);
-    if (!tam || m->v_offset_muestra > m->bytes || tam > m->bytes - m->v_offset_muestra)
-        return MP4_DATOS_INVALIDOS;
+    if (!tam) return MP4_DATOS_INVALIDOS;
 
     if (!m->v_restante_tiempo) {
         if (m->v_regla_tiempo >= be32(m->v_stts + 4)) return MP4_DATOS_INVALIDOS;
@@ -310,7 +385,9 @@ int mp4_siguiente_video(mp4_contenedor *m, const uint8_t **datos, size_t *bytes,
 
     if (m->v_tiempo_decodificacion > INT64_MAX - UINT32_MAX) return MP4_LIMITE_EXCEDIDO;
 
-    *datos = m->archivo + (size_t)m->v_offset_muestra;
+    int lectura = mp4_leer_muestra(m, MP4_FUENTE_VIDEO, m->v_offset_muestra, tam, m->muestra_video_buffer,
+                                   m->muestra_video_capacidad, datos);
+    if (lectura < 0) return lectura;
     *bytes = tam;
     *presentacion = (int64_t)m->v_tiempo_decodificacion + offset;
     *duracion = delta;
@@ -327,7 +404,7 @@ int mp4_siguiente_video(mp4_contenedor *m, const uint8_t **datos, size_t *bytes,
 }
 
 int mp4_siguiente_audio(mp4_contenedor *m, const uint8_t **datos, size_t *bytes, int64_t *tiempo) {
-    if (!m || !m->archivo || !m->tiene_audio || !datos || !bytes || !tiempo)
+    if (!m || (!m->archivo && !m->leer_fuente) || !m->tiene_audio || !datos || !bytes || !tiempo)
         return MP4_DATOS_INVALIDOS;
     if (m->a_indice == m->a_muestras) return 0;
 
@@ -343,8 +420,7 @@ int mp4_siguiente_audio(mp4_contenedor *m, const uint8_t **datos, size_t *bytes,
 
     uint32_t tam = be32(m->a_stsz + 4);
     if (!tam) tam = be32(m->a_stsz + 12 + (size_t)m->a_indice * 4);
-    if (!tam || m->a_offset_muestra > m->bytes || tam > m->bytes - m->a_offset_muestra)
-        return MP4_DATOS_INVALIDOS;
+    if (!tam) return MP4_DATOS_INVALIDOS;
 
     if (!m->a_restante_tiempo) {
         if (m->a_regla_tiempo >= be32(m->a_stts + 4)) return MP4_DATOS_INVALIDOS;
@@ -352,7 +428,9 @@ int mp4_siguiente_audio(mp4_contenedor *m, const uint8_t **datos, size_t *bytes,
     }
     uint32_t delta = be32(m->a_stts + 12 + (size_t)m->a_regla_tiempo * 8);
 
-    *datos = m->archivo + (size_t)m->a_offset_muestra;
+    int lectura = mp4_leer_muestra(m, MP4_FUENTE_AUDIO, m->a_offset_muestra, tam, m->muestra_audio_buffer,
+                                   m->muestra_audio_capacidad, datos);
+    if (lectura < 0) return lectura;
     *bytes = tam;
     *tiempo = (int64_t)m->a_tiempo;
 

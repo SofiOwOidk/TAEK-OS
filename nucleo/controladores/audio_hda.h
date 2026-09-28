@@ -54,13 +54,13 @@ struct estado_hda {
     enum hda_estado_reproductor estado_reproductor;
     enum hda_fuente_pos         fuente_pos_activa;
     uint32_t reproduccion_id;
-    uint32_t bytes_reproducidos;
+    uint64_t bytes_reproducidos;
     uint64_t bytes_dma_totales; // Contador monotónico de posición DMA observada
     uint64_t bytes_en_cola;     // Bytes de la fuente ya copiados al ring
     uint32_t eventos_bcis;     // Finalizaciones BDL observadas y reconocidas
     uint32_t errores_stream;   // FIFO/Descriptor errors observados
     uint32_t vaciados_audio;   // Underruns de búfer observados
-    uint32_t silencio_insertado_bytes; // Bytes de ceros insertados por falta de muestras
+    uint64_t silencio_insertado_bytes; // Bytes de ceros insertados por falta de muestras
     uint32_t pcm_aceptado_bytes;       // Total de bytes PCM aceptados en cola
     uint32_t pcm_rechazado_bytes;      // Bytes que no cupieron por backpressure
     uint32_t saltos_posicion_rechazados; // Saltos no coherentes filtrados
@@ -122,5 +122,12 @@ const struct estado_hda *audio_hda_obtener_estado(void);
 
 // Indica si el controlador Intel HDA fue detectado e inicializado exitosamente
 int  audio_hda_esta_operativo(void);
+
+// Control de volumen en hardware para códecs Intel HDA (en dB)
+int  audio_hda_obtener_volumen_db(void);
+int  audio_hda_fijar_volumen_db(int db);
+int  audio_hda_ajustar_volumen_db(int delta_db);
+int  audio_hda_esta_silenciado(void);
+void audio_hda_fijar_silencio(int silenciar);
 
 #endif // CONTROLADORES_AUDIO_HDA_H

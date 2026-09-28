@@ -56,7 +56,28 @@ struct h264_decodificador {
     uint64_t siguiente_identificador;
     const char *error;
     h264_telemetria telemetria;
+    int inter_sse2;
+    unsigned etapas_sse2; /* bit 0 filtro, bit 1 transformada, bit 2 Hadamard */
+    h264_mb *mb_privado;
+    struct h264_reconstruccion *reconstruccion;
+    int separar;
+    int32_t (*coef_publicar)[16];
+    int modo16_publicar;
+    h264_lote_fn ejecutar_lote;
+    void *usuario_lote;
+    unsigned trabajadores;
+    int (*servicio_coordinador)(void *);
 };
+static inline h264_mb *h264_mb_actual(h264_decodificador *d) {
+    return d->mb_privado?d->mb_privado:&d->actual->mb[d->mb_actual];
+}
+int h264_compensar(h264_decodificador *);
+int h264_aplicar_residuo(h264_decodificador *,int32_t [24][16],int);
+void h264_aplicar_transformada(h264_decodificador *,int32_t *,uint8_t *,unsigned,unsigned);
+int h264_reconstruccion_preparar(h264_decodificador *,unsigned);
+int h264_reconstruccion_ejecutar(h264_decodificador *,unsigned,unsigned);
+void h264_reconstruccion_liberar(h264_decodificador *);
+void h264_reconstruccion_modo(h264_decodificador *);
 
 static const uint8_t h264_orden4[16] = {0,1,4,5,2,3,6,7,8,9,12,13,10,11,14,15};
 static const uint8_t h264_scan4[16] = {0,1,4,8,5,2,3,6,9,12,13,10,7,11,14,15};

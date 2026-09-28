@@ -37,6 +37,9 @@ static const char *g_nombres_excepciones[32] = {
 
 static struct entrada_idt g_idt[256];
 static struct puntero_idt g_puntero_idt;
+void idt_cargar_cpu(void) {
+    __asm__ volatile("lidt %0"::"m"(g_puntero_idt):"memory");
+}
 static manejador_irq_fn   g_manejadores_irq[256];
 
 static void idt_configurar_puerta(int num, uint64_t dir_manejador) {

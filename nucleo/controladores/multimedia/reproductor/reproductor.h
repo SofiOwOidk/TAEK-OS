@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../mp4/mp4.h"
 
 // Modos de ejecución soportados
 enum modo_reproduccion {
@@ -17,5 +18,14 @@ void audio_aac_comando(const char *argumento);
 
 // Reproduce un archivo MP4 en memoria (buffer binario desde Limine o USB VFS)
 int reproductor_reproducir_memoria(const void *datos, size_t tamano, const char *nombre, enum modo_reproduccion modo);
+
+// Reproduce un MP4 desde una fuente de lectura aleatoria con buffers acotados.
+int reproductor_reproducir_fuente(mp4_lectura_posicional leer, void *contexto,
+                                  uint64_t tamano, const char *nombre,
+                                  enum modo_reproduccion modo,
+                                  int descriptor_vfs_video, int descriptor_vfs_audio);
+
+// Reproduce una pista MP3 desde un descriptor VFS por ventanas progresivas.
+int reproductor_mp3_reproducir_vfs(int descriptor_vfs, const char *nombre);
 
 #endif

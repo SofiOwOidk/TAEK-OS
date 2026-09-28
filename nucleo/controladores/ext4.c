@@ -539,7 +539,7 @@ static uint32_t ext4_buscar_inodo_por_ruta(const char *ruta) {
     return inodo_actual;
 }
 
-static void ext4_imprimir_tamano(uint32_t bytes) {
+static void ext4_imprimir_tamano(uint64_t bytes) {
     if (bytes < 1024) {
         consola_imprimir_dec(bytes);
         consola_imprimir(" B");
@@ -748,8 +748,8 @@ int ext4_leer_archivo_texto(const char *ruta) {
     consola_imprimir_linea("):");
     consola_imprimir_linea_color("----------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
 
-    uint32_t bytes_restantes = inodo.i_size_lo;
-    uint32_t cant_bloques = (bytes_restantes + g_volumen.tamano_bloque - 1) / g_volumen.tamano_bloque;
+    uint64_t bytes_restantes = (uint64_t)inodo.i_size_lo | ((uint64_t)inodo.i_size_high << 32);
+    uint64_t cant_bloques = (bytes_restantes + g_volumen.tamano_bloque - 1) / g_volumen.tamano_bloque;
 
     for (uint32_t b = 0; b < cant_bloques && bytes_restantes > 0; b++) {
         uint32_t bloque_fisico = 0;
@@ -792,7 +792,9 @@ int ext4_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out,
     if (ext4_leer_inodo(inodo_num, &inodo) != 0) return -4;
     if ((inodo.i_mode & 0xF000) == EXT4_S_IFDIR) return -5;
 
-    uint32_t tam = inodo.i_size_lo;
+    uint64_t tam64 = (uint64_t)inodo.i_size_lo | ((uint64_t)inodo.i_size_high << 32);
+    if (tam64 > 32ULL * 1024 * 1024 || tam64 > SIZE_MAX) return -10;
+    size_t tam = (size_t)tam64;
     if (tam == 0) return -6;
 
     int es_dma = 0;
@@ -808,8 +810,8 @@ int ext4_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out,
     }
 
     uint8_t *dest = (uint8_t *)buf;
-    uint32_t bytes_restantes = tam;
-    uint32_t cant_bloques = (bytes_restantes + g_volumen.tamano_bloque - 1) / g_volumen.tamano_bloque;
+    size_t bytes_restantes = tam;
+    size_t cant_bloques = (bytes_restantes + g_volumen.tamano_bloque - 1) / g_volumen.tamano_bloque;
 
     for (uint32_t b = 0; b < cant_bloques && bytes_restantes > 0; b++) {
         uint32_t bloque_fisico = 0;
@@ -825,7 +827,7 @@ int ext4_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out,
             return -9;
         }
 
-        uint32_t a_copiar = (bytes_restantes < g_volumen.tamano_bloque) ? bytes_restantes : g_volumen.tamano_bloque;
+        uint32_t a_copiar = (bytes_restantes < g_volumen.tamano_bloque) ? (uint32_t)bytes_restantes : g_volumen.tamano_bloque;
         memcpy(dest, g_bloque_buf, a_copiar);
         dest += a_copiar;
         bytes_restantes -= a_copiar;
@@ -1110,4 +1112,133 @@ int ext4_crear_directorio(const char *nombre) {
     consola_imprimir_linea(")");
     return 0;
 #endif
+}
+
+// --- FUNCIONES STREAMING EXT4 ---
+
+static void ext4_cachear_extent(struct ext4_cursor_archivo *cur, uint32_t bloque_logico) {
+    struct ext4_extent_cabecera *cab = (struct ext4_extent_cabecera *)cur->inodo.i_block;
+    if (cab->eh_magic != EXT4_EXTENTS_MAGIC || cab->eh_depth != 0) return;
+    struct ext4_extent *exts = (struct ext4_extent *)(cab + 1);
+    for (uint16_t i = 0; i < cab->eh_entries; i++) {
+        if (bloque_logico >= exts[i].ee_block && bloque_logico < exts[i].ee_block + exts[i].ee_len) {
+            cur->extent_logico_inicio = exts[i].ee_block;
+            cur->extent_longitud = exts[i].ee_len;
+            cur->extent_fisico_inicio = exts[i].ee_start_lo;
+            cur->extent_valido = 1;
+            return;
+        }
+    }
+}
+
+int ext4_abrir_stream(const char *ruta, void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    struct ext4_cursor_archivo *cur = (struct ext4_cursor_archivo *)fd->cursor;
+
+    uint32_t inodo_num = ext4_buscar_inodo_por_ruta(ruta);
+    if (inodo_num == 0) return -1;
+
+    if (ext4_leer_inodo(inodo_num, &cur->inodo) != 0) return -2;
+
+    if ((cur->inodo.i_mode & 0xF000) != EXT4_S_IFREG) return -3;
+
+    uint64_t tamano = cur->inodo.i_size_lo;
+    tamano |= ((uint64_t)cur->inodo.i_size_high) << 32;
+    fd->tamano = tamano;
+
+    cur->inodo_num = inodo_num;
+    cur->extent_valido = 0;
+
+    cur->tamano_bloque = g_volumen.tamano_bloque;
+    cur->sectores_por_bloque = g_volumen.sectores_por_bloque;
+    cur->lba_inicio_particion = g_volumen.lba_inicio_particion;
+    cur->unidad_msc = g_volumen.unidad_msc;
+
+    if (!cur->tamano_bloque || cur->tamano_bloque > VFS_STREAM_CACHE_MAX) return -5;
+    fd->bufer_tamano = cur->tamano_bloque;
+    fd->bufer_cache = asignar_memoria(fd->bufer_tamano);
+    if (!fd->bufer_cache) return -4;
+
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->posicion = 0;
+
+    return 0;
+}
+
+int64_t ext4_leer_stream(void *fd_generico, void *buf, size_t cantidad) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    struct ext4_cursor_archivo *cur = (struct ext4_cursor_archivo *)fd->cursor;
+    uint8_t *dest = (uint8_t *)buf;
+    int64_t bytes_leidos = 0;
+
+    if (fd->posicion >= fd->tamano) return 0;
+    if ((uint64_t)cantidad > fd->tamano - fd->posicion) cantidad = (size_t)(fd->tamano - fd->posicion);
+
+    while (cantidad > 0) {
+        if (fd->cancelado) return bytes_leidos ? bytes_leidos : -5;
+        uint64_t bloque_logico_64 = fd->posicion / cur->tamano_bloque;
+        if (bloque_logico_64 > UINT32_MAX) return bytes_leidos ? bytes_leidos : -6;
+        uint32_t bloque_logico = (uint32_t)bloque_logico_64;
+        uint32_t offset_en_bloque = (uint32_t)(fd->posicion % cur->tamano_bloque);
+        uint32_t bloque_fisico = 0;
+
+        if (cur->extent_valido && bloque_logico >= cur->extent_logico_inicio &&
+            bloque_logico < cur->extent_logico_inicio + cur->extent_longitud) {
+            bloque_fisico = cur->extent_fisico_inicio + (bloque_logico - cur->extent_logico_inicio);
+        } else {
+            if (ext4_mapear_bloque_logico(&cur->inodo, bloque_logico, &bloque_fisico) != 0) {
+                return bytes_leidos ? bytes_leidos : -2;
+            }
+            ext4_cachear_extent(cur, bloque_logico);
+        }
+
+        if (fd->bufer_unidad_logica != bloque_logico) {
+            uint64_t lba64 = (uint64_t)cur->lba_inicio_particion +
+                             (uint64_t)bloque_fisico * cur->sectores_por_bloque;
+            if (lba64 > UINT32_MAX) return bytes_leidos ? bytes_leidos : -6;
+            uint32_t lba = (uint32_t)lba64;
+            if (vfs_usb_leer_sectores(fd, lba, cur->sectores_por_bloque, fd->bufer_cache) != 0) {
+                return bytes_leidos ? bytes_leidos : -3;
+            }
+            fd->bufer_unidad_logica = bloque_logico;
+        }
+
+        uint32_t bytes_disponibles = cur->tamano_bloque - offset_en_bloque;
+        uint32_t a_copiar = (cantidad > bytes_disponibles) ? bytes_disponibles : (uint32_t)cantidad;
+
+        memcpy(dest, fd->bufer_cache + offset_en_bloque, a_copiar);
+        dest += a_copiar;
+        fd->posicion += a_copiar;
+        cantidad -= a_copiar;
+        bytes_leidos += a_copiar;
+    }
+
+    return bytes_leidos;
+}
+
+int64_t ext4_buscar_stream(void *fd_generico, int64_t offset, int origen) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    int64_t nueva_pos;
+
+    if (origen == VFS_SEEK_SET) nueva_pos = offset;
+    else if (origen == VFS_SEEK_CUR) nueva_pos = fd->posicion + offset;
+    else if (origen == VFS_SEEK_END) nueva_pos = fd->tamano + offset;
+    else return -1;
+
+    if (nueva_pos < 0) return -2;
+    if ((uint64_t)nueva_pos > fd->tamano) return -3;
+
+    fd->posicion = (uint64_t)nueva_pos;
+    return nueva_pos;
+}
+
+void ext4_cerrar_stream(void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    if (fd->bufer_cache) {
+        liberar_memoria(fd->bufer_cache);
+        fd->bufer_cache = NULL;
+    }
+    fd->bufer_tamano = 0;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->en_uso = 0;
 }

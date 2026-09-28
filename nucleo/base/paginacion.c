@@ -1,4 +1,5 @@
 #include "paginacion.h"
+#include "trabajos.h"
 #include "memoria.h"
 #include "huevo.h"
 #include "../arquitectura/x86_64/serial.h"
@@ -74,6 +75,7 @@ void paginacion_iniciar(void) {
 }
 
 int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t banderas) {
+    if(trabajos_en_curso())return -1;
     if (!g_paginacion_iniciada || g_pml4_kernel == NULL) {
         return -1;
     }
@@ -127,6 +129,7 @@ int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t bander
 }
 
 int paginacion_desmapear(uint64_t dir_virtual) {
+    if(trabajos_en_curso())return -1;
     if (!g_paginacion_iniciada || g_pml4_kernel == NULL) {
         return -1;
     }

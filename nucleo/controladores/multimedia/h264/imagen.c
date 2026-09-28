@@ -1,4 +1,5 @@
 #include "h264.h"
+#include "etapas_sse2.h"
 
 /* Huella de diagnóstico FNV-1a sobre las muestras visibles en orden Y, U, V.
  * No es una función criptográfica ni sustituye la comparación exacta. */
@@ -87,5 +88,20 @@ void h264_convertir_rgb(const h264_imagen *im, uint32_t *rgb, unsigned w, unsign
                            canal((yy + bu * u + 128) >> 8);
             }
         }
+    }
+}
+
+void h264_convertir_rgb_region(const h264_imagen *im,uint32_t *rgb,unsigned w,unsigned h,unsigned y0,unsigned y1,int sse2) {
+    if(!im || !rgb || !w || !h || y0>y1 || y1>h)return;
+    if(sse2){h264_rgb_sse2(im,rgb,w,h,y0,y1);return;}
+    /* Ruta escalar de referencia: una fila ya seleccionada mantiene el mapeo
+     * vertical global al convertir 1 fila; los pasos UV se conservan. */
+    for(unsigned y=y0;y<y1;y++) {
+        unsigned sy=(unsigned)((uint64_t)y*im->alto/h);
+        h264_imagen fila=*im;
+        fila.y=im->y+(size_t)sy*im->paso_y;
+        fila.u=im->u+(size_t)(sy/2)*im->paso_c;
+        fila.v=im->v+(size_t)(sy/2)*im->paso_c;
+        fila.alto=1;h264_convertir_rgb(&fila,rgb+(size_t)y*w,w,1);
     }
 }

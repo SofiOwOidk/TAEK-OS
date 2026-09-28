@@ -155,4 +155,35 @@ int  ntfs_listar_directorio(const char *ruta);
 int  ntfs_leer_archivo_texto(const char *ruta);
 int  ntfs_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out, int *es_dma_out);
 
+// --- CURSOR DE ARCHIVO PARA LECTURA POR POSICIÓN (Hito 68) ---
+
+#define NTFS_MAX_EXTENTS_STREAM 64
+
+struct ntfs_extent_stream {
+    uint64_t vcn_inicio;           // Virtual Cluster Number inicial del extent
+    uint64_t conteo_clusters;      // Cantidad de clusters en este extent
+    int64_t  lcn_inicio;           // Logical Cluster Number físico de inicio
+};
+
+struct ntfs_cursor_archivo {
+    uint32_t mft_idx;              // Índice del registro MFT
+    uint8_t  es_residente;         // 1 = datos dentro del registro MFT
+    // Datos residentes (archivos pequeños <= ~700 bytes):
+    uint8_t  datos_residentes[1024];
+    uint32_t tamano_residente;
+    // Datos no residentes (tabla de extents pre-decodificada):
+    struct ntfs_extent_stream extents[NTFS_MAX_EXTENTS_STREAM];
+    uint32_t total_extents;
+    // Estado de volumen:
+    uint32_t lba_inicio_particion;
+    uint8_t  sectores_por_cluster;
+    uint32_t bytes_por_cluster;
+    uint8_t  unidad_msc;
+};
+
+int     ntfs_abrir_stream(const char *ruta, void *fd_generico);
+int64_t ntfs_leer_stream(void *fd_generico, void *buf, size_t cantidad);
+int64_t ntfs_buscar_stream(void *fd_generico, int64_t offset, int origen);
+void    ntfs_cerrar_stream(void *fd_generico);
+
 #endif // CONTROLADORES_NTFS_H

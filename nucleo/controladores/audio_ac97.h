@@ -21,4 +21,11 @@ void audio_ac97_detener(void);
 int  audio_es_intel_hda(void);
 int  audio_esta_iniciado(void);
 
+// Control unificado de volumen del sistema operativo (en dB)
+int  audio_obtener_volumen_db(void);
+int  audio_fijar_volumen_db(int db);
+int  audio_ajustar_volumen_db(int delta_db);
+int  audio_esta_silenciado(void);
+void audio_fijar_silencio(int silenciar);
+
 #endif // CONTROLADORES_AUDIO_AC97_H

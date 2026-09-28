@@ -125,4 +125,23 @@ int  fat32_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_ou
 int  fat32_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);
 int  fat32_crear_directorio(const char *nombre);
 
+// --- CURSOR DE ARCHIVO PARA LECTURA POR POSICIÓN (Hito 68) ---
+
+struct fat32_cursor_archivo {
+    uint32_t cluster_inicio;       // Primer cluster del archivo
+    uint32_t cluster_actual;       // Cluster físico donde está el cursor
+    uint32_t indice_cluster;       // Índice lógico del cluster actual (0-based)
+    uint32_t bytes_por_cluster;    // Copia del volumen para acceso rápido
+    uint8_t  sectores_por_cluster; // Copia del volumen
+    uint16_t bytes_por_sector;     // Copia del volumen
+    uint32_t lba_datos;            // Copia del LBA de datos del volumen
+    uint32_t lba_fat;              // Copia del LBA de la tabla FAT
+    uint8_t  unidad_msc;           // Unidad USB MSC
+};
+
+int     fat32_abrir_stream(const char *ruta, void *fd_generico);
+int64_t fat32_leer_stream(void *fd_generico, void *buf, size_t cantidad);
+int64_t fat32_buscar_stream(void *fd_generico, int64_t offset, int origen);
+void    fat32_cerrar_stream(void *fd_generico);
+
 #endif // CONTROLADORES_FAT32_H

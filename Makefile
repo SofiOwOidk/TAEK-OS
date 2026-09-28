@@ -4,6 +4,12 @@ NASM    = nasm
 
 FECHA_BUILD = $(shell date +'%Y-%m-%d')
 HORA_BUILD  = $(shell date +'%H:%M:%S')
+REVISION_CODIGO = $(shell git describe --always --dirty 2>/dev/null || echo desconocida)
+# Selección explícita para comparaciones de rendimiento; nunca habilitar SIMD
+# en todos los fuentes del núcleo.
+H264_INTER_ESCALAR ?= 0
+H264_PERFIL_INTER ?= 0
+H264_INTER_SSE2 ?= 1
 
 CFLAGS  = -target x86_64-unknown-none-elf \
           -std=c11 \
@@ -17,6 +23,9 @@ CFLAGS  = -target x86_64-unknown-none-elf \
           -mcmodel=kernel \
           -DCOMPILACION_FECHA="\"$(FECHA_BUILD)\"" \
           -DCOMPILACION_HORA="\"$(HORA_BUILD)\"" \
+          -DTAEK_REVISION_CODIGO="\"$(REVISION_CODIGO)\"" \
+          -DH264_PERFIL_INTER=$(H264_PERFIL_INTER) \
+          -DH264_INTER_SSE2=$(H264_INTER_SSE2) \
           -I./nucleo -I. \
           -I./nucleo/controladores/multimedia/mp4 \
           -I./nucleo/controladores/multimedia/h264 \
@@ -25,6 +34,10 @@ CFLAGS  = -target x86_64-unknown-none-elf \
 
 LDFLAGS = -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 -T linker.ld
 
+ifeq ($(H264_INTER_ESCALAR),1)
+CFLAGS += -DH264_INTER_ESCALAR
+endif
+
 BUILD_DIR = build
 RECURSOS  = recursos
 
@@ -32,6 +45,8 @@ C_SRCS    = nucleo/principal.c \
             nucleo/arquitectura/x86_64/serial.c \
             nucleo/arquitectura/x86_64/gdt.c \
             nucleo/arquitectura/x86_64/idt.c \
+            nucleo/arquitectura/x86_64/fpu.c \
+            nucleo/arquitectura/x86_64/smp.c \
             nucleo/arquitectura/x86_64/apic.c \
             nucleo/arquitectura/x86_64/pci.c \
             nucleo/arquitectura/x86_64/vmx.c \
@@ -40,6 +55,7 @@ C_SRCS    = nucleo/principal.c \
             nucleo/base/energia.c \
             nucleo/base/utf8.c \
             nucleo/base/tiempo.c \
+            nucleo/base/trabajos.c \
             nucleo/base/version.c \
             nucleo/base/memoria.c \
             nucleo/base/dma.c \
@@ -69,10 +85,11 @@ C_SRCS    = nucleo/principal.c \
 C_SRCS   += $(wildcard nucleo/controladores/multimedia/mp4/*.c) \
             $(wildcard nucleo/controladores/multimedia/h264/*.c) \
             $(wildcard nucleo/controladores/multimedia/aac/*.c) \
+            $(wildcard nucleo/controladores/multimedia/mp3/*.c) \
             $(wildcard nucleo/controladores/multimedia/reproductor/*.c)
 MULTIMEDIA_HEADERS = $(wildcard nucleo/controladores/multimedia/*/*.h)
 
-S_SRCS    = nucleo/arquitectura/x86_64/trampas.s
+S_SRCS    = nucleo/arquitectura/x86_64/trampas.s nucleo/arquitectura/x86_64/smp_entrada.s
 
 OBJS      = $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS)) \
             $(patsubst %.s, $(BUILD_DIR)/%.o, $(S_SRCS)) \
@@ -137,8 +154,30 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/nucleo/controladores/multimedia/mp3/minimp3_impl.o: nucleo/controladores/multimedia/mp3/minimp3_impl.c nucleo/controladores/multimedia/mp3/minimp3.h
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -mno-80387 -mno-sse -mno-sse2,$(CFLAGS)) -mno-80387 -mno-mmx -msse2 -mfpmath=sse -c $< -o $@
+
+$(BUILD_DIR)/nucleo/controladores/multimedia/h264/inter_sse2.o: nucleo/controladores/multimedia/h264/inter_sse2.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -mno-sse -mno-sse2,$(CFLAGS)) -msse2 -mno-avx -mno-avx2 -c $< -o $@
+
+$(BUILD_DIR)/nucleo/controladores/multimedia/h264/etapas_sse2.o: nucleo/controladores/multimedia/h264/etapas_sse2.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -mno-sse -mno-sse2,$(CFLAGS)) -msse2 -mno-avx -mno-avx2 -c $< -o $@
+
 .PHONY: forzar_version
 $(BUILD_DIR)/nucleo/base/version.o: forzar_version
+
+# Cambiar una ruta de comparación debe recompilar el despacho y el informe,
+# incluso si los fuentes no cambiaron. El resto del kernel conserva sus flags.
+.PHONY: forzar_config_h264
+$(BUILD_DIR)/h264-config: forzar_config_h264
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' 'escalar=$(H264_INTER_ESCALAR) perfil=$(H264_PERFIL_INTER) sse2=$(H264_INTER_SSE2) revision=$(REVISION_CODIGO)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+$(patsubst %.c,$(BUILD_DIR)/%.o,$(wildcard nucleo/controladores/multimedia/h264/*.c)) $(BUILD_DIR)/nucleo/controladores/multimedia/reproductor/reproductor.o: $(BUILD_DIR)/h264-config Makefile
 
 $(BUILD_DIR)/%.o: %.s
 	@mkdir -p $(dir $@)

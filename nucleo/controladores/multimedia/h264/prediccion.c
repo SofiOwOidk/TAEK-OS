@@ -1,4 +1,5 @@
 #include "decodificador.h"
+#include "etapas_sse2.h"
 
 /* Vecino disponible para sintaxis/predicción dentro de la misma slice. */
 h264_mb *h264_vecino(h264_decodificador *d, int *x4, int *y4, int croma) {
@@ -13,7 +14,7 @@ h264_mb *h264_vecino(h264_decodificador *d, int *x4, int *y4, int croma) {
     if (mx < 0 || my < 0 || mx >= (int)d->s->ancho_mb || my >= (int)d->s->alto_mb) return NULL;
     unsigned indice = (unsigned)my*d->s->ancho_mb+(unsigned)mx;
     if (indice > d->mb_actual) return NULL;
-    h264_mb *mb = &d->actual->mb[indice];
+    h264_mb *mb = indice==d->mb_actual?h264_mb_actual(d):&d->actual->mb[indice];
     if (mb->slice != d->slice_id) return NULL;
     *x4 = x; *y4 = y;
     return mb;
@@ -24,7 +25,7 @@ static int muestra_intra(h264_decodificador *d, int plano, int x, int y, int *va
     int bx = x >= 0 ? x/4 : -1, by = y >= 0 ? y/4 : -1;
     h264_mb *mb = h264_vecino(d, &bx, &by, plano != 0);
     if (!mb || (d->p->intra_restringida && !mb->tipo)) return 0;
-    if (!plano && mb == &d->actual->mb[d->mb_actual] &&
+    if (!plano && mb == h264_mb_actual(d) &&
         !(mb->reconstruidos & (1u << (by*4+bx)))) return 0;
     int px = (int)(d->mb_actual%d->s->ancho_mb)*n+x;
     int py = (int)(d->mb_actual/d->s->ancho_mb)*n+y;
@@ -95,6 +96,24 @@ int h264_predecir(h264_decodificador *d, int plano, int bx, int by, int n, int m
         pa = 16*(t[n-1]+l[n-1]);
         pb = n == 16 ? (5*h+32)>>6 : (17*h+16)>>5;
         pc = n == 16 ? (5*v+32)>>6 : (17*v+16)>>5;
+    }
+    /* Modos frecuentes despachados una vez. Vecinos y DC de croma se
+     * reutilizan; ninguna suma de cuatro muestras se repite por píxel. */
+    if(modo<=2) {
+        int cuadrante[2][2];
+        for(int cy=0;cy<2;cy++)for(int cx=0;cx<2;cx++) {
+            int a=0,b=0;
+            for(int i=0;i<4;i++){a+=t[cx*4+i];b+=l[cy*4+i];}
+            cuadrante[cy][cx]=arriba&&izq?(!cy&&cx?(a+2)>>2:cy&&!cx?(b+2)>>2:(a+b+4)>>3):arriba?(a+2)>>2:izq?(b+2)>>2:128;
+        }
+        for(int y=0;y<n;y++) {
+            uint8_t *fila=dst+(size_t)y*paso;
+            if(modo==0)for(int x=0;x<n;x++)fila[x]=(uint8_t)t[x];
+            else if(modo==1)for(int x=0;x<n;x++)fila[x]=(uint8_t)l[y];
+            else if(plano)for(int x=0;x<n;x++)fila[x]=(uint8_t)cuadrante[y/4][x/4];
+            else for(int x=0;x<n;x++)fila[x]=(uint8_t)dc;
+        }
+        return 1;
     }
     for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) {
         int v = dc;

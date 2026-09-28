@@ -269,6 +269,73 @@ static uint8_t hda_encontrar_grupo_audio(uint8_t codec) {
     return 0;
 }
 
+#define HDA_MAX_NODOS_SALIDA 32
+struct hda_nodo_salida {
+    uint8_t codec;
+    uint8_t nodo;
+    uint8_t tipo; // 0 = DAC, 4 = Pin, 2 = Mixer
+    uint8_t num_entradas; // Para mixer
+};
+
+static struct hda_nodo_salida g_hda_nodos_salida[HDA_MAX_NODOS_SALIDA];
+static uint8_t g_hda_num_nodos_salida = 0;
+static int g_hda_volumen_db = -24;
+static int g_hda_silenciado = 0;
+
+static void hda_registrar_nodo_salida(uint8_t codec, uint8_t nodo, uint8_t tipo, uint8_t num_entradas) {
+    for (uint8_t i = 0; i < g_hda_num_nodos_salida; i++) {
+        if (g_hda_nodos_salida[i].codec == codec && g_hda_nodos_salida[i].nodo == nodo) {
+            g_hda_nodos_salida[i].tipo = tipo;
+            g_hda_nodos_salida[i].num_entradas = num_entradas;
+            return;
+        }
+    }
+    if (g_hda_num_nodos_salida < HDA_MAX_NODOS_SALIDA) {
+        g_hda_nodos_salida[g_hda_num_nodos_salida].codec = codec;
+        g_hda_nodos_salida[g_hda_num_nodos_salida].nodo = nodo;
+        g_hda_nodos_salida[g_hda_num_nodos_salida].tipo = tipo;
+        g_hda_nodos_salida[g_hda_num_nodos_salida].num_entradas = num_entradas;
+        g_hda_num_nodos_salida++;
+    }
+}
+
+static void hda_aplicar_volumen_nodos(int db, int silenciado) {
+    if (!g_mmio_base || !g_corb || !g_rirb) return;
+
+    // Escala dB a ganancia HDA:
+    // -24 dB -> 0x48 (72 decimal, nivel confortable)
+    // 0 dB -> ~120
+    // -60 dB -> 0
+    int ganancia = 72 + (db + 24) * 2;
+    if (ganancia < 0) ganancia = 0;
+    if (ganancia > 127) ganancia = 127;
+
+    uint32_t val = (uint32_t)(ganancia & 0x7F);
+    if (silenciado) {
+        val |= 0x80; // Bit 7 = MUTE
+    }
+
+    for (uint8_t i = 0; i < g_hda_num_nodos_salida; i++) {
+        uint8_t c = g_hda_nodos_salida[i].codec;
+        uint8_t n = g_hda_nodos_salida[i].nodo;
+        uint8_t tipo = g_hda_nodos_salida[i].tipo;
+
+        if (tipo == 0x0) { // DAC
+            hda_enviar_verbo(c, n, 0x3B000 | val);
+            hda_enviar_verbo(c, n, 0x3B700 | val);
+            hda_enviar_verbo(c, n, 0x39000 | val);
+        } else if (tipo == 0x4) { // Pin Complex
+            hda_enviar_verbo(c, n, 0x3B000 | val);
+            hda_enviar_verbo(c, n, 0x39000 | val);
+        } else if (tipo == 0x2) { // Mixer
+            uint8_t nin = g_hda_nodos_salida[i].num_entradas;
+            for (uint8_t in_idx = 0; in_idx < nin; in_idx++) {
+                hda_enviar_verbo(c, n, 0x3A000 | (in_idx << 8) | val);
+            }
+        }
+    }
+}
+
 // Configura los nodos DAC y Pin de salida del códec consultando el tipo real de cada nodo
 static void hda_configurar_nodos_codec(uint8_t codec) {
     serial_imprimir("[HDA] Configurando nodos de audio del códec ");
@@ -340,10 +407,11 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
             hda_enviar_verbo(codec, n, 0x70500);                                // Power State D0
             hda_enviar_verbo(codec, n, 0x20000 | HDA_FORMATO_44K_16B_STEREO); // Converter Format
             hda_enviar_verbo(codec, n, 0x70610);                                // Stream=1, Channel=0
-            // SET_AMP_GAIN_MUTE: Output, Left+Right, Index=0, Mute=0, Ganancia ~25 dB (confort)
+            // SET_AMP_GAIN_MUTE: Output, Left+Right, Index=0, Mute=0, Ganancia inicial
             hda_enviar_verbo(codec, n, 0x3B000 | HDA_AMP_GANANCIA_25DB);
             hda_enviar_verbo(codec, n, 0x3B700 | HDA_AMP_GANANCIA_25DB);
             hda_enviar_verbo(codec, n, 0x39000 | HDA_AMP_GANANCIA_25DB);
+            hda_registrar_nodo_salida(codec, n, 0x0, 0);
 
         } else if (widget_type == 0x4) {
             // --- Pin Complex ---
@@ -373,9 +441,10 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
                 // EAPD Enable (External Amplifier Power Down: bit 1 = Enable), vital en portátiles y MoDT
                 hda_enviar_verbo(codec, n, 0x70C02);
 
-                // Amplificador de salida: Desmutear ambos canales, ganancia confortable (~25 dB)
+                // Amplificador de salida: Desmutear ambos canales, ganancia inicial
                 hda_enviar_verbo(codec, n, 0x3B000 | HDA_AMP_GANANCIA_25DB);
                 hda_enviar_verbo(codec, n, 0x39000 | HDA_AMP_GANANCIA_25DB);
+                hda_registrar_nodo_salida(codec, n, 0x4, 0);
             }
 
         } else if (widget_type == 0x2) {
@@ -386,6 +455,7 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
             for (uint8_t i = 0; i < num_inputs; i++) {
                 hda_enviar_verbo(codec, n, 0x3A000 | (i << 8) | HDA_AMP_GANANCIA_25DB);
             }
+            hda_registrar_nodo_salida(codec, n, 0x2, num_inputs);
         } else if (widget_type == 0x3) {
             // Audio Selector: elegir la primera ruta
             hda_enviar_verbo(codec, n, 0x70500);
@@ -394,7 +464,35 @@ static void hda_configurar_nodos_codec(uint8_t codec) {
         // Nodos tipo Input, Selector, Power, VolumeKnob, Beep: ignorar
     }
 
+    // Aplicar volumen actual memorizado a todos los nodos registrados
+    hda_aplicar_volumen_nodos(g_hda_volumen_db, g_hda_silenciado);
+
     serial_imprimir_linea("[HDA] Configuración de códec completada.");
+}
+
+int audio_hda_obtener_volumen_db(void) {
+    return g_hda_volumen_db;
+}
+
+int audio_hda_fijar_volumen_db(int db) {
+    if (db > 6) db = 6;
+    if (db < -60) db = -60;
+    g_hda_volumen_db = db;
+    hda_aplicar_volumen_nodos(g_hda_volumen_db, g_hda_silenciado);
+    return g_hda_volumen_db;
+}
+
+int audio_hda_ajustar_volumen_db(int delta_db) {
+    return audio_hda_fijar_volumen_db(g_hda_volumen_db + delta_db);
+}
+
+int audio_hda_esta_silenciado(void) {
+    return g_hda_silenciado;
+}
+
+void audio_hda_fijar_silencio(int silenciar) {
+    g_hda_silenciado = silenciar ? 1 : 0;
+    hda_aplicar_volumen_nodos(g_hda_volumen_db, g_hda_silenciado);
 }
 
 // --- GESTIÓN DE BÚFERES Y REPRODUCCIÓN DMA (A2, A3) ---
@@ -690,14 +788,14 @@ void audio_hda_actualizar(void) {
         salto_valido = 1;
     }
 
-    // Actualizar bytes reproducidos
+    // Actualizar bytes reproducidos (64 bits - Hito 68: corrige desbordamiento a las 6h46m)
     if (g_modo_stream) {
-        g_hda_estado.bytes_reproducidos = (uint32_t)g_hda_estado.bytes_dma_totales;
+        g_hda_estado.bytes_reproducidos = g_hda_estado.bytes_dma_totales;
     } else {
         if (g_hda_estado.bytes_dma_totales >= g_audio_tamano) {
             g_hda_estado.bytes_reproducidos = g_audio_tamano;
         } else {
-            g_hda_estado.bytes_reproducidos = (uint32_t)g_hda_estado.bytes_dma_totales;
+            g_hda_estado.bytes_reproducidos = g_hda_estado.bytes_dma_totales;
         }
     }
 
@@ -1022,7 +1120,7 @@ uint32_t audio_hda_cola_disponible(void) {
 uint64_t audio_hda_obtener_tiempo_ms(void) {
     if (!g_hda_estado.inicializado) return 0;
     // 44100 Hz * 16 bits (2B) * 2 canales = 176400 bytes/segundo
-    return ((uint64_t)g_hda_estado.bytes_reproducidos * 1000ULL) / 176400ULL;
+    return (g_hda_estado.bytes_dma_totales * 1000ULL) / 176400ULL;
 }
 
 void audio_hda_reiniciar_reloj(void) {

@@ -75,9 +75,17 @@ trampa_comun_stub:
     push r14
     push r15
 
-    mov rdi, rsp        ; 1er parametro: puntero a struct marco_interrupcion
+    mov rax, rsp        ; Guardar el marco mientras se reserva estado FPU/SSE
+    sub rsp, 544
+    and rsp, -16
+    mov [rsp + 512], rax
+    fxsave64 [rsp]      ; Las rutinas de interrupción no pueden pisar el estado interrumpido
+    mov rdi, rax        ; 1er parametro: puntero a struct marco_interrupcion
     cld
     call despachador_interrupciones
+
+    fxrstor64 [rsp]
+    mov rsp, [rsp + 512]
 
     pop r15
     pop r14

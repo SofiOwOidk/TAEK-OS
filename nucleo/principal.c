@@ -7,6 +7,8 @@
 #include "arquitectura/x86_64/serial.h"
 #include "arquitectura/x86_64/gdt.h"
 #include "arquitectura/x86_64/idt.h"
+#include "arquitectura/x86_64/fpu.h"
+#include "base/trabajos.h"
 #include "arquitectura/x86_64/apic.h"
 #include "arquitectura/x86_64/pci.h"
 #include "arquitectura/x86_64/vmx.h"
@@ -119,6 +121,10 @@ void principal(void) {
         serial_imprimir("[BOOT] Línea de Comandos: \"");
         serial_imprimir(cmdline);
         serial_imprimir_linea("\"");
+        if(str_contiene(cmdline,"smp=0") || str_contiene(cmdline,"modo=vmx"))trabajos_limitar_cpu(0);
+        else if(str_contiene(cmdline,"smp=1"))trabajos_limitar_cpu(1);
+        else if(str_contiene(cmdline,"smp=2"))trabajos_limitar_cpu(2);
+        else if(str_contiene(cmdline,"smp=4"))trabajos_limitar_cpu(4);
         if (str_contiene(cmdline, "modo=ps2") || str_contiene(cmdline, "ps2") || str_contiene(cmdline, "legacy")) {
             modo_ps2_forzado = 1;
         }
@@ -163,6 +169,7 @@ void principal(void) {
     huevo_etapa_ok();
 
     huevo_etapa("IDT de 256 Vectores (Excepciones e Interrupciones)");
+    x86_64_fpu_iniciar();
     idt_iniciar();
     huevo_etapa_ok();
 
@@ -322,7 +329,14 @@ void principal(void) {
     }
 
     huevo_etapa("Detección y activación preliminar de Intel VMX");
-    if (vmx_iniciar(base_fisica, base_virtual) == 0) {
+    int smp_listo=trabajos_iniciar();
+    if(smp_listo) {
+        serial_imprimir_linea("[SMP activo; VMXON reservado para ejecución monoprocesador]");
+        if(!trabajos_autoprueba()) {
+            serial_imprimir_linea("[SMP autoprueba fallida; trabajadores detenidos]");trabajos_parar();
+        }
+        huevo_etapa_ok();
+    } else if (vmx_iniciar(base_fisica, base_virtual) == 0) {
         serial_imprimir("[VMXON activo - Guest y VM-Exit aún sin configurar] ");
         huevo_etapa_ok();
     } else {
@@ -331,6 +345,11 @@ void principal(void) {
     }
 
     huevo_etapa("Renderizado de Imagen de Arranque (Five Nights in Tel Aviv)");
+    if(!smp_listo && apic_obtener_estado()->activo)trabajos_autoprueba();
+    if(g_peticion_ejecutable.response && g_peticion_ejecutable.response->executable_file &&
+       str_contiene(g_peticion_ejecutable.response->executable_file->cmdline,"smp=prueba")) {
+        trabajos_parar();serial_imprimir_linea("SMP PARADA_COORDINADA=OK EJECUTORES=1");
+    }
     pantalla_dibujar_imagen_centrada(638, 780, (const uint32_t *)_binary_imagen_arranque_bin_start);
     serial_imprimir("[638x780 BGRA32 Centrada] ");
     huevo_etapa_ok();

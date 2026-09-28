@@ -199,4 +199,26 @@ int  ext4_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out
 int  ext4_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t tamano);
 int  ext4_crear_directorio(const char *nombre);
 
+// --- CURSOR DE ARCHIVO PARA LECTURA POR POSICIÓN (Hito 68) ---
+
+struct ext4_cursor_archivo {
+    uint32_t inodo_num;            // Número de inodo del archivo
+    struct ext4_inodo inodo;       // Copia del inodo (256 bytes aprox)
+    // Caché de extent activo (evita recorrer el árbol en cada bloque):
+    uint32_t extent_logico_inicio; // ee_block del extent cacheado
+    uint32_t extent_longitud;      // ee_len del extent cacheado
+    uint32_t extent_fisico_inicio; // ee_start_lo del extent cacheado
+    uint8_t  extent_valido;        // 1 = caché de extent es válido
+    // Estado de volumen:
+    uint32_t tamano_bloque;
+    uint32_t sectores_por_bloque;
+    uint32_t lba_inicio_particion;
+    uint8_t  unidad_msc;
+};
+
+int     ext4_abrir_stream(const char *ruta, void *fd_generico);
+int64_t ext4_leer_stream(void *fd_generico, void *buf, size_t cantidad);
+int64_t ext4_buscar_stream(void *fd_generico, int64_t offset, int origen);
+void    ext4_cerrar_stream(void *fd_generico);
+
 #endif // CONTROLADORES_EXT4_H

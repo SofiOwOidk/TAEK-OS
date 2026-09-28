@@ -90,9 +90,9 @@ void apic_enviar_self_ipi(uint8_t vector) {
 }
 
 void apic_despachar_irq(struct marco_interrupcion *marco) {
-    g_apic.interrupciones_recibidas++;
+    __atomic_fetch_add(&g_apic.interrupciones_recibidas,1,__ATOMIC_RELAXED);
     if (marco->num_interrupcion == APIC_VECTOR_PRUEBA_IPI) {
-        g_apic.ipi_recibidos++;
+        __atomic_fetch_add(&g_apic.ipi_recibidos,1,__ATOMIC_RELAXED);
     }
 
     if (marco->num_interrupcion != APIC_VECTOR_ESPURIO) {

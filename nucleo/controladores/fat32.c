@@ -848,6 +848,15 @@ int fat32_leer_archivo_binario(const char *nombre_buscado, void **buf_out, size_
         clus = fat32_siguiente_cluster(&g_volumen, clus);
     }
 
+    if (bytes_restantes != 0) {
+        consola_imprimir_linea_color(
+            "  [FAT32 ERROR] Cadena de clusters truncada: lectura incompleta.",
+            COLOR_ERROR_DEFAULT);
+        if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+        else liberar_memoria(buf);
+        return -7;
+    }
+
     *buf_out = buf;
     *tam_out = tam;
     if (es_dma_out) *es_dma_out = es_dma;
@@ -1076,3 +1085,159 @@ int fat32_crear_directorio(const char *nombre) {
     return 0;
 }
 
+static uint32_t fat32_sig_cluster_stream(struct fat32_cursor_archivo *cur) {
+    uint8_t fat_buf[512];
+    uint32_t fat_offset_bytes = cur->cluster_actual * 4;
+    uint32_t fat_sector_lba = cur->lba_fat + (fat_offset_bytes / cur->bytes_por_sector);
+    uint32_t offset_en_sector = fat_offset_bytes % cur->bytes_por_sector;
+    if (usb_msc_leer_sectores(cur->unidad_msc, fat_sector_lba, 1, fat_buf) != 0) return 0;
+    uint32_t raw = *(uint32_t *)&fat_buf[offset_en_sector];
+    uint32_t sig = raw & 0x0FFFFFFFU;
+    if (sig >= 0x0FFFFFF8U || sig == 0 || sig == 0x0FFFFFF7U) return 0;
+    return sig;
+}
+
+int fat32_abrir_stream(const char *ruta, void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    if (!g_volumen.montado) {
+        if (fat32_montar(0) != 0) return -2;
+    }
+
+    int num_items = 0;
+    fat32_leer_entradas_directorio(g_volumen.cluster_raiz, &num_items);
+
+    const struct fat32_item *objetivo = NULL;
+    for (int i = 0; i < num_items; i++) {
+        int match = 1;
+        int p = 0;
+        while (ruta[p] && g_items_actuales[i].nombre[p]) {
+            char c1 = ruta[p];
+            char c2 = g_items_actuales[i].nombre[p];
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+            if (c1 != c2) { match = 0; break; }
+            p++;
+        }
+        if (match && ruta[p] == '\0' && g_items_actuales[i].nombre[p] == '\0') {
+            objetivo = &g_items_actuales[i];
+            break;
+        }
+    }
+
+    if (!objetivo || objetivo->es_directorio) return -3;
+
+    fd->tamano = objetivo->tamano;
+    fd->posicion = 0;
+
+    struct fat32_cursor_archivo *cur = (struct fat32_cursor_archivo *)fd->cursor;
+    cur->cluster_inicio = objetivo->cluster_inicio;
+    cur->cluster_actual = objetivo->cluster_inicio;
+    cur->indice_cluster = 0;
+    cur->bytes_por_cluster = g_volumen.bytes_por_cluster;
+    cur->sectores_por_cluster = g_volumen.sectores_por_cluster;
+    cur->bytes_por_sector = g_volumen.bytes_por_sector;
+    cur->lba_datos = g_volumen.lba_datos;
+    cur->lba_fat = g_volumen.lba_fat;
+    cur->unidad_msc = g_volumen.unidad_msc;
+
+    if (!g_volumen.bytes_por_cluster || g_volumen.bytes_por_cluster > VFS_STREAM_CACHE_MAX) return -6;
+    fd->bufer_cache = (uint8_t *)asignar_memoria(g_volumen.bytes_por_cluster);
+    if (!fd->bufer_cache) return -5;
+
+    fd->bufer_tamano = g_volumen.bytes_por_cluster;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->bufer_bytes_validos = 0;
+
+    return 0;
+}
+
+int64_t fat32_leer_stream(void *fd_generico, void *buf, size_t cantidad) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    struct fat32_cursor_archivo *cur = (struct fat32_cursor_archivo *)fd->cursor;
+
+    if (fd->posicion >= fd->tamano) return 0;
+    uint64_t restante = fd->tamano - fd->posicion;
+    if (cantidad > restante) cantidad = (size_t)restante;
+
+    size_t bytes_leidos = 0;
+    uint8_t *dest = (uint8_t *)buf;
+
+    while (cantidad > 0) {
+        if (fd->cancelado) return bytes_leidos ? (int64_t)bytes_leidos : -3;
+        uint32_t target_cluster_idx = (uint32_t)(fd->posicion / cur->bytes_por_cluster);
+        uint32_t offset_in_cluster = (uint32_t)(fd->posicion % cur->bytes_por_cluster);
+
+        if (target_cluster_idx != fd->bufer_unidad_logica) {
+            if (target_cluster_idx < cur->indice_cluster) {
+                cur->cluster_actual = cur->cluster_inicio;
+                cur->indice_cluster = 0;
+            }
+
+            while (cur->indice_cluster < target_cluster_idx) {
+                uint32_t sig = fat32_sig_cluster_stream(cur);
+                if (sig == 0) return bytes_leidos > 0 ? (int64_t)bytes_leidos : -1;
+                cur->cluster_actual = sig;
+                cur->indice_cluster++;
+            }
+
+        uint64_t lba64 = (uint64_t)cur->lba_datos +
+                         (uint64_t)(cur->cluster_actual - 2) * cur->sectores_por_cluster;
+        if (lba64 > UINT32_MAX) return bytes_leidos ? (int64_t)bytes_leidos : -4;
+        uint32_t lba = (uint32_t)lba64;
+        if (vfs_usb_leer_sectores(fd, lba, cur->sectores_por_cluster, fd->bufer_cache) != 0) {
+                return bytes_leidos > 0 ? (int64_t)bytes_leidos : -2;
+            }
+
+            fd->bufer_unidad_logica = target_cluster_idx;
+            uint64_t bytes_en_cluster_logico = fd->tamano - ((uint64_t)target_cluster_idx * cur->bytes_por_cluster);
+            fd->bufer_bytes_validos = (bytes_en_cluster_logico < cur->bytes_por_cluster) ? (uint32_t)bytes_en_cluster_logico : cur->bytes_por_cluster;
+        }
+
+        uint32_t disponible_en_bufer = fd->bufer_bytes_validos - offset_in_cluster;
+        uint32_t a_copiar = (cantidad < disponible_en_bufer) ? (uint32_t)cantidad : disponible_en_bufer;
+
+        for (uint32_t i = 0; i < a_copiar; i++) {
+            dest[i] = fd->bufer_cache[offset_in_cluster + i];
+        }
+
+        fd->posicion += a_copiar;
+        dest += a_copiar;
+        cantidad -= a_copiar;
+        bytes_leidos += a_copiar;
+    }
+
+    return (int64_t)bytes_leidos;
+}
+
+int64_t fat32_buscar_stream(void *fd_generico, int64_t offset, int origen) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    int64_t nueva_pos = 0;
+
+    if (origen == VFS_SEEK_SET) {
+        nueva_pos = offset;
+    } else if (origen == VFS_SEEK_CUR) {
+        nueva_pos = (int64_t)fd->posicion + offset;
+    } else if (origen == VFS_SEEK_END) {
+        nueva_pos = (int64_t)fd->tamano + offset;
+    } else {
+        return -1;
+    }
+
+    if (nueva_pos < 0) nueva_pos = 0;
+    if ((uint64_t)nueva_pos > fd->tamano) nueva_pos = fd->tamano;
+
+    fd->posicion = (uint64_t)nueva_pos;
+    return nueva_pos;
+}
+
+void fat32_cerrar_stream(void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    if (fd->bufer_cache) {
+        liberar_memoria(fd->bufer_cache);
+        fd->bufer_cache = NULL;
+    }
+    fd->bufer_tamano = 0;
+    fd->bufer_bytes_validos = 0;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->en_uso = 0;
+}

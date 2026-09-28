@@ -53,6 +53,7 @@ struct __attribute__((packed)) usb_msc_csw {
 
 // Estructura de información de dispositivo de almacenamiento USB
 struct usb_msc_dispositivo {
+    uint64_t generacion;          // Cambia en cada conexión, aunque se reutilice la misma ranura
     int      activo;
     uint8_t  slot_id;             // Slot asignado en xHCI
     uint8_t  puerto_idx;          // Puerto físico raíz

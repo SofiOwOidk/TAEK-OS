@@ -556,11 +556,15 @@ int ntfs_leer_archivo_texto(const char *ruta) {
     while (offset + sizeof(struct ntfs_atributo_cabecera) <= tam_usado && offset < g_vol_ntfs.tamano_registro_mft) {
         struct ntfs_atributo_cabecera *attr = (struct ntfs_atributo_cabecera *)&g_ntfs_record_buf[offset];
         if (attr->tipo == NTFS_ATTR_END || attr->longitud == 0) break;
+        if (attr->longitud < sizeof(*attr) || attr->longitud > tam_usado - offset ||
+            attr->longitud > g_vol_ntfs.tamano_registro_mft - offset) return -6;
 
         if (attr->tipo == NTFS_ATTR_DATA) {
             if (attr->no_residente == 0) {
                 // Datos residentes: contenidos directamente en el MFT
                 struct ntfs_atributo_residente *res = (struct ntfs_atributo_residente *)attr;
+                if (res->offset_valor > attr->longitud ||
+                    res->longitud_valor > attr->longitud - res->offset_valor) return -6;
                 uint8_t *datos = &g_ntfs_record_buf[offset + res->offset_valor];
                 uint32_t len = res->longitud_valor;
 
@@ -777,4 +781,207 @@ int ntfs_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out,
     if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
     else liberar_memoria(buf);
     return -8;
+}
+
+// --- FUNCIONES STREAMING NTFS ---
+
+int ntfs_abrir_stream(const char *ruta, void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    struct ntfs_cursor_archivo *cur = (struct ntfs_cursor_archivo *)fd->cursor;
+
+    if (!g_vol_ntfs.montado) {
+        if (ntfs_montar(0) != 0) return -1;
+    }
+
+    int idx_nodo = -1;
+    for (int i = 0; i < g_total_nodos_ntfs; i++) {
+        if (!g_ntfs_nodos[i].es_directorio && ntfs_str_igual_sin_caso(g_ntfs_nodos[i].nombre, ruta)) {
+            idx_nodo = i;
+            break;
+        }
+    }
+    if (idx_nodo < 0) return -2;
+
+    uint32_t mft_idx = g_ntfs_nodos[idx_nodo].mft_idx;
+    if (ntfs_leer_registro_mft(mft_idx, g_ntfs_record_buf) != 0) return -3;
+
+    struct ntfs_registro_mft *reg = (struct ntfs_registro_mft *)g_ntfs_record_buf;
+    uint32_t offset = reg->primer_atributo_offset;
+    uint32_t tam_usado = reg->tamano_usado;
+
+    cur->mft_idx = mft_idx;
+    cur->lba_inicio_particion = g_vol_ntfs.lba_inicio_particion;
+    cur->sectores_por_cluster = g_vol_ntfs.sectores_por_cluster;
+    cur->bytes_por_cluster = g_vol_ntfs.bytes_por_cluster;
+    cur->unidad_msc = g_vol_ntfs.unidad_msc;
+    cur->total_extents = 0;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+
+    int encontrado = 0;
+    while (offset + sizeof(struct ntfs_atributo_cabecera) <= tam_usado && offset < g_vol_ntfs.tamano_registro_mft) {
+        struct ntfs_atributo_cabecera *attr = (struct ntfs_atributo_cabecera *)&g_ntfs_record_buf[offset];
+        if (attr->tipo == NTFS_ATTR_END || attr->longitud == 0) break;
+
+        if (attr->tipo == NTFS_ATTR_DATA) {
+            encontrado = 1;
+            if (attr->no_residente == 0) {
+                struct ntfs_atributo_residente *res = (struct ntfs_atributo_residente *)attr;
+                uint8_t *datos = &g_ntfs_record_buf[offset + res->offset_valor];
+                uint32_t len = res->longitud_valor;
+                if (len > sizeof(cur->datos_residentes)) return -6;
+                memcpy(cur->datos_residentes, datos, len);
+                cur->es_residente = 1;
+                cur->tamano_residente = len;
+                fd->tamano = len;
+            } else {
+                struct ntfs_atributo_no_residente *no_res = (struct ntfs_atributo_no_residente *)attr;
+                if (no_res->offset_data_runs >= attr->longitud) return -6;
+                uint8_t *run_ptr = &g_ntfs_record_buf[offset + no_res->offset_data_runs];
+                uint8_t *run_fin = &g_ntfs_record_buf[offset + attr->longitud];
+                cur->es_residente = 0;
+                fd->tamano = no_res->tamano_real;
+
+                int64_t prev_lcn = 0;
+                uint64_t vcn_actual = 0;
+
+                while (run_ptr < run_fin && *run_ptr != 0 && cur->total_extents < NTFS_MAX_EXTENTS_STREAM) {
+                    uint8_t header = *run_ptr++;
+                    uint8_t len_size = header & 0x0F;
+                    uint8_t off_size = (header >> 4) & 0x0F;
+
+                    if (len_size == 0 || len_size > 8 || off_size > 8 ||
+                        (size_t)(run_fin - run_ptr) < (size_t)len_size + off_size) return -6;
+
+                    uint64_t run_len = 0;
+                    for (int k = 0; k < len_size; k++) {
+                        run_len |= ((uint64_t)*run_ptr++) << (k * 8);
+                    }
+                    if (!run_len || run_len > UINT64_MAX - vcn_actual) return -6;
+
+                    int64_t lcn_delta = 0;
+                    if (off_size > 0) {
+                        for (int k = 0; k < off_size; k++) {
+                            lcn_delta |= ((int64_t)*run_ptr++) << (k * 8);
+                        }
+                        if (*(run_ptr - 1) & 0x80) {
+                            for (int k = off_size; k < 8; k++) {
+                                lcn_delta |= ((int64_t)0xFF) << (k * 8);
+                            }
+                        }
+                    }
+
+                    if ((lcn_delta > 0 && prev_lcn > INT64_MAX - lcn_delta) ||
+                        (lcn_delta < 0 && prev_lcn < INT64_MIN - lcn_delta)) return -6;
+                    int64_t curr_lcn = prev_lcn + lcn_delta;
+                    prev_lcn = curr_lcn;
+
+                    cur->extents[cur->total_extents].vcn_inicio = vcn_actual;
+                    cur->extents[cur->total_extents].conteo_clusters = run_len;
+                    cur->extents[cur->total_extents].lcn_inicio = curr_lcn;
+                    cur->total_extents++;
+                    vcn_actual += run_len;
+                }
+                if (run_ptr >= run_fin || *run_ptr != 0) return -6;
+            }
+            break;
+        }
+        offset += attr->longitud;
+    }
+
+    if (!encontrado) return -4;
+
+    if (!cur->es_residente) {
+        if (!cur->bytes_por_cluster || cur->bytes_por_cluster > VFS_STREAM_CACHE_MAX) return -5;
+        fd->bufer_tamano = cur->bytes_por_cluster;
+        fd->bufer_cache = asignar_memoria(fd->bufer_tamano);
+        if (!fd->bufer_cache) return -5;
+    }
+
+    fd->posicion = 0;
+    return 0;
+}
+
+int64_t ntfs_leer_stream(void *fd_generico, void *buf, size_t cantidad) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    struct ntfs_cursor_archivo *cur = (struct ntfs_cursor_archivo *)fd->cursor;
+    uint8_t *dest = (uint8_t *)buf;
+    int64_t bytes_leidos = 0;
+
+    if (fd->posicion >= fd->tamano) return 0;
+    if ((uint64_t)cantidad > fd->tamano - fd->posicion) cantidad = (size_t)(fd->tamano - fd->posicion);
+
+    if (cur->es_residente) {
+        memcpy(dest, cur->datos_residentes + fd->posicion, cantidad);
+        fd->posicion += cantidad;
+        return cantidad;
+    }
+
+    while (cantidad > 0) {
+        if (fd->cancelado) return bytes_leidos ? bytes_leidos : -3;
+        uint64_t target_vcn = fd->posicion / cur->bytes_por_cluster;
+        uint32_t offset_in_cluster = fd->posicion % cur->bytes_por_cluster;
+
+        int extent_idx = -1;
+        for (uint32_t i = 0; i < cur->total_extents; i++) {
+            if (target_vcn >= cur->extents[i].vcn_inicio &&
+                target_vcn < cur->extents[i].vcn_inicio + cur->extents[i].conteo_clusters) {
+                extent_idx = i;
+                break;
+            }
+        }
+
+        if (extent_idx == -1) return bytes_leidos ? bytes_leidos : -4;
+
+        int64_t lcn = cur->extents[extent_idx].lcn_inicio + (target_vcn - cur->extents[extent_idx].vcn_inicio);
+        if (lcn < 0) return bytes_leidos ? bytes_leidos : -4; /* Extents dispersos no compatibles */
+
+        if (fd->bufer_unidad_logica != (uint32_t)target_vcn) {
+            uint64_t lba64 = (uint64_t)cur->lba_inicio_particion +
+                             (uint64_t)lcn * cur->sectores_por_cluster;
+            if (lba64 > UINT32_MAX) return bytes_leidos ? bytes_leidos : -4;
+            uint32_t lba = (uint32_t)lba64;
+            if (vfs_usb_leer_sectores(fd, lba, cur->sectores_por_cluster, fd->bufer_cache) != 0) {
+                return bytes_leidos ? bytes_leidos : -5;
+            }
+            fd->bufer_unidad_logica = (uint32_t)target_vcn;
+        }
+
+        uint32_t bytes_disponibles = cur->bytes_por_cluster - offset_in_cluster;
+        uint32_t a_copiar = (cantidad > bytes_disponibles) ? bytes_disponibles : (uint32_t)cantidad;
+
+        memcpy(dest, fd->bufer_cache + offset_in_cluster, a_copiar);
+        dest += a_copiar;
+        fd->posicion += a_copiar;
+        cantidad -= a_copiar;
+        bytes_leidos += a_copiar;
+    }
+
+    return bytes_leidos;
+}
+
+int64_t ntfs_buscar_stream(void *fd_generico, int64_t offset, int origen) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    int64_t nueva_pos;
+
+    if (origen == VFS_SEEK_SET) nueva_pos = offset;
+    else if (origen == VFS_SEEK_CUR) nueva_pos = fd->posicion + offset;
+    else if (origen == VFS_SEEK_END) nueva_pos = fd->tamano + offset;
+    else return -1;
+
+    if (nueva_pos < 0) return -2;
+    if ((uint64_t)nueva_pos > fd->tamano) return -3;
+
+    fd->posicion = (uint64_t)nueva_pos;
+    return nueva_pos;
+}
+
+void ntfs_cerrar_stream(void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    if (fd->bufer_cache) {
+        liberar_memoria(fd->bufer_cache);
+        fd->bufer_cache = NULL;
+    }
+    fd->bufer_tamano = 0;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->en_uso = 0;
 }

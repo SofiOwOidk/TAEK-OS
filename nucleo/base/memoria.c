@@ -1,6 +1,7 @@
 #include "memoria.h"
 #include "dma.h"
 #include "huevo.h"
+#include "trabajos.h"
 #include "../arquitectura/x86_64/serial.h"
 
 #define LIMINE_API_REVISION 2
@@ -145,6 +146,7 @@ int memcmp(const void *s1, const void *s2, size_t n) {
 // --- GESTOR DE MARCOS DE PÁGINA FÍSICA (PMM - 4 KiB) ---
 
 uint64_t pmm_asignar_pagina_fisica(void) {
+    if(!trabajos_es_coordinador())return 0;
     if (g_pila_marcos_libres == 0) {
         serial_imprimir_linea("[PMM FATAL] ¡Memoria física agotada! Sin marcos libres.");
         huevo_agrietar("PMM: Memoria física agotada (Out of Memory)");
@@ -180,6 +182,7 @@ void *pmm_asignar_pagina_virtual(void) {
 }
 
 void pmm_liberar_pagina_fisica(uint64_t phys) {
+    if(!trabajos_es_coordinador())return;
     if (phys == 0 || (phys & 0xFFFULL) != 0) {
         huevo_quebrar("PMM: dirección de liberación inválida", phys, 0, 0);
         return;
@@ -233,6 +236,7 @@ static void heap_agregar_arena(void *direccion_virtual, uint64_t tamano_bytes) {
 }
 
 void *asignar_memoria(uint64_t bytes) {
+    if(!trabajos_es_coordinador())return NULL;
     if (bytes == 0) return NULL;
 
     // Alinear a 16 bytes para compatibilidad y rendimiento de CPU
@@ -340,6 +344,7 @@ void *asignar_memoria_cero(uint64_t bytes) {
 }
 
 void liberar_memoria(void *ptr) {
+    if(!trabajos_es_coordinador())return;
     if (ptr == NULL) return;
 
     bloque_heap_t *bloque = ((bloque_heap_t *)ptr) - 1;

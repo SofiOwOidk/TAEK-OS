@@ -1,9 +1,15 @@
 #include "decodificador.h"
+#include "etapas_sse2.h"
+#if H264_PERFIL_INTER
+static uint64_t reloj_residuo(void) {
+    unsigned a,d;__asm__ volatile("lfence;rdtsc":"=a"(a),"=d"(d)::"memory");return ((uint64_t)d<<32)|a;
+}
+#endif
 
 static unsigned bin(h264_decodificador *d, unsigned ctx) { return h264_cabac_bin(&d->cabac,ctx); }
 
 static int vecino_cbf(h264_decodificador *d, int cat, int bloque, int arriba) {
-    h264_mb *actual = &d->actual->mb[d->mb_actual], *v;
+    h264_mb *actual = h264_mb_actual(d), *v;
     int x, y, plano = bloque / 4;
     if (cat == 0 || cat == 3) {
         x = arriba ? 0 : -1; y = arriba ? -1 : 0;
@@ -39,7 +45,7 @@ int h264_residuo(h264_decodificador *d, int32_t c[64], int cat, int bloque) {
         3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,
         5,5,5,5,6,6,6,6,7,7,7,7,8,8,8
     };
-    h264_mb *m = &d->actual->mb[d->mb_actual];
+    h264_mb *m = h264_mb_actual(d);
     int max = cat == 3 ? 4 : cat == 5 ? 64 : cat == 1 || cat == 4 ? 15 : 16;
     h264_cero(c,64*sizeof(*c));
     if (cat != 5) {
@@ -124,7 +130,7 @@ int h264_leer_mb_tipo(h264_decodificador *d) {
 }
 
 int h264_leer_cbp(h264_decodificador *d) {
-    h264_mb *m=&d->actual->mb[d->mb_actual];
+    h264_mb *m=h264_mb_actual(d);
     int cbp=0;
     for (int i=0;i<4;i++) {
         int x=(i%2)*2-1,y=(i/2)*2;
@@ -185,13 +191,20 @@ static void hadamard4(int32_t *c) {
 }
 
 int h264_reconstruir_residuo(h264_decodificador *d,int modo16) {
-    h264_mb *m=&d->actual->mb[d->mb_actual];
-    int32_t coef[24][16], dc[64], tmp[64], dc_c[2][4];
-    h264_cero(coef,sizeof(coef));h264_cero(dc,sizeof(dc));h264_cero(dc_c,sizeof(dc_c));
+    h264_mb *m=h264_mb_actual(d);
+    int32_t respaldo[24][16], dc[64], tmp[64], dc_c[2][4];
+    int32_t (*coef)[16]=d->separar?d->coef_publicar:respaldo;
+    h264_cero(coef,24*16*sizeof(int32_t));h264_cero(dc,sizeof(dc));h264_cero(dc_c,sizeof(dc_c));
     int qp=m->qp;
     if (m->tipo == 2) {
         if (h264_residuo(d,dc,0,0)<0) return 0;
-        hadamard4(dc);
+#if H264_PERFIL_INTER
+        uint64_t inicio_hadamard=reloj_residuo();
+#endif
+        if(d->inter_sse2 && (d->etapas_sse2&4))h264_hadamard_sse2(dc);else hadamard4(dc);
+#if H264_PERFIL_INTER
+        d->telemetria.ciclos_hadamard+=reloj_residuo()-inicio_hadamard;
+#endif
         for (int i=0;i<16;i++) {
             int64_t v=((int64_t)dc[i]*escala4[qp%6][0]*(1<<(qp/6))+2)>>2;
             if (v < -(1<<20) || v > (1<<20)) return 0;
@@ -239,18 +252,29 @@ int h264_reconstruir_residuo(h264_decodificador *d,int modo16) {
         m->nz[16+p*4+j]=(uint8_t)cantidad;
         for (int k=1;k<16;k++) coef[16+p*4+j][k]=tmp[k];
     }
+    for(int p=0;p<2;p++)for(int j=0;j<4;j++)coef[16+p*4+j][0]=dc_c[p][j];
+    if(d->separar) {
+        d->modo16_publicar=modo16;
+        h264_reconstruccion_modo(d);
+        return !d->bits.error;
+    }
+    return h264_aplicar_residuo(d,coef,modo16);
+}
+
+int h264_aplicar_residuo(h264_decodificador *d,int32_t coef[24][16],int modo16) {
+    h264_mb *m=h264_mb_actual(d);
     if (m->tipo==2 && !h264_predecir(d,0,0,0,16,modo16)) return 0;
     unsigned paso=d->actual->w;
     uint8_t *dst=d->actual->pixeles+(d->mb_actual/d->s->ancho_mb)*16*paso+(d->mb_actual%d->s->ancho_mb)*16;
     if (m->transformada8) for (int q=0;q<4;q++) {
         int x=(q%2)*8,y=(q/2)*8;
         if (m->tipo && !h264_predecir(d,0,x,y,8,m->modo[y+x/4])) return 0;
-        h264_transformar8(((int32_t *)coef)+q*64,dst+y*paso+x,paso);
+        h264_aplicar_transformada(d,((int32_t *)coef)+q*64,dst+y*paso+x,paso,8);
         for (int j=0;j<4;j++) m->reconstruidos|=(uint16_t)(1u<<h264_orden4[q*4+j]);
     } else for (int j=0;j<16;j++) {
         int b=h264_orden4[j], x=(b%4)*4,y=(b/4)*4;
         if (m->tipo==1 && !h264_predecir(d,0,x,y,4,m->modo[b])) return 0;
-        h264_transformar4(coef[b],dst+y*paso+x,paso);
+        h264_aplicar_transformada(d,coef[b],dst+y*paso+x,paso,4);
         m->reconstruidos|=(uint16_t)(1u<<b);
     }
     for (int p=0;p<2;p++) {
@@ -259,15 +283,14 @@ int h264_reconstruir_residuo(h264_decodificador *d,int modo16) {
         uint8_t *cd=d->actual->pixeles+(size_t)paso*d->actual->h*(4+p)/4+
              (d->mb_actual/d->s->ancho_mb)*8*pc+(d->mb_actual%d->s->ancho_mb)*8;
         for (int j=0;j<4;j++) {
-            coef[16+p*4+j][0]=dc_c[p][j];
-            h264_transformar4(coef[16+p*4+j],cd+(j/2)*4*pc+(j%2)*4,pc);
+            h264_aplicar_transformada(d,coef[16+p*4+j],cd+(j/2)*4*pc+(j%2)*4,pc,4);
         }
     }
     return !d->bits.error;
 }
 
 int h264_intra(h264_decodificador *d,unsigned tipo) {
-    h264_mb *m=&d->actual->mb[d->mb_actual];
+    h264_mb *m=h264_mb_actual(d);
     m->tipo=tipo == 0 ? 1 : tipo == 25 ? 3 : 2;
     int x=-1,y=0;
     h264_mb *a=h264_vecino(d,&x,&y,0);

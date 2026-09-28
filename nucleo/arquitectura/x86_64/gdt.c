@@ -19,6 +19,32 @@ static uint8_t g_pila_df[16384] __attribute__((aligned(16)));
 static uint8_t g_pila_nmi[16384] __attribute__((aligned(16)));
 static uint8_t g_pila_mc[16384] __attribute__((aligned(16)));
 
+/* TSS y tres IST privados: nunca compartir una pila de excepción entre CPUs. */
+static struct entrada_gdt g_ap_gdt[3][5];
+static struct tss64 g_ap_tss[3];
+static uint8_t g_ap_pilas[3][4][16384] __attribute__((aligned(16)));
+void gdt_iniciar_cpu(unsigned indice) {
+    if(!indice || indice>3)return;
+    unsigned i=indice-1;
+    __builtin_memcpy(g_ap_gdt[i],g_gdt,sizeof(g_gdt));
+    struct tss64 *t=&g_ap_tss[i];
+    t->rsp0=(uint64_t)(g_ap_pilas[i][0]+16384);
+    for(unsigned j=0;j<3;j++)t->ist[j]=(uint64_t)(g_ap_pilas[i][j+1]+16384);
+    t->iomap_base=sizeof(*t);
+    uint64_t base=(uint64_t)t, bajo=(sizeof(*t)-1)|((base&0xffffff)<<16)|
+        (UINT64_C(0x89)<<40)|(((base>>24)&255)<<56),alto=base>>32;
+    __builtin_memcpy(&g_ap_gdt[i][3],&bajo,8);
+    __builtin_memcpy(&g_ap_gdt[i][4],&alto,8);
+    struct puntero_gdt p={sizeof(g_ap_gdt[i])-1,(uint64_t)g_ap_gdt[i]};
+    __asm__ volatile("lgdt %0"::"m"(p):"memory");
+    __asm__ volatile(
+        "mov $0x10,%%ax;mov %%ax,%%ds;mov %%ax,%%es;mov %%ax,%%ss;mov %%ax,%%fs;mov %%ax,%%gs;"
+        "pushq $0x08;lea 1f(%%rip),%%rax;pushq %%rax;lretq;1:"
+        :::"rax","memory");
+    uint16_t selector=0x18;
+    __asm__ volatile("ltr %0"::"r"(selector):"memory");
+}
+
 static void gdt_configurar_puerta(int num, uint32_t base, uint32_t limite, uint8_t acceso, uint8_t gran) {
     g_gdt[num].base_baja    = (base & 0xFFFF);
     g_gdt[num].base_media   = (base >> 16) & 0xFF;

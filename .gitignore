@@ -1,4 +1,6 @@
 build/
+build antigua/
+build antigua+/
 *.img
 *.iso
 *.bin
@@ -22,6 +24,7 @@ Recursos Asets/Video 1080p.mp4
 # Herramientas de prueba, fuzzer y scripts de validacion
 herramientas/
 tests/
+*_tmp.c
 
 # Documentos internos de desarrollo, pruebas y planificacion
 # REGLA ESTRICTA: Solo se suben al repositorio publico el codigo refinado, README.md y BITACORA.md

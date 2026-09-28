@@ -24,6 +24,7 @@ h264_decodificador *h264_crear(const h264_servicios *s) {
 
 void h264_destruir(h264_decodificador *d) {
     if (!d) return;
+    h264_reconstruccion_liberar(d);
     h264_servicios s=d->servicios;
     for (int i=0;i<18;i++) {
         if (d->fotos[i].pixeles) s.liberar(s.usuario,d->fotos[i].pixeles);
@@ -31,6 +32,25 @@ void h264_destruir(h264_decodificador *d) {
     }
     if (d->rbsp) s.liberar(s.usuario,d->rbsp);
     s.liberar(s.usuario,d);
+}
+
+int h264_configurar_sse2(h264_decodificador *d,int estado_xmm_disponible) {
+    if(!d)return 0;
+    d->inter_sse2=0;
+    /* El filtro SSE2 aumentó el tiempo de desbloqueo del tramo de referencia.
+     * Se conserva seleccionable; el despacho medido por defecto es 6. */
+    d->etapas_sse2=6;
+#if defined(__x86_64__) || defined(__i386__)
+    if(estado_xmm_disponible) {
+        uint32_t a,b,c,e;
+        __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(e) : "a"(1),"c"(0));
+        const uint32_t requeridos=(1u<<24)|(1u<<25)|(1u<<26);
+        d->inter_sse2=(e&requeridos)==requeridos;
+    }
+#else
+    (void)estado_xmm_disponible;
+#endif
+    return d->inter_sse2;
 }
 
 const char *h264_error(const h264_decodificador *d) { return d ? d->error : "Contexto nulo"; }
@@ -42,6 +62,15 @@ void h264_obtener_telemetria(const h264_decodificador *d, h264_telemetria *t) {
         return;
     }
     *t = d->telemetria;
+    t->inter_sse2=(unsigned)d->inter_sse2;
+    t->etapas_sse2=d->etapas_sse2;
+    t->trabajadores=d->trabajadores?d->trabajadores:1;
+    if (d->s && d->s->valido) {
+        t->perfil=d->s->perfil;t->nivel=d->s->nivel;
+        t->ancho_codificado=d->s->ancho_mb*16;t->alto_codificado=d->s->alto_mb*16;
+        t->ancho_visible=d->s->ancho;t->alto_visible=d->s->alto;
+        t->num_tick=d->s->num_tick;t->escala_tick=d->s->escala_tick;
+    }
 }
 
 static int emitir(h264_decodificador *d,h264_foto *f) {
@@ -309,8 +338,14 @@ static int decodificar_slice(h264_decodificador *d,unsigned nal,int64_t tiempo) 
     while (d->bits.posicion&7) if (!h264_bits_leer(&d->bits,1)) return 0;
     if (!h264_cabac_iniciar(&d->cabac,&d->bits,d->sl.qp,d->sl.tipo==2?0:d->sl.cabac_id+1)) return 0;
     unsigned n=d->s->ancho_mb*d->s->alto_mb;
+    d->separar=d->ejecutar_lote && n<=8192 && d->s->alto_mb<=256;
+    if(d->separar && !h264_reconstruccion_preparar(d,n))return 0;
     uint64_t t_mb0 = h264_rdtsc();
     for (d->mb_actual=primero;d->mb_actual<n;d->mb_actual++) {
+        if(d->separar)h264_reconstruccion_preparar(d,n);
+        if(d->servicio_coordinador && (d->mb_actual&7)==0 && d->servicio_coordinador(d->usuario_lote)) {
+            d->fallo=H264_CANCELADO;return 0;
+        }
         h264_mb *m=&d->actual->mb[d->mb_actual];
         m->slice=(int16_t)d->slice_id;
         m->filtro=(int8_t)d->sl.filtro;m->alfa=(int8_t)d->sl.alfa;m->beta=(int8_t)d->sl.beta;
@@ -344,7 +379,10 @@ static int decodificar_slice(h264_decodificador *d,unsigned nal,int64_t tiempo) 
             uint64_t dt_mb = h264_rdtsc() - t_mb0;
             d->telemetria.ciclos_sintaxis_reconstruccion += dt_mb;
             if (dt_mb > d->telemetria.max_ciclos_sintaxis) d->telemetria.max_ciclos_sintaxis = dt_mb;
-            return 1;
+            if(d->separar && !h264_reconstruccion_ejecutar(d,primero,d->mb_actual+1))return 0;
+            dt_mb=h264_rdtsc()-t_mb0;
+            if(dt_mb>d->telemetria.max_ciclos_sintaxis)d->telemetria.max_ciclos_sintaxis=dt_mb;
+            d->separar=0;return 1;
         }
     }
     uint64_t dt_mb = h264_rdtsc() - t_mb0;

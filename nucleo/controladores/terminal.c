@@ -2005,40 +2005,54 @@ static int visor_imagen_mostrar(const void *datos, size_t tamano, const char *no
     return 0;
 }
 
+struct vfs_fuente_mp4 { int descriptor_video; int descriptor_audio; };
+
+static int64_t leer_vfs_mp4(void *contexto, int pista, uint64_t offset, void *destino, size_t cantidad) {
+    struct vfs_fuente_mp4 *fuente = (struct vfs_fuente_mp4 *)contexto;
+    int descriptor = pista == MP4_FUENTE_AUDIO ? fuente->descriptor_audio : fuente->descriptor_video;
+    return vfs_leer_en(descriptor, offset, destino, cantidad);
+}
+
 static void ejecutar_reproducir_mp4_vfs(const char *nombre) {
     if (!nombre || *nombre == '\0') {
         consola_imprimir_linea_color("  [ERROR] Especifica el nombre o número de archivo MP4.", COLOR_ERROR_DEFAULT);
         return;
     }
 
-    consola_imprimir_color("==> [ VFS ] Cargando archivo multimedia: '", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_color("==> [ VFS ] Abriendo archivo multimedia: '", COLOR_PROMPT_DEFAULT);
     consola_imprimir_color(nombre, COLOR_AVISO_DEFAULT);
     consola_imprimir_linea("'...");
 
-    void *buffer = NULL;
-    size_t tamano = 0;
-    int es_dma = 0;
-
-    int res = vfs_leer_archivo_binario(nombre, &buffer, &tamano, &es_dma);
-    if (res != 0 || !buffer || tamano == 0) {
+    int descriptor = -1;
+    int res = vfs_abrir(nombre, &descriptor);
+    uint64_t tamano = res == 0 ? vfs_tamano_fd(descriptor) : 0;
+    int descriptor_audio = -1;
+    if (res == 0) res = vfs_abrir(nombre, &descriptor_audio);
+    if (res != 0 || tamano == 0) {
+        if (descriptor >= 0) vfs_cerrar(descriptor);
+        if (descriptor_audio >= 0) vfs_cerrar(descriptor_audio);
         consola_imprimir_color("  [ERROR] No se pudo leer el archivo '", COLOR_ERROR_DEFAULT);
         consola_imprimir(nombre);
         consola_imprimir_linea_color("' desde el sistema de archivos.", COLOR_ERROR_DEFAULT);
         return;
     }
 
-    consola_imprimir("==> [ REPRODUCTOR ] Archivo en memoria (");
+    consola_imprimir("==> [ REPRODUCTOR ] Reproducción progresiva (");
     consola_imprimir_dec(tamano);
-    consola_imprimir(" bytes, ");
-    consola_imprimir(es_dma ? "Arena DMA" : "Heap");
-    consola_imprimir_linea("). Iniciando decodificación H.264 + AAC...");
+    consola_imprimir_linea(" bytes). Iniciando decodificación H.264 + AAC...");
     consola_imprimir_linea_color("    [Control+C o ESC para detener reproducción en cualquier momento]", COLOR_AVISO_DEFAULT);
 
-    reproductor_reproducir_memoria(buffer, tamano, nombre, MODO_INTERACTIVO);
+    struct vfs_fuente_mp4 fuente = {descriptor, descriptor_audio};
+    int resultado = reproductor_reproducir_fuente(leer_vfs_mp4, &fuente, tamano, nombre,
+                                                   MODO_INTERACTIVO, descriptor, descriptor_audio);
+    vfs_cerrar(descriptor);
+    vfs_cerrar(descriptor_audio);
 
-    vfs_liberar_archivo_binario(buffer, tamano, es_dma);
-
-    consola_imprimir_linea_color("==> [ REPRODUCTOR ] Reproducción finalizada y recursos liberados.", COLOR_EXITO_DEFAULT);
+    if (resultado < 0) {
+        consola_imprimir_linea_color("==> [ REPRODUCTOR ] No se pudo completar la reproducción progresiva.", COLOR_ERROR_DEFAULT);
+    } else {
+        consola_imprimir_linea_color("==> [ REPRODUCTOR ] Reproducción finalizada y recursos liberados.", COLOR_EXITO_DEFAULT);
+    }
 }
 
 static void ejecutar_mostrar_imagen_vfs(const char *nombre) {
@@ -2085,6 +2099,9 @@ static void ejecutar_comando_abrir(const char *arg) {
                     consola_imprimir(cat->entradas[i].nombre);
                     if (cat->entradas[i].tipo_archivo == VFS_TIPO_MP4) consola_imprimir_linea_color(" [MP4]", COLOR_EXITO_DEFAULT);
                     else if (cat->entradas[i].tipo_archivo == VFS_TIPO_IMAGEN_BMP) consola_imprimir_linea_color(" [IMG]", COLOR_AVISO_DEFAULT);
+                    else if (cat->entradas[i].tipo_archivo == VFS_TIPO_IMAGEN_JPEG) consola_imprimir_linea_color(" [JPEG]", COLOR_AVISO_DEFAULT);
+                    else if (cat->entradas[i].tipo_archivo == VFS_TIPO_IMAGEN_PNG) consola_imprimir_linea_color(" [PNG]", COLOR_AVISO_DEFAULT);
+                    else if (cat->entradas[i].tipo_archivo == VFS_TIPO_MP3) consola_imprimir_linea_color(" [MP3]", COLOR_AVISO_DEFAULT);
                     else if (cat->entradas[i].tipo_archivo == VFS_TIPO_TEXTO) consola_imprimir_linea_color(" [TXT]", COLOR_TEXTO_DEFAULT);
                     else if (cat->entradas[i].tipo_nodo == VFS_NODO_DIRECTORIO) consola_imprimir_linea_color(" <DIR>", COLOR_PROMPT_DEFAULT);
                     else consola_imprimir_linea("");
@@ -2159,32 +2176,31 @@ static void ejecutar_comando_abrir(const char *arg) {
         ejecutar_reproducir_mp4_vfs(nombre_final);
     } else if (tipo == VFS_TIPO_IMAGEN_BMP) {
         ejecutar_mostrar_imagen_vfs(nombre_final);
+    } else if (tipo == VFS_TIPO_IMAGEN_JPEG || tipo == VFS_TIPO_IMAGEN_PNG) {
+        consola_imprimir_color("  [AVISO] Imagen '", COLOR_AVISO_DEFAULT);
+        consola_imprimir(nombre_final);
+        consola_imprimir_linea_color("' identificada, pero el visor aun no soporta JPEG/PNG.", COLOR_AVISO_DEFAULT);
+    } else if (tipo == VFS_TIPO_MP3) {
+        int descriptor_mp3 = -1;
+        if (vfs_abrir(nombre_final, &descriptor_mp3) != 0) {
+            consola_imprimir_color("  [ERROR] No se pudo abrir el MP3 '", COLOR_ERROR_DEFAULT);
+            consola_imprimir(nombre_final);
+            consola_imprimir_linea_color("'.", COLOR_ERROR_DEFAULT);
+        } else {
+            int resultado_mp3 = reproductor_mp3_reproducir_vfs(descriptor_mp3, nombre_final);
+            vfs_cerrar(descriptor_mp3);
+            if (resultado_mp3 < 0) {
+                consola_imprimir_linea_color("==> [ MP3 ] Error durante la reproducción progresiva.", COLOR_ERROR_DEFAULT);
+            } else {
+                consola_imprimir_linea_color("==> [ MP3 ] Reproducción finalizada.", COLOR_EXITO_DEFAULT);
+            }
+        }
     } else if (tipo == VFS_TIPO_TEXTO) {
         vfs_leer_archivo_texto(nombre_final);
     } else {
-        void *buf = NULL;
-        size_t tam = 0;
-        int es_dma = 0;
-        if (vfs_leer_archivo_binario(nombre_final, &buf, &tam, &es_dma) == 0 && buf && tam >= 4) {
-            const uint8_t *b = (const uint8_t *)buf;
-            if (b[0] == 'B' && b[1] == 'M') {
-                visor_imagen_mostrar(buf, tam, nombre_final);
-                vfs_liberar_archivo_binario(buf, tam, es_dma);
-                return;
-            }
-            if (tam >= 8 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') {
-                reproductor_reproducir_memoria(buf, tam, nombre_final, MODO_INTERACTIVO);
-                vfs_liberar_archivo_binario(buf, tam, es_dma);
-                return;
-            }
-            vfs_liberar_archivo_binario(buf, tam, es_dma);
-        }
-        int res_txt = vfs_leer_archivo_texto(nombre_final);
-        if (res_txt != 0) {
-            consola_imprimir_color("  [ERROR] No se pudo abrir '", COLOR_ERROR_DEFAULT);
-            consola_imprimir(nombre_final);
-            consola_imprimir_linea_color("'. Formato no reconocido.", COLOR_ERROR_DEFAULT);
-        }
+        consola_imprimir_color("  [AVISO] Archivo '", COLOR_AVISO_DEFAULT);
+        consola_imprimir(nombre_final);
+        consola_imprimir_linea_color("' es binario o tiene un formato no soportado.", COLOR_AVISO_DEFAULT);
     }
 }
 

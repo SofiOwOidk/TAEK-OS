@@ -25,6 +25,7 @@ static uint8_t            *g_msc_dma_buffer = NULL;
 static uint64_t            g_msc_dma_buffer_fisica = 0;
 
 static uint32_t            g_etiqueta_actual = 0x20260900U;
+static uint64_t            g_generacion_dispositivo = 1;
 
 void usb_msc_iniciar(void) {
     if (g_msc_inicializado) return;
@@ -164,6 +165,8 @@ int usb_msc_registrar_dispositivo(uint8_t slot_id, uint8_t puerto_idx,
     }
 
     struct usb_msc_dispositivo *dev = &g_msc_dispositivos[idx];
+    dev->generacion = g_generacion_dispositivo++;
+    if (!g_generacion_dispositivo) g_generacion_dispositivo = 1;
     dev->activo = 1;
     dev->slot_id = slot_id;
     dev->puerto_idx = puerto_idx;

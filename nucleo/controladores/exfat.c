@@ -665,6 +665,15 @@ int exfat_leer_archivo_binario(const char *ruta, void **buf_out, size_t *tam_out
         }
     }
 
+    if (restante != 0) {
+        consola_imprimir_linea_color(
+            "  [exFAT ERROR] Cadena de clusters truncada: lectura incompleta.",
+            COLOR_AVISO_EXFAT);
+        if (es_dma) dma_liberar_bufer_contiguo(buf, phys_dma, tam);
+        else liberar_memoria(buf);
+        return -7;
+    }
+
     *buf_out = buf;
     *tam_out = tam;
     if (es_dma_out) *es_dma_out = es_dma;
@@ -918,7 +927,6 @@ int exfat_crear_archivo(const char *nombre, const uint8_t *datos, uint32_t taman
     consola_imprimir_linea(")");
     return 0;
 }
-
 int exfat_crear_directorio(const char *nombre) {
     if (!exfat_nombre_valido(nombre)) return -1;
     if (!g_vol_exfat.montado) {
@@ -958,4 +966,153 @@ int exfat_crear_directorio(const char *nombre) {
     consola_imprimir_dec(cluster_dir);
     consola_imprimir_linea(")");
     return 0;
+}
+
+static uint32_t exfat_sig_cluster_stream(struct exfat_cursor_archivo *cur) {
+    if (cur->sin_cadena_fat) return cur->cluster_actual + 1;
+    uint8_t fat_buf[512];
+    uint32_t fat_offset = cur->cluster_actual * 4;
+    uint32_t fat_lba = cur->lba_fat + (fat_offset / cur->bytes_por_sector);
+    uint32_t off = fat_offset % cur->bytes_por_sector;
+    if (usb_msc_leer_sectores(cur->unidad_msc, fat_lba, 1, fat_buf) != 0) return 0xFFFFFFFF;
+    uint32_t val = *(uint32_t *)&fat_buf[off];
+    if (val >= 0xFFFFFFF8U || val < 2) return 0xFFFFFFFF;
+    return val;
+}
+
+int exfat_abrir_stream(const char *ruta, void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    if (!g_vol_exfat.montado) {
+        if (exfat_montar(0) != 0) return -2;
+    }
+
+    struct exfat_nodo *nodos = g_exfat_nodos;
+    int total = exfat_leer_entradas_directorio(g_vol_exfat.cluster_raiz, 0, 0, nodos, MAX_NODOS_POR_DIR);
+
+    int idx = -1;
+    for (int i = 0; i < total; i++) {
+        if (!nodos[i].es_directorio && exfat_str_igual_sin_caso(nodos[i].nombre, ruta)) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx < 0) return -3;
+
+    struct exfat_nodo *objetivo = &nodos[idx];
+    fd->tamano = objetivo->tamano_bytes;
+    fd->posicion = 0;
+
+    struct exfat_cursor_archivo *cur = (struct exfat_cursor_archivo *)fd->cursor;
+    cur->cluster_inicio = objetivo->cluster_inicio;
+    cur->cluster_actual = objetivo->cluster_inicio;
+    cur->indice_cluster = 0;
+    cur->bytes_por_cluster = g_vol_exfat.bytes_por_cluster;
+    cur->sectores_por_cluster = g_vol_exfat.sectores_por_cluster;
+    cur->bytes_por_sector = g_vol_exfat.bytes_por_sector;
+    cur->lba_heap = g_vol_exfat.lba_heap;
+    cur->lba_fat = g_vol_exfat.lba_fat;
+    cur->unidad_msc = g_vol_exfat.unidad_msc;
+    cur->sin_cadena_fat = objetivo->sin_cadena_fat;
+
+    if (!g_vol_exfat.bytes_por_cluster || g_vol_exfat.bytes_por_cluster > VFS_STREAM_CACHE_MAX) return -6;
+    fd->bufer_cache = (uint8_t *)asignar_memoria(g_vol_exfat.bytes_por_cluster);
+    if (!fd->bufer_cache) return -5;
+
+    fd->bufer_tamano = g_vol_exfat.bytes_por_cluster;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->bufer_bytes_validos = 0;
+
+    return 0;
+}
+
+int64_t exfat_leer_stream(void *fd_generico, void *buf, size_t cantidad) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    struct exfat_cursor_archivo *cur = (struct exfat_cursor_archivo *)fd->cursor;
+
+    if (fd->posicion >= fd->tamano) return 0;
+    uint64_t restante = fd->tamano - fd->posicion;
+    if (cantidad > restante) cantidad = (size_t)restante;
+
+    size_t bytes_leidos = 0;
+    uint8_t *dest = (uint8_t *)buf;
+
+    while (cantidad > 0) {
+        if (fd->cancelado) return bytes_leidos ? (int64_t)bytes_leidos : -3;
+        uint32_t target_cluster_idx = (uint32_t)(fd->posicion / cur->bytes_por_cluster);
+        uint32_t offset_in_cluster = (uint32_t)(fd->posicion % cur->bytes_por_cluster);
+
+        if (target_cluster_idx != fd->bufer_unidad_logica) {
+            if (target_cluster_idx < cur->indice_cluster) {
+                cur->cluster_actual = cur->cluster_inicio;
+                cur->indice_cluster = 0;
+            }
+
+            while (cur->indice_cluster < target_cluster_idx) {
+                uint32_t sig = exfat_sig_cluster_stream(cur);
+                if (sig == 0xFFFFFFFF) return bytes_leidos > 0 ? (int64_t)bytes_leidos : -1;
+                cur->cluster_actual = sig;
+                cur->indice_cluster++;
+            }
+
+            uint64_t lba64 = (uint64_t)cur->lba_heap +
+                             (uint64_t)(cur->cluster_actual - 2) * cur->sectores_por_cluster;
+            if (lba64 > UINT32_MAX) return bytes_leidos ? (int64_t)bytes_leidos : -4;
+            uint32_t lba = (uint32_t)lba64;
+            if (vfs_usb_leer_sectores(fd, lba, cur->sectores_por_cluster, fd->bufer_cache) != 0) {
+                return bytes_leidos > 0 ? (int64_t)bytes_leidos : -2;
+            }
+
+            fd->bufer_unidad_logica = target_cluster_idx;
+            uint64_t bytes_en_cluster_logico = fd->tamano - ((uint64_t)target_cluster_idx * cur->bytes_por_cluster);
+            fd->bufer_bytes_validos = (bytes_en_cluster_logico < cur->bytes_por_cluster) ? (uint32_t)bytes_en_cluster_logico : cur->bytes_por_cluster;
+        }
+
+        uint32_t disponible_en_bufer = fd->bufer_bytes_validos - offset_in_cluster;
+        uint32_t a_copiar = (cantidad < disponible_en_bufer) ? (uint32_t)cantidad : disponible_en_bufer;
+
+        for (uint32_t i = 0; i < a_copiar; i++) {
+            dest[i] = fd->bufer_cache[offset_in_cluster + i];
+        }
+
+        fd->posicion += a_copiar;
+        dest += a_copiar;
+        cantidad -= a_copiar;
+        bytes_leidos += a_copiar;
+    }
+
+    return (int64_t)bytes_leidos;
+}
+
+int64_t exfat_buscar_stream(void *fd_generico, int64_t offset, int origen) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    int64_t nueva_pos = 0;
+
+    if (origen == VFS_SEEK_SET) {
+        nueva_pos = offset;
+    } else if (origen == VFS_SEEK_CUR) {
+        nueva_pos = (int64_t)fd->posicion + offset;
+    } else if (origen == VFS_SEEK_END) {
+        nueva_pos = (int64_t)fd->tamano + offset;
+    } else {
+        return -1;
+    }
+
+    if (nueva_pos < 0) nueva_pos = 0;
+    if ((uint64_t)nueva_pos > fd->tamano) nueva_pos = fd->tamano;
+
+    fd->posicion = (uint64_t)nueva_pos;
+    return nueva_pos;
+}
+
+void exfat_cerrar_stream(void *fd_generico) {
+    struct vfs_descriptor_archivo *fd = (struct vfs_descriptor_archivo *)fd_generico;
+    if (fd->bufer_cache) {
+        liberar_memoria(fd->bufer_cache);
+        fd->bufer_cache = NULL;
+    }
+    fd->bufer_tamano = 0;
+    fd->bufer_bytes_validos = 0;
+    fd->bufer_unidad_logica = 0xFFFFFFFF;
+    fd->en_uso = 0;
 }
