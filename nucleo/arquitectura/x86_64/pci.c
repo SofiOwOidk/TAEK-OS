@@ -259,6 +259,10 @@ void pci_iniciar(void) {
     g_pci_inicializado = 1;
 }
 
+int pci_esta_iniciado(void) {
+    return g_pci_inicializado;
+}
+
 int pci_obtener_conteo(void) {
     if (!g_pci_inicializado) pci_iniciar();
     return g_conteo_dispositivos;

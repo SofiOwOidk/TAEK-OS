@@ -1,4 +1,9 @@
 #include "decodificador.h"
+/* El perfil de instrumentación se define en h264.h (H264_TELEMETRIA_DETALLADA):
+ * 1 = detallado (relojes por macrobloque); 0 = rendimiento (pared por lote). */
+void h264_configurar_traza(h264_decodificador *d,h264_traza_fn f,void *u) {
+    if(d){d->traza=f;d->usuario_traza=u;}
+}
 
 static inline uint64_t h264_rdtsc(void) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -107,6 +112,7 @@ static int terminar_foto(h264_decodificador *d) {
     uint64_t t0 = h264_rdtsc();
     h264_desbloquear(d);
     uint64_t dt = h264_rdtsc() - t0;
+    if(d->traza)d->traza(d->usuario_traza,0,6,f->tiempo,t0,t0+dt,0);
     d->telemetria.ciclos_desbloqueo += dt;
     if (dt > d->telemetria.max_ciclos_desbloqueo) d->telemetria.max_ciclos_desbloqueo = dt;
     f->salida=1;f->ocupado=0;
@@ -340,7 +346,9 @@ static int decodificar_slice(h264_decodificador *d,unsigned nal,int64_t tiempo) 
     unsigned n=d->s->ancho_mb*d->s->alto_mb;
     d->separar=d->ejecutar_lote && n<=8192 && d->s->alto_mb<=256;
     if(d->separar && !h264_reconstruccion_preparar(d,n))return 0;
+#if H264_TELEMETRIA_DETALLADA
     uint64_t t_mb0 = h264_rdtsc();
+#endif
     for (d->mb_actual=primero;d->mb_actual<n;d->mb_actual++) {
         if(d->separar)h264_reconstruccion_preparar(d,n);
         if(d->servicio_coordinador && (d->mb_actual&7)==0 && d->servicio_coordinador(d->usuario_lote)) {
@@ -350,7 +358,9 @@ static int decodificar_slice(h264_decodificador *d,unsigned nal,int64_t tiempo) 
         m->slice=(int16_t)d->slice_id;
         m->filtro=(int8_t)d->sl.filtro;m->alfa=(int8_t)d->sl.alfa;m->beta=(int8_t)d->sl.beta;
         
+#if H264_TELEMETRIA_DETALLADA
         uint64_t t_c0 = h264_rdtsc();
+#endif
         int salto=0;
         if (d->sl.tipo!=2) {
             int x=-1,y=0;
@@ -360,34 +370,50 @@ static int decodificar_slice(h264_decodificador *d,unsigned nal,int64_t tiempo) 
             salto=(int)h264_cabac_bin(&d->cabac,(d->sl.tipo==1?24:11)+(a&&!a->salto)+(b&&!b->salto));
         }
         int tipo=salto?0:h264_leer_mb_tipo(d);
+#if H264_TELEMETRIA_DETALLADA
         d->telemetria.ciclos_cabac_puro += (h264_rdtsc() - t_c0);
+#endif
 
         int intra=d->sl.tipo==2 ? tipo : d->sl.tipo==0 ? tipo-5 : tipo-23;
         if (salto || intra<0) {
+#if H264_TELEMETRIA_DETALLADA
             uint64_t t_i0 = h264_rdtsc();
+#endif
             if (!h264_inter(d,(unsigned)tipo,salto)) return 0;
+#if H264_TELEMETRIA_DETALLADA
             d->telemetria.ciclos_inter += (h264_rdtsc() - t_i0);
+#endif
         } else {
+#if H264_TELEMETRIA_DETALLADA
             uint64_t t_a0 = h264_rdtsc();
+#endif
             if (!h264_intra(d,(unsigned)intra)) return 0;
+#if H264_TELEMETRIA_DETALLADA
             d->telemetria.ciclos_intra += (h264_rdtsc() - t_a0);
+#endif
         }
         d->mb_completos++;
         unsigned fin=h264_cabac_terminar(&d->cabac);
         if (d->bits.error) return 0;
         if (fin) {
+#if H264_TELEMETRIA_DETALLADA
             uint64_t dt_mb = h264_rdtsc() - t_mb0;
             d->telemetria.ciclos_sintaxis_reconstruccion += dt_mb;
             if (dt_mb > d->telemetria.max_ciclos_sintaxis) d->telemetria.max_ciclos_sintaxis = dt_mb;
+#endif
             if(d->separar && !h264_reconstruccion_ejecutar(d,primero,d->mb_actual+1))return 0;
+#if H264_TELEMETRIA_DETALLADA
             dt_mb=h264_rdtsc()-t_mb0;
             if(dt_mb>d->telemetria.max_ciclos_sintaxis)d->telemetria.max_ciclos_sintaxis=dt_mb;
+#endif
             d->separar=0;return 1;
         }
     }
+#if H264_TELEMETRIA_DETALLADA
     uint64_t dt_mb = h264_rdtsc() - t_mb0;
     d->telemetria.ciclos_sintaxis_reconstruccion += dt_mb;
     if (dt_mb > d->telemetria.max_ciclos_sintaxis) d->telemetria.max_ciclos_sintaxis = dt_mb;
+#endif
     return 0;
 }
 

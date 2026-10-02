@@ -67,6 +67,8 @@ struct h264_decodificador {
     void *usuario_lote;
     unsigned trabajadores;
     int (*servicio_coordinador)(void *);
+    h264_traza_fn traza;
+    void *usuario_traza;
 };
 static inline h264_mb *h264_mb_actual(h264_decodificador *d) {
     return d->mb_privado?d->mb_privado:&d->actual->mb[d->mb_actual];

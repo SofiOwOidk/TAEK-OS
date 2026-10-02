@@ -186,6 +186,28 @@ static struct xhci_evento_pendiente g_evento_comando;
 static struct xhci_evento_pendiente g_eventos_transfer[XHCI_MAX_SLOTS + 1][32];
 static uint8_t g_cambio_puerto_pendiente;
 
+// --- TELEMETRIA DE TRANSFERENCIAS BULK (sin salida en el camino caliente) ---
+// Captura con marca TSC del primer evento de cada TRB de una transferencia
+// segmentada, para fechar el "primer DATA recibido" sin ambiguedad.
+#define XHCI_CAPTURA_EVENTOS_MAX 8
+// Longitud maxima por TRB Normal (campo Transfer Length de 17 bits: 131071).
+// Se usa 64 KiB por alineacion y margen; el resto se reparte en varios TRBs.
+#define XHCI_BULK_TRAMO_MAX 65536U
+struct xhci_captura_bulk {
+    int      activo;
+    uint8_t  slot;
+    uint8_t  dci;
+    uint32_t esperados;
+    uint32_t recibidos;
+    uint64_t ciclos[XHCI_CAPTURA_EVENTOS_MAX];
+    uint8_t  codigos[XHCI_CAPTURA_EVENTOS_MAX];
+};
+static struct xhci_captura_bulk g_captura_bulk;
+
+static uint64_t g_bulk_ciclos_espera = 0; // CPU ociosa en esperar_milisegundos
+static uint64_t g_bulk_ciclos_sondeo = 0; // MMIO/eventos en xhci_bombear_eventos
+static uint64_t g_ciclos_timbre = 0;      // doorbell (incluye su traza serial)
+
 // Transfer Ring para EP0 dedicado por cada ranura (Slot 1..XHCI_MAX_SLOTS)
 static volatile struct trb_xhci *g_slot_ep0_ring[XHCI_MAX_SLOTS + 1] = {0};
 static uint64_t                  g_slot_ep0_ring_fisica[XHCI_MAX_SLOTS + 1] = {0};
@@ -334,6 +356,7 @@ static uint32_t g_cmd_ring_wraparounds = 0;
 
 // Tocar timbre (Doorbell) con instrumentación nuclear de telemetría y mfence
 static inline void xhci_tocar_timbre(uint8_t slot, uint32_t ep_o_cmd) {
+    uint64_t t_costo0 = rdtsc();
     uint64_t tsc = rdtsc();
     uint64_t ms = tiempo_obtener_milisegundos();
     uint64_t reg_db = g_db_base + ((uint64_t)slot * 4);
@@ -351,6 +374,7 @@ static inline void xhci_tocar_timbre(uint8_t slot, uint32_t ep_o_cmd) {
     serial_imprimir_linea(")");
     mmio_escribir32(reg_db, ep_o_cmd);
     __asm__ volatile ("mfence" ::: "memory");
+    g_ciclos_timbre += rdtsc() - t_costo0;
 }
 
 static inline void xhci_sincronizar_evento_actual(void) {
@@ -412,6 +436,15 @@ static void xhci_bombear_eventos(void) {
             for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
                 if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id == slot &&
                     g_teclado_eps[e].ep_dci == dci) { es_hid = 1; break; }
+            }
+            if (g_captura_bulk.activo && !es_hid &&
+                g_captura_bulk.slot == slot && g_captura_bulk.dci == dci) {
+                if (g_captura_bulk.recibidos < XHCI_CAPTURA_EVENTOS_MAX) {
+                    g_captura_bulk.ciclos[g_captura_bulk.recibidos] = rdtsc();
+                    g_captura_bulk.codigos[g_captura_bulk.recibidos] = cc;
+                    g_captura_bulk.recibidos++;
+                }
+                continue;
             }
             if (es_hid) {
                 xhci_procesar_evento_hid(&evt);
@@ -1315,6 +1348,8 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
 }
 
+static int sondeo_breve;
+void xhci_configurar_sondeo_breve(int activo){sondeo_breve=activo;}
 void xhci_sondeo(void) {
     if (!g_estado.inicializado) return;
 
@@ -1324,7 +1359,7 @@ void xhci_sondeo(void) {
     static uint64_t g_ultimo_escaneo_puertos = 0;
     uint64_t ahora = tiempo_obtener_milisegundos();
     uint32_t usbsts = mmio_leer32(g_op_base + REG_OP_USBSTS);
-    if ((usbsts & USBSTS_PCD) || (ahora - g_ultimo_escaneo_puertos >= 200)) {
+    if (!sondeo_breve && ((usbsts & USBSTS_PCD) || (ahora - g_ultimo_escaneo_puertos >= 200))) {
         g_ultimo_escaneo_puertos = ahora;
         if (usbsts & USBSTS_PCD) {
             mmio_escribir32(g_op_base + REG_OP_USBSTS, USBSTS_PCD);
@@ -1333,7 +1368,7 @@ void xhci_sondeo(void) {
     }
 
     xhci_bombear_eventos();
-    if (g_cambio_puerto_pendiente) {
+    if (!sondeo_breve && g_cambio_puerto_pendiente) {
         g_cambio_puerto_pendiente = 0;
         xhci_escanear_cambios_puertos(1);
     }
@@ -1499,6 +1534,13 @@ static int xhci_transferencia_control(uint8_t slot_id, uint8_t tipo_peticion, ui
 int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms) {
     if (!g_estado.inicializado || slot_id == 0 || ep_dci == 0) return -1;
 
+    // Fuera del alcance de un unico TRB (17 bits): repartir en varios.
+    if (longitud > XHCI_BULK_TRAMO_MAX) {
+        return xhci_transferencia_bulk_segmentada(slot_id, ep_dci, buffer,
+                                                  buffer_fisica, longitud, es_in,
+                                                  0, timeout_ms, NULL, NULL);
+    }
+
     struct xhci_ep_bulk *bep = NULL;
     for (int i = 0; i < XHCI_MAX_BULK_EPS; i++) {
         if (g_bulk_eps[i].activo && g_bulk_eps[i].slot_id == slot_id && g_bulk_eps[i].ep_dci == ep_dci) {
@@ -1546,7 +1588,9 @@ int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint6
 
     int timeout = (timeout_ms > 0) ? timeout_ms : 2000;
     while (timeout > 0) {
+        uint64_t t_sondeo = rdtsc();
         xhci_bombear_eventos();
+        g_bulk_ciclos_sondeo += rdtsc() - t_sondeo;
         struct xhci_evento_pendiente *b = &g_eventos_transfer[slot_id][ep_dci];
         if (b->listo) {
             uint8_t codigo = (b->trb.estado >> 24) & 0xFF;
@@ -1558,12 +1602,140 @@ int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint6
             }
             return -(int)codigo;
         }
+        uint64_t t_espera = rdtsc();
         esperar_milisegundos(1);
+        g_bulk_ciclos_espera += rdtsc() - t_espera;
         timeout--;
     }
 
     serial_imprimir_linea("  [xHCI AVISO] Timeout en transferencia Bulk");
     return -99;
+}
+
+// Encola un TRB Normal en el anillo del endpoint Bulk, gestionando el enlace
+// de fin de anillo. Factoriza el mismo patron que usa la ruta no segmentada.
+static void xhci_encolar_bulk_trb(struct xhci_ep_bulk *bep, uint64_t phys,
+                                  uint32_t longitud, int es_in) {
+    volatile struct trb_xhci *trb = &bep->ring[bep->idx];
+    trb->parametro = phys;
+    trb->estado    = longitud;
+    uint32_t ctrl  = (TRB_TIPO_NORMAL << 10) | (1U << 5) /* IOC */ | (bep->cycle ? 1 : 0);
+    if (es_in) ctrl |= (1U << 2); // ISP: Interrupt on Short Packet
+    trb->control   = ctrl;
+
+    bep->idx++;
+    if (bep->idx >= XHCI_TAM_ANILLO - 1) {
+        volatile struct trb_xhci *link = &bep->ring[XHCI_TAM_ANILLO - 1];
+        link->parametro = bep->ring_fisica;
+        link->estado    = 0;
+        link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ | (bep->cycle ? 1 : 0);
+        dma_sincronizar_cpu_a_dispositivo((const void *)link, sizeof(*link));
+        bep->idx = 0;
+        bep->cycle = !bep->cycle;
+    }
+}
+
+// Transferencia Bulk segmentada: parte la fase de datos en un primer tramo con
+// su propio IOC (lo que fecha el "primer DATA recibido") y el resto. Encola
+// ambos TRBs y toca el timbre una sola vez, evitando burbujas entre tramos.
+// Los instantes de cada evento se entregan en ciclos TSC.
+int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
+                                       void *buffer, uint64_t buffer_fisica,
+                                       uint32_t longitud, int es_in,
+                                       uint32_t primer_tramo, int timeout_ms,
+                                       uint64_t *ciclos_primer_evento,
+                                       uint64_t *ciclos_fin_evento) {
+    if (ciclos_primer_evento) *ciclos_primer_evento = 0;
+    if (ciclos_fin_evento) *ciclos_fin_evento = 0;
+
+    if (!g_estado.inicializado || slot_id == 0 || ep_dci == 0) return -1;
+    if (longitud == 0) return -1;
+
+    struct xhci_ep_bulk *bep = NULL;
+    for (int i = 0; i < XHCI_MAX_BULK_EPS; i++) {
+        if (g_bulk_eps[i].activo && g_bulk_eps[i].slot_id == slot_id &&
+            g_bulk_eps[i].ep_dci == ep_dci) {
+            bep = &g_bulk_eps[i];
+            break;
+        }
+    }
+    if (!bep || !bep->ring) return -2;
+
+    if (!es_in && buffer && longitud > 0) {
+        dma_sincronizar_cpu_a_dispositivo(buffer, longitud);
+    }
+
+    // Reparte la transferencia en TRBs: el primer tramo opcional fecha el
+    // primer DATA; el resto va en bloques de a lo sumo XHCI_BULK_TRAMO_MAX.
+    uint32_t trbs = 0;
+    uint32_t resta = longitud;
+    if (primer_tramo > 0 && primer_tramo < longitud) {
+        xhci_encolar_bulk_trb(bep, buffer_fisica, primer_tramo, es_in);
+        trbs++;
+        resta -= primer_tramo;
+    }
+    while (resta > 0) {
+        uint32_t len = (resta > XHCI_BULK_TRAMO_MAX) ? XHCI_BULK_TRAMO_MAX : resta;
+        xhci_encolar_bulk_trb(bep, buffer_fisica + (longitud - resta), len, es_in);
+        trbs++;
+        resta -= len;
+    }
+    if (trbs == 0 || trbs > XHCI_CAPTURA_EVENTOS_MAX) return -3;
+
+    dma_sincronizar_cpu_a_dispositivo((const void *)bep->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
+    __asm__ volatile ("mfence" ::: "memory");
+
+    g_eventos_transfer[slot_id][ep_dci].listo = 0;
+    g_captura_bulk.activo = 1;
+    g_captura_bulk.slot = slot_id;
+    g_captura_bulk.dci = ep_dci;
+    g_captura_bulk.esperados = trbs;
+    g_captura_bulk.recibidos = 0;
+
+    xhci_tocar_timbre(slot_id, ep_dci);
+
+    int timeout = (timeout_ms > 0) ? timeout_ms : 2000;
+    while (timeout > 0 && g_captura_bulk.recibidos < trbs) {
+        uint64_t t_sondeo = rdtsc();
+        xhci_bombear_eventos();
+        g_bulk_ciclos_sondeo += rdtsc() - t_sondeo;
+        if (g_captura_bulk.recibidos >= trbs) break;
+        uint64_t t_espera = rdtsc();
+        esperar_milisegundos(1);
+        g_bulk_ciclos_espera += rdtsc() - t_espera;
+        timeout--;
+    }
+
+    int resultado = 0;
+    if (g_captura_bulk.recibidos < trbs) {
+        serial_imprimir_linea("  [xHCI AVISO] Timeout en transferencia Bulk segmentada");
+        g_captura_bulk.activo = 0;
+        return -99;
+    }
+
+    if (ciclos_primer_evento) *ciclos_primer_evento = g_captura_bulk.ciclos[0];
+    if (ciclos_fin_evento) *ciclos_fin_evento = g_captura_bulk.ciclos[trbs - 1];
+
+    for (uint32_t i = 0; i < trbs; i++) {
+        uint8_t cc = g_captura_bulk.codigos[i];
+        if (cc != 1 && cc != 13) { resultado = -(int)cc; break; }
+    }
+    if (resultado == 0 && es_in && buffer && longitud > 0) {
+        dma_sincronizar_dispositivo_a_cpu(buffer, longitud);
+    }
+
+    g_captura_bulk.activo = 0;
+    return resultado;
+}
+
+// --- TELEMETRIA EXPORTADA HACIA USB MSC ---
+uint64_t xhci_telemetria_espera_ciclos(void) { return g_bulk_ciclos_espera; }
+uint64_t xhci_telemetria_sondeo_ciclos(void) { return g_bulk_ciclos_sondeo; }
+uint64_t xhci_telemetria_timbre_ciclos(void) { return g_ciclos_timbre; }
+void     xhci_telemetria_reiniciar(void) {
+    g_bulk_ciclos_espera = 0;
+    g_bulk_ciclos_sondeo = 0;
+    g_ciclos_timbre = 0;
 }
 
 // Libera un Device Slot de hardware limpiando la entrada DCBAA y liberando búferes DMA (xHCI 1.2 §4.3.4)

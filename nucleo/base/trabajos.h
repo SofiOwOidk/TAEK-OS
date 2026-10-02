@@ -23,10 +23,13 @@ int trabajos_ejecutar(trabajo_fn, void *, unsigned, void (*servicio)(void *), vo
 unsigned trabajos_cpu_activas(void);
 unsigned trabajos_cpu_arrancadas(void);
 unsigned trabajos_cpu_detectadas(void);
+/* Reloj calibrado del ejecutor: 0 = BSP, 1..3 = AP. 0 si no hay dato. */
+uint64_t trabajos_ticks_por_ms(unsigned cpu);
 int trabajos_en_curso(void);
 void trabajos_cancelar_actual(void);
 int trabajos_iniciar(void);
 void trabajos_limitar_cpu(unsigned);
+int trabajos_configurar_distribucion(unsigned cpus,int bsp_calcula);
 int trabajos_es_coordinador(void);
 int trabajos_autoprueba(void);
 void trabajos_parar(void);

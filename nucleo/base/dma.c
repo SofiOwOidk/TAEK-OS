@@ -129,13 +129,13 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
     return NULL;
 }
 
-void dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes) {
+int dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes) {
     if (bytes == 0 || !dir_virtual || g_dma_total_paginas == 0 ||
         dir_fisica < g_dma_base_fisica || dir_fisica >= (g_dma_base_fisica + g_dma_tamano_bytes) ||
         ((dir_fisica - g_dma_base_fisica) % TAMANO_PAGINA) != 0 ||
         dir_virtual != (void *)(dir_fisica + memoria_obtener_hhdm_offset())) {
         serial_imprimir_linea("[DMA FATAL] Liberación fuera del arena o puntero incoherente.");
-        return;
+        return -1;
     }
 
     uint32_t inicio_bit = (uint32_t)((dir_fisica - g_dma_base_fisica) / TAMANO_PAGINA);
@@ -143,17 +143,17 @@ void dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t
         inicio_bit >= g_dma_total_paginas ||
         g_dma_tamano_asignacion[inicio_bit] != bytes) {
         serial_imprimir_linea("[DMA FATAL] Double free o tamaño de asignación incorrecto.");
-        return;
+        return -1;
     }
     uint32_t pags = (uint32_t)((bytes + TAMANO_PAGINA - 1) / TAMANO_PAGINA);
     if (pags > g_dma_total_paginas - inicio_bit) {
         serial_imprimir_linea("[DMA FATAL] Liberación excede el arena.");
-        return;
+        return -1;
     }
     for (uint32_t j = 0; j < pags; j++) {
         if (!bitmap_probar_bit(inicio_bit + j)) {
             serial_imprimir_linea("[DMA FATAL] Liberación duplicada o tamaño incorrecto.");
-            return;
+            return -1;
         }
     }
     g_dma_tamano_asignacion[inicio_bit] = 0;
@@ -173,6 +173,7 @@ void dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t
     if (g_dma_asignaciones_activas > 0) {
         g_dma_asignaciones_activas--;
     }
+    return 0;
 }
 
 void dma_sincronizar_cpu_a_dispositivo(const void *dir_virtual, uint64_t bytes) {

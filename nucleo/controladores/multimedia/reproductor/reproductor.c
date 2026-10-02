@@ -1,4 +1,11 @@
 #include "reproductor.h"
+#include "cola_muestras.h"
+#include "traza.h"
+#include "cache_fuente.h"
+#include "anillo_almacenamiento.h"
+#include "arquitectura/x86_64/pci.h"
+#include "controladores/usb_msc.h"
+#include "controladores/usb_msc_telemetria.h"
 #include "controladores/multimedia/mp4/mp4.h"
 #include "controladores/multimedia/h264/h264.h"
 #include "controladores/multimedia/aac/aac.h"
@@ -16,6 +23,10 @@
 #include "controladores/audio_ac97.h"
 #include "controladores/audio_hda.h"
 #include "controladores/vfs.h"
+#include "controladores/video/intel/intel_info.h"
+#include "controladores/video/intel/intel_diagnostico_ring0.h"
+#include "controladores/video/intel/i915_drv.h"
+#include "controladores/video/intel/i915_va.h"
 
 #ifndef TAEK_REVISION_CODIGO
 #define TAEK_REVISION_CODIGO "sin identificar"
@@ -36,6 +47,9 @@ static volatile struct limine_module_request peticion_video = {
 };
 /* Sólo el token de arranque smoke1080 activa este límite funcional de QEMU. */
 static unsigned muestras_funcionales;
+static unsigned diagnostico_cpu=4;
+static int diagnostico_coordinador;
+static unsigned diagnostico_lectura_kib=4;
 
 // Modos de ejecución soportados definidos en reproductor.h
 
@@ -114,6 +128,28 @@ typedef struct {
     mp4_contenedor    *mp4;
     int descriptor_vfs_video;
     int descriptor_vfs_audio;
+    cola_muestras *video_comprimido,*audio_comprimido;
+    traza_video *traza;
+    unsigned muestra_actual;
+    int64_t pts_actual;
+    mp4_lectura_posicional lector_original;
+    void *lector_contexto;
+    uint64_t ciclos_lectura, bytes_lectura, lecturas;
+    unsigned cuadros_tardios;
+    uint64_t ultimo_sondeo;
+    cache_fuente *cache;
+    anillo_almacenamiento *anillo;
+    uint64_t usb_comandos_inicio,usb_bytes_inicio;
+    unsigned muestra_lectura;
+    int64_t pts_lectura;
+    int pista_lectura;
+    uint64_t ultima_presentacion_ms;
+    int ya_presentado;
+    traza_video *pausa;
+    uint64_t pausa_inicio,pausa_fin;
+    uint64_t heap_inicial;
+    i915_va_sesion_t *va_sesion;
+    int usando_intel_va;
 } reproductor;
 
 typedef struct {
@@ -149,10 +185,49 @@ static void soltar(void *usuario, void *memoria) {
     liberar_memoria(c);
 }
 
+static void registrar(reproductor *p,unsigned etapa,uint64_t ini,uint64_t fin,uint64_t detalle) {
+    traza_registrar(p->traza,0,etapa,p->muestra_actual,p->pts_actual,ini,fin,detalle,
+                    audio_ac97_cola_ocupada(),p->presentaciones_pendientes);
+}
+static void observar_h264(void *u,unsigned cpu,unsigned etapa,int64_t pts,uint64_t ini,uint64_t fin,uint64_t detalle) {
+    reproductor *p=u;
+    /* AP no consulta hardware ni campos modificados por servicio BSP. */
+    traza_registrar(p->traza,cpu,etapa,p->muestra_actual,pts,ini,fin,detalle,0,0);
+}
+static void observar_indice(void *u,int pista,unsigned muestra,int64_t pts,uint64_t ini,uint64_t fin) {
+    reproductor *p=u;
+    p->muestra_lectura=muestra;p->pts_lectura=pts;p->pista_lectura=pista;
+    p->telem.ciclos_demux+=fin-ini;
+    traza_registrar(p->traza,0,TR_DEMUX,muestra,pts,ini,fin,pista,audio_ac97_cola_ocupada(),p->presentaciones_pendientes);
+}
+static int64_t leer_medido(void *u,int pista,uint64_t off,void *dst,size_t n) {
+    reproductor *p=u;uint64_t t=rdtsc();
+    /* Contrato verificable: no iniciar I/O si un lote posee filas/superficies. */
+    if(trabajos_en_curso()){p->error=1;return MP4_ERROR_LECTURA;}
+    int64_t r=p->lector_original(p->lector_contexto,pista,off,dst,n);
+    uint64_t fin=rdtsc();p->ciclos_lectura+=fin-t;p->lecturas++;
+    if(r>0)p->bytes_lectura+=(uint64_t)r;
+    traza_registrar(p->traza,0,TR_LECTURA,p->muestra_lectura,p->pts_lectura,t,fin,n,
+        audio_ac97_cola_ocupada(),p->presentaciones_pendientes);
+    return r;
+}
+
 static int atender(reproductor *p) {
     uint64_t t0 = rdtsc();
     xhci_sondeo();
     audio_ac97_actualizar();
+    if(p && p->descriptor_vfs_video>=0) {
+        struct vfs_descriptor_archivo *fd=vfs_obtener_descriptor(p->descriptor_vfs_video);
+        const struct usb_msc_dispositivo *d=fd?usb_msc_obtener_dispositivo(fd->unidad_msc):NULL;
+        if(!fd || fd->cancelado || !d || !d->activo || !d->listo || d->generacion!=fd->generacion_msc) {
+            int desconectado=!fd || !d || !d->activo || !d->listo || d->generacion!=fd->generacion_msc;
+            p->error=1;
+            if(!p->mp4->ultimo_error_lectura || desconectado)
+                p->mp4->ultimo_error_lectura=desconectado?VOLUMEN_DESCONECTADO:VOLUMEN_CANCELADO;
+            if(p->video_comprimido)p->video_comprimido->error=MP4_ERROR_LECTURA;
+            if(p->audio_comprimido)p->audio_comprimido->error=MP4_ERROR_LECTURA;
+        }
+    }
     while (teclado_hay_datos()) {
         char c = teclado_leer_caracter();
         if (c == 27 || c == 3 || c == 'q' || c == 'Q') {
@@ -173,8 +248,39 @@ static int atender(reproductor *p) {
     if (p) {
         p->telem.ciclos_hda_usb += dt;
         if (dt > p->telem.max_ciclos_hda_usb) p->telem.max_ciclos_hda_usb = dt;
+        registrar(p,TR_SERVICIO,t0,t0+dt,0);
     }
     return p ? p->cancelado : 0;
+}
+
+static int servicio_recarga(void *u){reproductor *p=u;return atender(p)||p->error;}
+static int validar_cache(void *u) {
+    reproductor *p=u;
+    if(servicio_recarga(p))return p->mp4->ultimo_error_lectura?(int)p->mp4->ultimo_error_lectura:VOLUMEN_CANCELADO;
+    return 0;
+}
+static void guardar_pausa(reproductor *p,uint64_t ini,uint64_t fin) {
+    uint64_t c_ms=tiempo_ciclos_por_ms();
+    if(p->pausa && p->traza && c_ms && fin-ini>=150*c_ms && fin-ini>p->pausa_fin-p->pausa_inicio) {
+        /* Sólo entre lotes, después de adquirir las terminaciones de los AP. */
+        memcpy(p->pausa,p->traza,sizeof(*p->pausa));p->pausa_inicio=ini;p->pausa_fin=fin;
+    }
+}
+static int recargar(reproductor *p,int video) {
+    cola_muestras *q=video?p->video_comprimido:p->audio_comprimido;
+    if(!q)return 1;
+    if(q->cantidad>=(video?2u:32u))return 1;
+    uint64_t ini=rdtsc();
+    int r=cola_muestras_recargar(q,video?4:64,servicio_recarga,p);
+    guardar_pausa(p,ini,rdtsc());
+    if(r<0){p->error=1;if(q->cursor.ultimo_error_lectura)p->mp4->ultimo_error_lectura=q->cursor.ultimo_error_lectura;}
+    return r;
+}
+static int siguiente_audio(reproductor *p,const uint8_t **d,size_t *n,int64_t *pts) {
+    if(!p->audio_comprimido)return mp4_siguiente_audio(p->mp4,d,n,pts);
+    int r=cola_muestras_tomar(p->audio_comprimido,d,n,pts,NULL);
+    if(r>0)p->mp4->a_indice++;
+    return r;
 }
 
 // PCM estéreo S16 44.1 kHz del dispositivo: objetivo 750 ms, servicio prioritario.
@@ -193,7 +299,7 @@ static void reproductor_alimentar_audio(reproductor *p) {
         size_t bytes_audio;
         int64_t pts_audio;
         uint64_t t_da0 = rdtsc();
-        int res_a = mp4_siguiente_audio(p->mp4, &datos_audio, &bytes_audio, &pts_audio);
+        int res_a = siguiente_audio(p, &datos_audio, &bytes_audio, &pts_audio);
         uint64_t dt_da = rdtsc() - t_da0;
         p->telem.ciclos_demux += dt_da;
         if (dt_da > p->telem.max_ciclos_demux) p->telem.max_ciclos_demux = dt_da;
@@ -209,6 +315,7 @@ static void reproductor_alimentar_audio(reproductor *p) {
         uint64_t dt_aac = rdtsc() - t_aac0;
         p->telem.ciclos_aac += dt_aac;
         if (dt_aac > p->telem.max_ciclos_aac) p->telem.max_ciclos_aac = dt_aac;
+        registrar(p,TR_AAC,t_aac0,t_aac0+dt_aac,bytes_audio);
 
         if (s > 0) {
             uint32_t pcm_bytes = (uint32_t)(s * sizeof(int16_t));
@@ -416,16 +523,22 @@ static int presentar_pendiente(reproductor *p,int esperar) {
             if (c_ms_pts == 0) c_ms_pts = 2500000;
             uint64_t max_ciclos_espera = c_ms_pts * 500ULL; // 500 ms máximo de seguridad
             uint64_t t_pts0 = rdtsc();
+            uint64_t trabajo_pts=0;
 
             while (1) {
                 uint64_t t_act = reloj_maestro(p);
                 if (t_act >= destino) break;
                 if ((rdtsc() - t_pts0) >= max_ciclos_espera) break;
+                uint64_t t_trabajo=rdtsc();
                 if (atender(p)) return 1;
+                if(recargar(p,0)<0)return 1;
                 reproductor_alimentar_audio(p);
+                trabajo_pts+=rdtsc()-t_trabajo;
                 esperar_microsegundos(200);
             }
-            uint64_t dt_pts = rdtsc() - t_pts0;
+            uint64_t fin_pts=rdtsc();
+            uint64_t dt_pts = fin_pts-t_pts0>trabajo_pts?fin_pts-t_pts0-trabajo_pts:0;
+            registrar(p,TR_PTS,t_pts0,fin_pts,trabajo_pts);
             p->telem.ciclos_espera_pts += dt_pts;
             if (dt_pts > p->telem.max_ciclos_espera_pts) p->telem.max_ciclos_espera_pts = dt_pts;
             p->ciclos_espera_pts_ultimo_cuadro = dt_pts;
@@ -433,6 +546,17 @@ static int presentar_pendiente(reproductor *p,int esperar) {
             uint64_t retraso_us = (ahora - destino) * 1000;
             p->telem.retraso_pts_acumulado_us += retraso_us;
             if (retraso_us > p->telem.retraso_pts_max_us) p->telem.retraso_pts_max_us = retraso_us;
+            /* Caduca una presentación, jamás la decodificación/referencias.
+             * Tolerancia dos períodos nominales de la pista. */
+            uint64_t periodo=p->mp4->v_muestras?
+                p->mp4->v_duracion_ticks*1000/p->escala/p->mp4->v_muestras:42;
+            if(!periodo)periodo=42;
+            if(ahora-destino>2*periodo &&
+               (p->presentaciones_pendientes>1 || (p->ya_presentado && ahora-p->ultima_presentacion_ms<periodo))) {
+                registrar(p,TR_DESCARTADO,rdtsc(),rdtsc(),ahora-destino);
+                p->cuadros_tardios++;p->presentaciones_cabeza^=1;p->presentaciones_pendientes--;
+                return 0;
+            }
         }
     }
 
@@ -440,14 +564,21 @@ static int presentar_pendiente(reproductor *p,int esperar) {
     uint64_t t=rdtsc();
     pantalla_dibujar_imagen_centrada((int)p->ancho,(int)p->alto,p->rgb+(size_t)p->presentaciones_cabeza*p->ancho*p->alto);
     uint64_t dt=rdtsc()-t;p->telem.ciclos_copia_fb+=dt;
+    traza_registrar(p->traza,0,TR_FRAMEBUFFER,p->muestra_actual,p->presentaciones_pts[p->presentaciones_cabeza],
+        t,t+dt,0,audio_ac97_cola_ocupada(),p->presentaciones_pendientes);
+    p->ultima_presentacion_ms=reloj_maestro(p);p->ya_presentado=1;
     if(dt>p->telem.max_ciclos_copia_fb)p->telem.max_ciclos_copia_fb=dt;
     p->telem.cuadros_presentados++;p->presentaciones_cabeza^=1;p->presentaciones_pendientes--;
     return 0;
 }
 static int servir_coordinador(void *u) {
     reproductor *p=u;
-    atender(p);reproductor_alimentar_audio(p);
-    if(!p->cancelado && !p->error && presentar_pendiente(p,0))p->error=1;
+    /* Callback dentro de filas: sólo sondeo y cancelación. No leer, AAC,
+     * esperar PCM ni copiar framebuffer mientras se posee una dependencia. */
+    uint64_t ahora=rdtsc(),c_ms=tiempo_ciclos_por_ms();
+    if(ahora-p->ultimo_sondeo>=(c_ms?c_ms:2500000)) {
+        xhci_configurar_sondeo_breve(1);atender(p);xhci_configurar_sondeo_breve(0);p->ultimo_sondeo=ahora;
+    }
     if(p->cancelado || p->error){h264_cancelar_trabajadores(p->dec_video);trabajos_cancelar_actual();}
     return p->cancelado || p->error;
 }
@@ -457,10 +588,11 @@ static int ejecutar_lote(void *u,h264_region_fn f,void *ctx,unsigned n) {
     int ok=trabajos_ejecutar(f,ctx,n,servir_lote,p);
     return ok && !p->cancelado && !p->error;
 }
-typedef struct {const h264_imagen *im;uint32_t *rgb;unsigned w,h,n;int sse2;} rgb_lote;
+typedef struct {const h264_imagen *im;uint32_t *rgb;unsigned w,h,n;int sse2;reproductor *p;} rgb_lote;
 static void convertir_region(void *u,unsigned i,unsigned cpu) {
-    (void)cpu;rgb_lote *r=u;
+    rgb_lote *r=u;uint64_t t=rdtsc();
     h264_convertir_rgb_region(r->im,r->rgb,r->w,r->h,r->h*i/r->n,r->h*(i+1)/r->n,r->sse2);
+    observar_h264(r->p,cpu,TR_CONVERSION,r->im->marca_tiempo,t,rdtsc(),i);
 }
 
 static int presentar(void *usuario, const h264_imagen *im) {
@@ -511,10 +643,12 @@ static int presentar(void *usuario, const h264_imagen *im) {
         unsigned slot=(p->presentaciones_cabeza+p->presentaciones_pendientes)&1;
         uint32_t *destino_rgb=p->rgb+(size_t)slot*w*h;
         unsigned n=trabajos_cpu_activas();
-        rgb_lote r={im,destino_rgb,w,h,n,H264_INTER_SSE2&&x86_64_fpu_sse2_lista()};
+        rgb_lote r={im,destino_rgb,w,h,n,H264_INTER_SSE2&&x86_64_fpu_sse2_lista(),p};
         if(!ejecutar_lote(p,convertir_region,&r,n)){p->error=1;return 1;}
         p->presentaciones_pts[slot]=im->marca_tiempo;p->presentaciones_pendientes++;
         uint64_t dt_rgb = rdtsc() - t_rgb0;
+        traza_registrar(p->traza,0,TR_CONVERSION,p->muestra_actual,im->marca_tiempo,t_rgb0,t_rgb0+dt_rgb,0,audio_ac97_cola_ocupada(),p->presentaciones_pendientes);
+        traza_registrar(p->traza,0,TR_LISTO,p->muestra_actual,im->marca_tiempo,t_rgb0+dt_rgb,t_rgb0+dt_rgb,0,audio_ac97_cola_ocupada(),p->presentaciones_pendientes);
         p->telem.ciclos_yuv_rgb += dt_rgb;
         if (dt_rgb > p->telem.max_ciclos_yuv_rgb) p->telem.max_ciclos_yuv_rgb = dt_rgb;
 
@@ -702,20 +836,30 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     } else {
         telem_print("0.00%");
     }
-    telem_println(")");
+    telem_println(" del total decodificado)");
 
-    telem_print("  Cuadros Omitidos      : ");
+    telem_print("  Descartes por Tardanza : ");
+    telem_print_dec(p->cuadros_tardios);
+    telem_println(" (LATE_DROPS; sólo presentación, jamás decodificación)");
+
+    telem_print("  Omitidos sin Presentar : ");
     telem_print_dec(p->telem.cuadros_omitidos);
-    telem_println("");
+    telem_println(" (otros: p. ej. presentación selectiva forense)");
 
     if (duracion_total_ms > 0) {
-        uint64_t fps_ent = (uint64_t)p->telem.cuadros_decodificados * 1000 / duracion_total_ms;
-        uint64_t fps_dec = ((uint64_t)p->telem.cuadros_decodificados * 100000 / duracion_total_ms) % 100;
-        telem_print("  Rendimiento Efectivo  : ");
-        telem_print_dec(fps_ent);
-        telem_print(".");
-        if (fps_dec < 10) telem_print("0");
-        telem_print_dec(fps_dec);
+        uint64_t fpsd_ent = (uint64_t)p->telem.cuadros_decodificados * 1000 / duracion_total_ms;
+        uint64_t fpsd_dec = ((uint64_t)p->telem.cuadros_decodificados * 100000 / duracion_total_ms) % 100;
+        uint64_t fpsp_ent = (uint64_t)p->telem.cuadros_presentados * 1000 / duracion_total_ms;
+        uint64_t fpsp_dec = ((uint64_t)p->telem.cuadros_presentados * 100000 / duracion_total_ms) % 100;
+        telem_print("  FPS Decodificados     : ");
+        telem_print_dec(fpsd_ent);telem_print(".");
+        if (fpsd_dec < 10) telem_print("0");
+        telem_print_dec(fpsd_dec);
+        telem_println(" FPS");
+        telem_print("  FPS Presentados       : ");
+        telem_print_dec(fpsp_ent);telem_print(".");
+        if (fpsp_dec < 10) telem_print("0");
+        telem_print_dec(fpsp_dec);
         telem_println(" FPS");
     }
 
@@ -730,13 +874,16 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     }
     telem_println("---------------------------------------------------------------------------------");
 
-    telem_println("DESGLOSE DE TIEMPOS POR ETAPA (NO ANIDADOS):");
-    telem_println("  Etapa                     |  Ciclos Totales   |  Tiempo (ms)  |  % Tiempo  |  Máx Cuadro");
+    telem_println("DESGLOSE DE TIEMPOS POR ETAPA (INTERVALOS INCLUSIVOS; NO SUMAR ENTRE SÍ):");
+    telem_println("  Etapa                     |  Ciclos Totales   |  Tiempo (ms)  |  % Pared   |  Máx Cuadro");
     telem_println("  --------------------------+-------------------+---------------+------------+------------");
     telem_print_fila_etapa("1. Demux MP4", p->telem.ciclos_demux, p->telem.max_ciclos_demux, ciclos_activos, c_ms);
     telem_print_fila_etapa("2. Decodificación AAC", p->telem.ciclos_aac, p->telem.max_ciclos_aac, ciclos_activos, c_ms);
-    telem_print_fila_etapa("3. CABAC / Sintaxis / Rec", p->telem.ciclos_cabac_reconstruccion, p->telem.max_ciclos_cabac, ciclos_activos, c_ms);
-    telem_print_fila_etapa("   - CABAC Sintaxis Pura", p->telem.ciclos_cabac_puro, 0, ciclos_activos, c_ms);
+    telem_print_fila_etapa("3. Pared sintaxis+recon", p->telem.ciclos_cabac_reconstruccion, p->telem.max_ciclos_cabac, ciclos_activos, c_ms);
+    telem_print_fila_etapa("   - CABAC Sintaxis pura", p->telem.ciclos_cabac_puro, 0, ciclos_activos, c_ms);
+    telem_print_fila_etapa("   - Reconstrucción pared", ht.ciclos_reconstruccion_pared, 0, ciclos_activos, c_ms);
+    telem_print_fila_etapa("   - Cómputo trabajadores", ht.ciclos_reconstruccion_cpu, 0, ciclos_activos, c_ms);
+    telem_print_fila_etapa("   - Dependencias AP", ht.ciclos_dependencias_cpu, 0, 0, c_ms);
     telem_print_fila_etapa("   - Inter / Compensación", p->telem.ciclos_inter, 0, ciclos_activos, c_ms);
     telem_print_fila_etapa("   - Intra / Predicción", p->telem.ciclos_intra, 0, ciclos_activos, c_ms);
     telem_print_fila_etapa("4. Desbloqueo (Deblocking)", p->telem.ciclos_desbloqueo, p->telem.max_ciclos_desbloqueo, ciclos_activos, c_ms);
@@ -747,6 +894,37 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     if (p->modo == MODO_PRUEBA_FORENSE) {
         telem_print_fila_etapa("9. Hash FNV-1a (Forense)", p->telem.ciclos_hash, p->telem.max_ciclos_hash, ciclos_activos, c_ms);
     }
+    telem_println("---------------------------------------------------------------------------------");
+
+    telem_println("DESBLOQUEO POR COMPONENTE (C1):");
+    telem_print("  Segmentos evaluados/filtrados/desc.: ");
+    telem_print_dec(ht.deblock_bordes_evaluados);telem_print(" / ");
+    telem_print_dec(ht.deblock_bordes_filtrados);telem_print(" / ");
+    telem_print_dec(ht.deblock_bordes_descartados);telem_println("");
+    telem_print("  Filtrados H / V ; Luma / Croma    : ");
+    telem_print_dec(ht.deblock_filtrados_h);telem_print(" / ");
+    telem_print_dec(ht.deblock_filtrados_v);telem_print(" ; ");
+    telem_print_dec(ht.deblock_luma);telem_print(" / ");
+    telem_print_dec(ht.deblock_croma);telem_println("");
+    telem_print("  Fuerza tipo / nz / movimiento     : ");
+    telem_print_dec(ht.deblock_fuerza_tipo);telem_print(" / ");
+    telem_print_dec(ht.deblock_fuerza_nz);telem_print(" / ");
+    telem_print_dec(ht.deblock_fuerza_movimiento);telem_println("");
+    telem_print("  Saltos MB filtro/marco/8x8/slice  : ");
+    telem_print_dec(ht.deblock_skip_filtro);telem_print(" / ");
+    telem_print_dec(ht.deblock_skip_marco);telem_print(" / ");
+    telem_print_dec(ht.deblock_skip_8x8);telem_print(" / ");
+    telem_print_dec(ht.deblock_skip_slice);telem_println("");
+    telem_print("  Kernel SSE2 / escalar             : ");
+    telem_print_dec(ht.deblock_kernel_sse2);telem_print(" / ");
+    telem_print_dec(ht.deblock_kernel_escalar);telem_println("");
+    telem_print("  Ciclos fuerza / kernel (H / V)    : ");
+    telem_print_ms(ht.ciclos_deblock_fuerza, c_ms);telem_print(" / ");
+    telem_print_ms(ht.ciclos_deblock_kernel, c_ms);telem_print(" (");
+    telem_print_ms(ht.ciclos_deblock_h, c_ms);telem_print(" / ");
+    telem_print_ms(ht.ciclos_deblock_v, c_ms);
+    telem_println(") ms");
+    telem_println("  (ciclos por componente sólo con telemetría detallada; los recuentos siempre)");
     telem_println("---------------------------------------------------------------------------------");
 
     telem_println("MÉTRICAS DE CAMINO CRÍTICO Y LATENCIA:");
@@ -827,12 +1005,156 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     telem_print_dec(p->telem.silencio_insertado_bytes);
     telem_println(" bytes de relleno");
 
+    telem_print("  Silencio en Pista / Tras EOF   : ");
+    telem_print_dec(p->silencio_en_pista);
+    telem_print(" bytes / ");
+    telem_print_dec(p->silencio_despues_eof);
+    telem_println(" bytes");
+
     telem_print("  Vaciados de Búfer Registrados  : ");
     telem_print_dec(p->telem.vaciados_audio);
+    telem_print(" (En pista: ");
+    telem_print_dec(p->vaciados_en_pista);
+    telem_print(", Tras EOF: ");
+    telem_print_dec(p->vaciados_eof);
+    telem_println(")");
+    telem_println("---------------------------------------------------------------------------------");
+
+    telem_println("PIPELINE I/O Y ALMACENAMIENTO:");
+    telem_print("  Origen de la Fuente            : ");
+    telem_println(p->lector_original ? "USB / VFS Progresivo" : "RAM (Memoria Directa)");
+
+    telem_print("  Tiempo de Lectura a la Fuente  : ");
+    telem_print_ms(p->ciclos_lectura, c_ms);
+    telem_print(" (");
+    telem_print_dec(p->bytes_lectura);
+    telem_print(" bytes en ");
+    telem_print_dec(p->lecturas);
+    telem_println(" llamadas)");
+
+    uint64_t cmd_usb = 0, bytes_usb = 0;
+    usb_msc_obtener_lecturas(&cmd_usb, &bytes_usb);
+    uint64_t cmd_sesion = cmd_usb - p->usb_comandos_inicio;
+    uint64_t b_sesion = bytes_usb - p->usb_bytes_inicio;
+    telem_print("  Comandos USB READ(10)          : ");
+    telem_print_dec(cmd_sesion);
+    telem_print(" comandos (");
+    telem_print_dec(b_sesion);
+    telem_println(" bytes fisicos)");
+
+    if (p->anillo) {
+        telem_print("  Anillo almac. (productor/consumidor): ");
+        telem_print_dec(p->anillo->aciertos);
+        telem_print(" aciertos; ");
+        telem_print_dec(p->anillo->starvations);
+        telem_print(" starvations; ");
+        telem_print_dec(p->anillo->productor_paradas);
+        telem_print(" prod. paradas; ");
+        telem_print_dec(p->anillo->bloques_leidos);
+        telem_println(" bloques prefetched");
+        telem_print("    - margen prefetch min/media/max  : ");
+        telem_print_dec(p->anillo->margen_muestras ? p->anillo->margen_min : 0);
+        telem_print(" / ");
+        telem_print_dec(p->anillo->margen_muestras ? p->anillo->margen_suma / p->anillo->margen_muestras : 0);
+        telem_print(" / ");
+        telem_print_dec(p->anillo->margen_max);
+        telem_println(" bytes");
+        telem_print("    - bytes prefetched utiles/inutiles: ");
+        telem_print_dec(p->anillo->bytes_utiles);
+        telem_print(" / ");
+        telem_print_dec(p->anillo->bytes_inutiles);
+        telem_println(" bytes");
+    }
+
+    telem_print("  Ventana I/O / Modo BSP         : ");
+    telem_print_dec(diagnostico_lectura_kib);
+    telem_print(" KiB");
+    if (diagnostico_lectura_kib == 4) telem_print(" (referencia de comparación)");
+    telem_print(" / ");
+    telem_println((!diagnostico_coordinador || trabajos_cpu_activas() == 1) ? "BSP Calcula" : "BSP Coordinador");
+
+    telem_print("  Fallos de Disponibilidad (Miss): Video: ");
+    telem_print_dec(p->video_comprimido ? p->video_comprimido->faltantes : 0);
+    telem_print(" | Audio: ");
+    telem_print_dec(p->audio_comprimido ? p->audio_comprimido->faltantes : 0);
     telem_println("");
+
+    telem_print("  Cuadros Tardios Descartados    : ");
+    telem_print_dec(p->cuadros_tardios);
+    telem_println(" (LATE_DROPS)");
+    telem_println("---------------------------------------------------------------------------------");
+
+    telem_println("PARALELISMO Y COORDINACIÓN DE RECONSTRUCCIÓN:");
+    telem_print("  Trabajadores Activos           : ");
+    telem_print_dec(trabajos_cpu_activas());
+    telem_print(" CPUs (");
+    telem_println((!diagnostico_coordinador || trabajos_cpu_activas() == 1) ? "BSP participando en cálculo" : "BSP exclusivo coordinador");
+
+    telem_print("  Pared de Reconstrucción (Wall) : ");
+    telem_print_ms(ht.ciclos_reconstruccion_pared, c_ms);
+    telem_print(" (");
+    telem_print_dec(ht.lotes_reconstruccion);
+    telem_print(" lotes, ");
+    telem_print_dec(ht.regiones_reconstruccion);
+    telem_print(" filas)");
+    telem_println("");
+
+    telem_print("  Cómputo Total de CPUs en Filas : ");
+    telem_print_ms(ht.ciclos_reconstruccion_cpu, c_ms);
+    telem_println(" (suma entre trabajadores; usar su reloj)");
+
+    telem_print("  Espera por Dependencias (AP)   : ");
+    telem_print_ms(ht.ciclos_dependencias_cpu, c_ms);
+    telem_println("");
+
+    telem_print("  Regiones OK / Despachadas      : ");
+    telem_print_dec(ht.regiones_ok_reconstruccion);
+    telem_print(" / ");
+    telem_print_dec(ht.regiones_reconstruccion);
+    if (ht.regiones_ok_reconstruccion == ht.regiones_reconstruccion) {
+        telem_println(" (exactamente una vez)");
+    } else {
+        telem_println(" [ANOMALÍA: región perdida o duplicada]");
+    }
+
+    telem_print("  Regiones Duplicadas / Faltantes: ");
+    telem_print_dec(ht.regiones_duplicadas);
+    telem_print(" / ");
+    telem_print_dec(ht.regiones_faltantes);
+    telem_println("");
+
+    telem_print("  Relación Cómputo/Pared (peor)  : ");
+    telem_print_dec(ht.ratio_worst_miles / 1000);
+    telem_print(".");
+    telem_print_dec(ht.ratio_worst_miles % 1000);
+    telem_print(" x; límite ");
+    telem_print_dec(ht.trabajadores);
+    telem_print(" x; lotes incoherentes: ");
+    telem_print_dec(ht.lotes_incoherentes);
+    telem_println(ht.lotes_incoherentes ? " [REVISAR RELOJES POR CPU]" : " [coherente]");
+
+    for (unsigned i = 0; i < ht.trabajadores && i < 4; i++) {
+        telem_print("    Ejecutor ");
+        telem_print_dec(i);
+        telem_print(": regiones=");
+        telem_print_dec(ht.regiones_ejecutor[i]);
+        telem_print(" pared=");
+        telem_print_ms(ht.pared_ejecutor[i], c_ms);
+        telem_print(" ms cómputo=");
+        telem_print_ms(ht.computo_ejecutor[i], c_ms);
+        telem_print(" ms espera=");
+        telem_print_ms(ht.espera_ejecutor[i], c_ms);
+        telem_print(" ms; TSC=");
+        telem_print_dec(trabajos_ticks_por_ms(i));
+        telem_println(" ciclos/ms");
+    }
     telem_println("---------------------------------------------------------------------------------");
 
     telem_println("MEMORIA DEL SISTEMA:");
+    telem_print("  Heap antes de comenzar         : ");
+    telem_print_dec(p->heap_inicial);
+    telem_println(" bytes (referencia base de la sesión)");
+
     telem_print("  Memoria Máxima Dinámica en Uso : ");
     telem_print_dec(p->memoria_maxima / (1024 * 1024));
     telem_print(" MB (");
@@ -842,6 +1164,18 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     telem_print("  Memoria Remanente sin Liberar  : ");
     telem_print_dec(p->memoria_usada);
     telem_println(" bytes");
+
+    memoria_estadisticas_t mem_actual;
+    memoria_obtener_estadisticas(&mem_actual);
+    uint64_t heap_delta = mem_actual.heap_bytes_en_uso >= p->heap_inicial ?
+                          mem_actual.heap_bytes_en_uso - p->heap_inicial : 0;
+    telem_print("  Heap al terminar la sesión     : ");
+    telem_print_dec(mem_actual.heap_bytes_en_uso);
+    telem_println(" bytes (antes de liberar buffers)");
+
+    telem_print("  Delta de Heap durante Sesión   : ");
+    telem_print_dec(heap_delta);
+    telem_println(" bytes (HEAP_DELTA en el informe final tras liberar)");
 
     telem_print("  Integridad de Canarios de Heap : ");
     if (memoria_verificar_integridad()) {
@@ -859,10 +1193,36 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     x86_64_capacidades_simd simd_cpu=x86_64_fpu_capacidades_cpu();
     serial_imprimir("[BENCHMARK] AVX2_CPUID=");serial_imprimir_dec(simd_cpu.avx2);
     serial_imprimir(" YMM_ENABLED=");serial_imprimir_dec(simd_cpu.ymm_habilitado);serial_imprimir_linea(" AVX2_SELECTED=0");
+    serial_imprimir("[BENCHMARK] TELEMETRIA_DETALLADA=");serial_imprimir_dec(H264_TELEMETRIA_DETALLADA);serial_imprimir_linea("");
     serial_imprimir("[BENCHMARK] CLOCK_SCOPE=BSP_WALL_CYCLES WORKER_CPU_CYCLES=");
     serial_imprimir_dec(ht.ciclos_reconstruccion_cpu);serial_imprimir(" RECON_WALL_CYCLES=");
     serial_imprimir_dec(ht.ciclos_reconstruccion_pared);serial_imprimir(" DEPENDENCY_CPU_CYCLES=");
     serial_imprimir_dec(ht.ciclos_dependencias_cpu);serial_imprimir_linea("");
+    serial_imprimir("[BENCHMARK] RECON_LOTES=");serial_imprimir_dec(ht.lotes_reconstruccion);
+    serial_imprimir(" RECON_REGIONES=");serial_imprimir_dec(ht.regiones_reconstruccion);
+    serial_imprimir(" RECON_REGIONES_OK=");serial_imprimir_dec(ht.regiones_ok_reconstruccion);
+    serial_imprimir(" RECON_REGIONES_DUP=");serial_imprimir_dec(ht.regiones_duplicadas);
+    serial_imprimir(" RECON_REGIONES_FALTA=");serial_imprimir_dec(ht.regiones_faltantes);
+    serial_imprimir(" RECON_PARTICIPANTES=");serial_imprimir_dec(ht.trabajadores);
+    serial_imprimir(" RECON_RATIO_MILES=");serial_imprimir_dec(ht.ratio_worst_miles);
+    serial_imprimir(" RECON_INCOHERENTES=");serial_imprimir_dec(ht.lotes_incoherentes);
+    serial_imprimir_linea("");
+    for(unsigned i=0;i<ht.trabajadores && i<4;i++){
+        serial_imprimir("[BENCHMARK] RECON_EJECUTOR=");serial_imprimir_dec(i);
+        serial_imprimir(" REGIONES=");serial_imprimir_dec(ht.regiones_ejecutor[i]);
+        serial_imprimir(" PARED=");serial_imprimir_dec(ht.pared_ejecutor[i]);
+        serial_imprimir(" COMPUTO=");serial_imprimir_dec(ht.computo_ejecutor[i]);
+        serial_imprimir(" ESPERA=");serial_imprimir_dec(ht.espera_ejecutor[i]);
+        serial_imprimir(" TICKS_PER_MS=");serial_imprimir_dec(trabajos_ticks_por_ms(i));
+        serial_imprimir_linea("");
+    }
+    serial_imprimir("[BENCHMARK] FPS_DECODIFICADOS_MILES=");
+    serial_imprimir_dec(duracion_total_ms?((uint64_t)p->telem.cuadros_decodificados*100000/duracion_total_ms):0);
+    serial_imprimir(" FPS_PRESENTADOS_MILES=");
+    serial_imprimir_dec(duracion_total_ms?((uint64_t)p->telem.cuadros_presentados*100000/duracion_total_ms):0);
+    serial_imprimir(" LATE_DROPS=");serial_imprimir_dec(p->cuadros_tardios);
+    serial_imprimir(" OMITIDOS=");serial_imprimir_dec(p->telem.cuadros_omitidos);
+    serial_imprimir_linea("");
     serial_imprimir("[BENCHMARK] SESSION_WALL_CYCLES=");serial_imprimir_dec(p->telem.ciclos_pared_sesion);
     serial_imprimir(" ACTIVE_WALL_CYCLES=");serial_imprimir_dec(ciclos_activos);serial_imprimir_linea(" SERVICE_OVERLAP=1");
     serial_imprimir("[BENCHMARK] TRANSFORM_CYCLES=");serial_imprimir_dec(ht.ciclos_transformadas);
@@ -875,7 +1235,8 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     serial_imprimir(" AUDIO_EOF_EVENTS=");serial_imprimir_dec(p->vaciados_eof);
     serial_imprimir(" SILENCE_TRACK_BYTES=");serial_imprimir_dec(p->silencio_en_pista);
     serial_imprimir(" SILENCE_EOF_BYTES=");serial_imprimir_dec(p->silencio_despues_eof);
-    serial_imprimir_linea(" AUDIO_TARGET_MS=750 AUDIO_LOW_MS=450 LATE_POLICY=PRESENT_ALL RGB_QUEUE=2");
+    serial_imprimir(" AUDIO_TARGET_MS=750 AUDIO_LOW_MS=450 LATE_POLICY=");
+    serial_imprimir_linea(p->modo==MODO_INTERACTIVO?"DROP_STALE RGB_QUEUE=2":"PRESENT_ALL RGB_QUEUE=2");
 #if H264_PERFIL_INTER
     static const char *etapas_inter[H264_INTER_ETAPAS]={"ENTERO","HORIZONTAL","VERTICAL","DIAGONAL_CRUZADA",
         "CROMA","SIMPLE","DOBLE","PONDERADA","BORDES"};
@@ -925,6 +1286,29 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     serial_imprimir(" ESPERA_PTS_CICLOS="); serial_imprimir_dec(p->telem.ciclos_espera_pts);
     serial_imprimir(" HDA_USB_CICLOS="); serial_imprimir_dec(p->telem.ciclos_hda_usb);
     serial_imprimir_linea("");
+    serial_imprimir("[BENCHMARK] DEBLOCK_SEG_EVAL=");serial_imprimir_dec(ht.deblock_bordes_evaluados);
+    serial_imprimir(" DEBLOCK_SEG_FILT=");serial_imprimir_dec(ht.deblock_bordes_filtrados);
+    serial_imprimir(" DEBLOCK_SEG_DESC=");serial_imprimir_dec(ht.deblock_bordes_descartados);
+    serial_imprimir(" DEBLOCK_H=");serial_imprimir_dec(ht.deblock_filtrados_h);
+    serial_imprimir(" DEBLOCK_V=");serial_imprimir_dec(ht.deblock_filtrados_v);
+    serial_imprimir(" DEBLOCK_LUMA=");serial_imprimir_dec(ht.deblock_luma);
+    serial_imprimir(" DEBLOCK_CROMA=");serial_imprimir_dec(ht.deblock_croma);
+    serial_imprimir_linea("");
+    serial_imprimir("[BENCHMARK] DEBLOCK_FUERZA_TIPO=");serial_imprimir_dec(ht.deblock_fuerza_tipo);
+    serial_imprimir(" DEBLOCK_FUERZA_NZ=");serial_imprimir_dec(ht.deblock_fuerza_nz);
+    serial_imprimir(" DEBLOCK_FUERZA_MOV=");serial_imprimir_dec(ht.deblock_fuerza_movimiento);
+    serial_imprimir(" DEBLOCK_SKIP_FILTRO=");serial_imprimir_dec(ht.deblock_skip_filtro);
+    serial_imprimir(" DEBLOCK_SKIP_MARCO=");serial_imprimir_dec(ht.deblock_skip_marco);
+    serial_imprimir(" DEBLOCK_SKIP_8X8=");serial_imprimir_dec(ht.deblock_skip_8x8);
+    serial_imprimir(" DEBLOCK_SKIP_SLICE=");serial_imprimir_dec(ht.deblock_skip_slice);
+    serial_imprimir_linea("");
+    serial_imprimir("[BENCHMARK] DEBLOCK_KERNEL_SSE2=");serial_imprimir_dec(ht.deblock_kernel_sse2);
+    serial_imprimir(" DEBLOCK_KERNEL_ESCALAR=");serial_imprimir_dec(ht.deblock_kernel_escalar);
+    serial_imprimir(" DEBLOCK_CICLOS_FUERZA=");serial_imprimir_dec(ht.ciclos_deblock_fuerza);
+    serial_imprimir(" DEBLOCK_CICLOS_KERNEL=");serial_imprimir_dec(ht.ciclos_deblock_kernel);
+    serial_imprimir(" DEBLOCK_CICLOS_H=");serial_imprimir_dec(ht.ciclos_deblock_h);
+    serial_imprimir(" DEBLOCK_CICLOS_V=");serial_imprimir_dec(ht.ciclos_deblock_v);
+    serial_imprimir_linea("");
 }
 
 static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum modo_reproduccion modo,
@@ -944,13 +1328,14 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
         .huella = UINT64_C(14695981039346656037)
     };
 
+    memoria_estadisticas_t antes, despues;
+    memoria_obtener_estadisticas(&antes);
+    p.heap_inicial = antes.heap_bytes_en_uso;
     // Reservar búfer para percentiles de latencia (hasta 5000 cuadros)
     p.telem.capacidad_tiempos = 5000;
     p.telem.tiempos_cuadro_us = (uint32_t *)reservar(&p, sizeof(uint32_t) * p.telem.capacidad_tiempos);
 
     h264_servicios servicios = { &p, reservar, soltar, presentar };
-    memoria_estadisticas_t antes, despues;
-    memoria_obtener_estadisticas(&antes);
 
     h264_decodificador *dec = h264_crear(&servicios);
     h264_configurar_sse2(dec,H264_INTER_SSE2&&x86_64_fpu_sse2_lista());
@@ -977,8 +1362,31 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     p.dec_aac = dec_aac;
     p.mp4 = mp4;
     p.dec_video=dec;
-    if(trabajos_cpu_activas()>1)
-        h264_configurar_trabajadores(dec,ejecutar_lote,&p,trabajos_cpu_activas(),servir_coordinador);
+    p.traza=reservar(&p,sizeof(*p.traza));
+    if(p.traza)memset(p.traza,0,sizeof(*p.traza));
+    p.pausa=reservar(&p,sizeof(*p.pausa));
+    h264_configurar_traza(dec,observar_h264,&p);
+    p.lector_original=mp4->leer_fuente;p.lector_contexto=mp4->fuente_contexto;
+    if(p.lector_original) {
+        p.anillo=reservar(&p,sizeof(*p.anillo));
+        if(p.anillo) {
+            anillo_iniciar(p.anillo,leer_medido,&p,validar_cache,&p,mp4->bytes);
+            mp4->leer_fuente=anillo_leer;mp4->fuente_contexto=p.anillo;
+        } else {mp4->leer_fuente=leer_medido;mp4->fuente_contexto=&p;}
+    }
+    usb_msc_obtener_lecturas(&p.usb_comandos_inicio,&p.usb_bytes_inicio);
+    usb_msc_telemetria_reiniciar();
+    p.video_comprimido=reservar(&p,sizeof(cola_muestras));
+    p.audio_comprimido=dec_aac?reservar(&p,sizeof(cola_muestras)):NULL;
+    uint8_t *datos_video=reservar(&p,8u*1024*1024);
+    uint8_t *datos_audio=dec_aac?reservar(&p,2u*1024*1024):NULL;
+    if(!p.video_comprimido || !datos_video || (dec_aac && (!p.audio_comprimido || !datos_audio)))p.error=1;
+    if(p.video_comprimido)cola_muestras_iniciar(p.video_comprimido,mp4,MP4_FUENTE_VIDEO,datos_video,datos_video?8u*1024*1024:0);
+    if(p.audio_comprimido)cola_muestras_iniciar(p.audio_comprimido,mp4,MP4_FUENTE_AUDIO,datos_audio,datos_audio?2u*1024*1024:0);
+    if(p.video_comprimido){p.video_comprimido->observar_indice=observar_indice;p.video_comprimido->usuario_observador=&p;}
+    if(p.audio_comprimido){p.audio_comprimido->observar_indice=observar_indice;p.audio_comprimido->usuario_observador=&p;}
+    /* También con una CPU: misma ruta de sintaxis/reconstrucción SSE2. */
+    h264_configurar_trabajadores(dec,ejecutar_lote,&p,trabajos_cpu_activas(),servir_coordinador);
 
     // Prebuffer inicial de audio para cebar el pipeline DMA (128 KiB = ambos bloques DMA de 64 KiB + margen)
     if (dec_aac && mp4->tiene_audio && modo == MODO_INTERACTIVO) {
@@ -990,7 +1398,9 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
             size_t bytes_audio;
             int64_t pts_audio;
             uint64_t t_da0 = rdtsc();
-            int res_a = mp4_siguiente_audio(mp4, &datos_audio, &bytes_audio, &pts_audio);
+            if(p.anillo)anillo_rellenar(p.anillo,ANILLO_BLOQUES);
+            if(recargar(&p,0)<0)break;
+            int res_a = siguiente_audio(&p, &datos_audio, &bytes_audio, &pts_audio);
             p.telem.ciclos_demux += (rdtsc() - t_da0);
             if (res_a < 0) { p.error = 1; break; }
             if (res_a == 0) break;
@@ -1039,6 +1449,26 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     serial_imprimir("[MULTIMEDIA] INICIO "); serial_imprimir_linea(nombre);
     h264_resultado resultado = h264_configurar_avcc(dec, mp4->avcc, mp4->avcc_bytes);
 
+    i915_va_sesion_t *va_ses = NULL;
+#ifdef TAEK_I915_HW
+    // [EXPERIMENTAL / NO VALIDADO] Decodificacion VA-API por GPU. Excluida del
+    // build estable: no hay evidencia de M16/M19 (ver plan maestro, M17-M22).
+    if (i915_va_disponible()) {
+        uint32_t w = 1920;
+        uint32_t h = 1080;
+        if (i915_va_crear_sesion(w, h, &va_ses) == 0) {
+            p.va_sesion = va_ses;
+            p.usando_intel_va = 1;
+            serial_imprimir_linea("[MULTIMEDIA] Acelerador Intel VA-API activado con exito.");
+            consola_imprimir_linea_color(" [ACELERACION INTEL VA-API GPU ACTIVA]", COLOR_EXITO_DEFAULT);
+        } else {
+            serial_imprimir_linea("[MULTIMEDIA] Intel VA-API no pudo inicializar sesion; usando software.");
+        }
+    }
+#else
+    (void)va_ses;
+#endif
+
     uint64_t t_inicio_reproduccion = tiempo_obtener_milisegundos();
     uint64_t t_inicio_sesion_ciclos=rdtsc();
 
@@ -1050,12 +1480,16 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
         uint32_t duracion_v;
         if (servir_coordinador(&p)) { resultado = H264_CANCELADO; break; }
         if(presentar_pendiente(&p,0)){resultado=H264_CANCELADO;break;}
+        /* Productor: mantener el anillo lleno para que el consumidor no espere. */
+        if(p.anillo)anillo_rellenar(p.anillo,ANILLO_BLOQUES);
+        if(recargar(&p,0)<0 || recargar(&p,1)<0){resultado=H264_DATOS_INVALIDOS;break;}
 
         if (p.t_inicio_cuadro_ciclos == 0) p.t_inicio_cuadro_ciclos = rdtsc();
 
         // 1. Demux de video
         uint64_t t_dv0 = rdtsc();
-        int siguiente = mp4_siguiente_video(mp4, &datos_v, &bytes_v, &pts_v, &duracion_v);
+        int siguiente = cola_muestras_tomar(p.video_comprimido, &datos_v, &bytes_v, &pts_v, &duracion_v);
+        if(siguiente>0){p.muestra_actual=mp4->v_indice++;p.pts_actual=pts_v;}
         uint64_t dt_dv = rdtsc() - t_dv0;
         p.telem.ciclos_demux += dt_dv;
         if (dt_dv > p.telem.max_ciclos_demux) p.telem.max_ciclos_demux = dt_dv;
@@ -1070,7 +1504,28 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
         reproductor_alimentar_audio(&p);
 
         // 3. Decodificación de muestra H.264
-        resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
+        uint64_t t_decode=rdtsc();
+#ifdef TAEK_I915_HW
+        if (p.va_sesion) {
+            int ret_va = i915_va_decodificar_cuadro(p.va_sesion, datos_v, bytes_v, pts_v);
+            if (ret_va == 0) {
+                h264_imagen im;
+                if (i915_va_obtener_imagen(p.va_sesion, &im) == 0) {
+                    presentar(&p, &im);
+                    resultado = H264_OK;
+                } else {
+                    resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
+                }
+            } else {
+                resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
+            }
+        } else
+#endif
+        {
+            resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
+        }
+        registrar(&p,TR_DECODIFICAR,t_decode,rdtsc(),bytes_v);
+        guardar_pausa(&p,t_decode,rdtsc());
     }
     if (!resultado) resultado = h264_finalizar(dec);
     while(!resultado && !p.cancelado && p.presentaciones_pendientes)
@@ -1116,12 +1571,91 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
 
     // Generar e imprimir informe integral de telemetría y benchmark
     imprimir_informe_benchmark(&p, dec, duracion_real_ms);
+    serial_imprimir("[PIPELINE] READ_CYCLES=");serial_imprimir_dec(p.ciclos_lectura);
+    serial_imprimir(" READ_BYTES=");serial_imprimir_dec(p.bytes_lectura);
+    serial_imprimir(" READ_CALLS=");serial_imprimir_dec(p.lecturas);
+    serial_imprimir(" LATE_DROPS=");serial_imprimir_dec(p.cuadros_tardios);
+    serial_imprimir_linea(" GOP_SCANOUT_VERIFIED=0");
+    uint64_t comandos_usb,bytes_usb;usb_msc_obtener_lecturas(&comandos_usb,&bytes_usb);
+    serial_imprimir("[PIPELINE] USB_READ_COMMANDS=");serial_imprimir_dec(comandos_usb-p.usb_comandos_inicio);
+    serial_imprimir(" USB_READ_BYTES=");serial_imprimir_dec(bytes_usb-p.usb_bytes_inicio);
+    serial_imprimir(" VIDEO_MISSES=");serial_imprimir_dec(p.video_comprimido?p.video_comprimido->faltantes:0);
+    serial_imprimir(" AUDIO_MISSES=");serial_imprimir_dec(p.audio_comprimido?p.audio_comprimido->faltantes:0);
+    serial_imprimir(" SOURCE=");serial_imprimir(p.lector_original?"USB":"RAM");
+    serial_imprimir(" BSP_COMPUTE=");serial_imprimir_dec(!diagnostico_coordinador || trabajos_cpu_activas()==1);
+    serial_imprimir(" IO_KIB=");serial_imprimir_dec(diagnostico_lectura_kib);
+    serial_imprimir(" RING_HITS=");serial_imprimir_dec(p.anillo?p.anillo->aciertos:0);
+    serial_imprimir(" RING_STALLS=");serial_imprimir_dec(p.anillo?p.anillo->fallos:0);
+    serial_imprimir(" RING_SEEKS=");serial_imprimir_dec(p.anillo?p.anillo->reposiciones:0);
+    serial_imprimir(" RING_BLOCKS=");serial_imprimir_dec(p.anillo?p.anillo->bloques_leidos:0);
+    serial_imprimir(" RING_BYTES=");serial_imprimir_dec(p.anillo?p.anillo->bytes_leidos:0);
+    serial_imprimir(" RING_STARVATIONS=");serial_imprimir_dec(p.anillo?p.anillo->starvations:0);
+    serial_imprimir(" RING_PROD_PARADAS=");serial_imprimir_dec(p.anillo?p.anillo->productor_paradas:0);
+    serial_imprimir(" RING_MARGEN_MIN=");serial_imprimir_dec(p.anillo&&p.anillo->margen_muestras?p.anillo->margen_min:0);
+    serial_imprimir(" RING_MARGEN_MAX=");serial_imprimir_dec(p.anillo?p.anillo->margen_max:0);
+    serial_imprimir(" RING_MARGEN_MEDIA=");
+    serial_imprimir_dec(p.anillo&&p.anillo->margen_muestras?p.anillo->margen_suma/p.anillo->margen_muestras:0);
+    serial_imprimir(" RING_BYTES_UTILES=");serial_imprimir_dec(p.anillo?p.anillo->bytes_utiles:0);
+    serial_imprimir(" RING_BYTES_INUTILES=");serial_imprimir_dec(p.anillo?p.anillo->bytes_inutiles:0);
+    serial_imprimir_linea("");
+    usb_msc_telemetria_volcar_serial();
+    {
+        memoria_estadisticas_t mem_sesion;
+        memoria_obtener_estadisticas(&mem_sesion);
+        serial_imprimir("[PIPELINE] HEAP_INICIAL=");serial_imprimir_dec(p.heap_inicial);
+        serial_imprimir(" HEAP_PICO_SESION=");serial_imprimir_dec(p.memoria_maxima);
+        serial_imprimir(" HEAP_SESION=");serial_imprimir_dec(mem_sesion.heap_bytes_en_uso);
+        serial_imprimir(" SILENCIO_EN_PISTA=");serial_imprimir_dec(p.silencio_en_pista);
+        serial_imprimir(" SILENCIO_TRAS_EOF=");serial_imprimir_dec(p.silencio_despues_eof);
+        serial_imprimir_linea("");
+    }
+    for(unsigned archivo_traza=0;archivo_traza<2;archivo_traza++) {
+        traza_video *tr=archivo_traza?p.pausa:p.traza;
+        if(!tr || (archivo_traza && !p.pausa_fin))continue;
+        if(archivo_traza) {
+            serial_imprimir("[TRACE_PAUSE] START=");serial_imprimir_dec(p.pausa_inicio);
+            serial_imprimir(" END=");serial_imprimir_dec(p.pausa_fin);serial_imprimir_linea("");
+        }
+        serial_imprimir("[TRACE] CYCLES_PER_MS=");serial_imprimir_dec(tiempo_ciclos_por_ms());
+        serial_imprimir_linea(" columns=cpu,stage,sample,pts,start,end,detail,pcm_bytes,ready_frames");
+        for(unsigned cpu=0;cpu<TRAZA_CPU;cpu++) {
+            for(unsigned etapa=1;etapa<14;etapa++) {
+                traza_evento *e=&tr->maximos[cpu][etapa];
+                if(!e->fin)continue;
+                serial_imprimir("[TRACE_MAX] ");serial_imprimir_dec(cpu);
+                uint64_t campos[]={e->etapa,e->cuadro,(uint64_t)e->pts,e->inicio,e->fin,e->detalle,e->audio,e->video};
+                for(unsigned j=0;j<8;j++){serial_imprimir(",");serial_imprimir_dec(campos[j]);}serial_imprimir_linea("");
+            }
+            uint64_t total=tr->escritos[cpu],ini=total>TRAZA_EVENTOS?total-TRAZA_EVENTOS:0;
+            for(uint64_t i=ini;i<total;i++) {
+                traza_evento *e=&tr->eventos[cpu][i%TRAZA_EVENTOS];
+                serial_imprimir(archivo_traza?"[TRACE_PAUSE_EVENT] ":"[TRACE_EVENT] ");serial_imprimir_dec(cpu);
+                uint64_t campos[]={e->etapa,e->cuadro,(uint64_t)e->pts,e->inicio,e->fin,e->detalle,e->audio,e->video};
+                for(unsigned j=0;j<8;j++){serial_imprimir(",");serial_imprimir_dec(campos[j]);}
+                serial_imprimir_linea("");
+            }
+        }
+    }
 
+#ifdef TAEK_I915_HW
+    if (p.va_sesion) {
+        i915_va_destruir_sesion(p.va_sesion);
+        p.va_sesion = NULL;
+    }
+#endif
     h264_destruir(dec);
     if (p.rgb) soltar(&p, p.rgb);
     if (p.telem.tiempos_cuadro_us) soltar(&p, p.telem.tiempos_cuadro_us);
+    soltar(&p,datos_audio);soltar(&p,datos_video);
+    soltar(&p,p.audio_comprimido);soltar(&p,p.video_comprimido);soltar(&p,p.traza);
+    soltar(&p,p.cache);soltar(&p,p.anillo);
+    soltar(&p,p.pausa);
+    mp4->leer_fuente=p.lector_original;mp4->fuente_contexto=p.lector_contexto;
 
     memoria_obtener_estadisticas(&despues);
+    serial_imprimir("[MULTIMEDIA] HEAP_TRAS_LIBERAR=");serial_imprimir_dec(despues.heap_bytes_en_uso);
+    serial_imprimir(" HEAP_INICIAL=");serial_imprimir_dec(antes.heap_bytes_en_uso);
+    serial_imprimir_linea("");
     serial_imprimir("[MULTIMEDIA] HEAP_DELTA=");
     serial_imprimir_dec((uint64_t)(despues.heap_bytes_en_uso >= antes.heap_bytes_en_uso ?
                         despues.heap_bytes_en_uso - antes.heap_bytes_en_uso : 0));
@@ -1348,7 +1882,36 @@ void audio_aac_comando(const char *arg) {
 }
 
 void video_h264_comando(const char *arg) {
-    if (iguales(arg, "360p") || iguales(arg, "1")) {
+    if(iguales(arg,"io 4") || iguales(arg,"io 16") || iguales(arg,"io 32") || iguales(arg,"io 64") ||
+       iguales(arg,"io 128") || iguales(arg,"io 256")) {
+        unsigned n=0;for(const char *c=arg+3;*c;c++)n=n*10+(unsigned)(*c-'0');
+        if(particiones_configurar_lectura(n))diagnostico_lectura_kib=n;
+        serial_imprimir("[PIPELINE_CONFIG] IO_KIB=");serial_imprimir_dec(diagnostico_lectura_kib);
+        if(n==4)serial_imprimir(" REFERENCIA=1");
+        serial_imprimir_linea("");
+    } else if(iguales(arg,"intel h0")) {
+        intel_inventario_imprimir_h0();
+    } else if(iguales(arg,"intel probar") || iguales(arg,"intel test") || iguales(arg,"intel r0") || iguales(arg,"intel h1")) {
+        intel_diagnostico_ring0_ejecutar();
+    } else if(iguales(arg,"intel estado") || iguales(arg,"intel drv")) {
+        i915_imprimir_estado();
+    } else if(iguales(arg,"intel vcs") || iguales(arg,"intel trabajo") || iguales(arg,"intel batch")) {
+        uint32_t res = 0;
+        i915_vcs_primer_trabajo(0x5441454BU, &res);
+        consola_imprimir_linea_color("==> [ AVISO ] Envío de trabajos VCS deshabilitado temporalmente.", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("Pendiente de resolver: ownership formal GGTT, direccionamiento DMA y recuperación.");
+    } else if(iguales(arg,"cpu 1") || iguales(arg,"cpu 2") || iguales(arg,"cpu 4")) {
+        unsigned n=(unsigned)(arg[4]-'0');
+        if(trabajos_configurar_distribucion(n,!diagnostico_coordinador)) {
+            diagnostico_cpu=n;serial_imprimir("[PIPELINE_CONFIG] CPUS=");serial_imprimir_dec(n);serial_imprimir_linea("");
+        }
+        else consola_imprimir_linea("No hay tantos procesadores activos o existe un lote en curso.");
+    } else if(iguales(arg,"bsp coordinador") || iguales(arg,"bsp calcula")) {
+        diagnostico_cpu=trabajos_cpu_activas();
+        int coordinador=iguales(arg,"bsp coordinador") && diagnostico_cpu>1;
+        if(trabajos_configurar_distribucion(diagnostico_cpu,!coordinador))diagnostico_coordinador=coordinador;
+        serial_imprimir("[PIPELINE_CONFIG] BSP_COMPUTE=");serial_imprimir_dec(!diagnostico_coordinador);serial_imprimir_linea("");
+    } else if (iguales(arg, "360p") || iguales(arg, "1")) {
         reproducir("h264:360p", MODO_INTERACTIVO);
     } else if (iguales(arg, "1080p") || iguales(arg, "2")) {
         reproducir("h264:1080p", MODO_INTERACTIVO);
@@ -1368,6 +1931,8 @@ void video_h264_comando(const char *arg) {
         audio_aac_probar("h264:360p");
     } else {
         consola_imprimir_linea_color("--- REPRODUCTOR MULTIMEDIA H.264 & AAC (TELEMETRÍA) ---", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("  h264 cpu 1|2|4; h264 bsp coordinador|calcula: comparación de distribución.");
+        consola_imprimir_linea("  reproducir [ram|usb] [bench|prueba] archivo.mp4: diagnóstico de la misma fuente.");
         consola_imprimir_color("  h264 360p          ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproducción interactiva A/V completa (H.264 + AAC + PTS).");
         consola_imprimir_color("  h264 bench 360p    ", COLOR_PROMPT_DEFAULT);
@@ -1399,6 +1964,7 @@ void video_h264_arranque(const char *cmdline) {
             muestras_funcionales=32;reproducir("h264:1080p",MODO_BENCHMARK);muestras_funcionales=0;
         }
         if (iguales(token, "h264=play360")) reproducir("h264:360p", MODO_INTERACTIVO);
+        if (iguales(token, "h264=play1080") || iguales(token, "h264=1080p")) reproducir("h264:1080p", MODO_INTERACTIVO);
         if (iguales(token, "h264=prueba1080")) reproducir("h264:1080p", MODO_PRUEBA_FORENSE);
     }
 }

@@ -25,10 +25,15 @@
 #include "iommu.h"
 #include "xhci.h"
 #include "usb_msc.h"
+#include "usb_msc_telemetria.h"
 #include "fat32.h"
 #include "exfat.h"
 #include "ntfs.h"
 #include "vfs.h"
+#include "red/red.h"
+#include "video/intel/intel_info.h"
+#include "video/intel/intel_diagnostico_ring0.h"
+#include "video/intel/i915_drv.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 #include "../arquitectura/x86_64/triple_fault.h"
@@ -1043,8 +1048,9 @@ static void ejecutar_comando_linux(const char *arg) {
 }
 
 static void ejecutar_comando_dmesg(void) {
-    uint32_t tamano = 0, cursor = 0;
-    const char *buf = serial_obtener_log_buffer(&tamano, &cursor);
+    static char buf[KERNEL_LOG_TAMANO];
+    int copiados = serial_copiar_log(buf, sizeof(buf), NULL, NULL);
+    uint32_t tamano = copiados > 0 ? (uint32_t)copiados : 0;
 
     consola_imprimir_linea_color("================ BUFFER DE REGISTRO DEL KERNEL (DMESG / COM1) ================", COLOR_AVISO_DEFAULT);
     consola_imprimir("  Estado UART COM1 Físico   : ");
@@ -1057,7 +1063,7 @@ static void ejecutar_comando_dmesg(void) {
     consola_imprimir_dec((uint64_t)tamano);
     consola_imprimir(" bytes registrados (Capacidad: 64 KiB)\n");
 
-    if (buf && tamano > 0) {
+    if (tamano > 0) {
         uint32_t inicio = 0;
         if (tamano > 1500) {
             inicio = tamano - 1500;
@@ -2051,6 +2057,12 @@ static int64_t leer_vfs_mp4(void *contexto, int pista, uint64_t offset, void *de
 }
 
 static void ejecutar_reproducir_mp4_vfs(const char *nombre) {
+    int desde_ram=0;
+    enum modo_reproduccion modo=MODO_INTERACTIVO;
+    if(str_comienza_con(nombre,"ram ")){desde_ram=1;nombre=str_saltar_espacios(nombre+4);}
+    else if(str_comienza_con(nombre,"usb "))nombre=str_saltar_espacios(nombre+4);
+    if(str_comienza_con(nombre,"bench ")){modo=MODO_BENCHMARK;nombre=str_saltar_espacios(nombre+6);}
+    else if(str_comienza_con(nombre,"prueba ")){modo=MODO_PRUEBA_FORENSE;nombre=str_saltar_espacios(nombre+7);}
     if (!nombre || *nombre == '\0') {
         consola_imprimir_linea_color("  [ERROR] Especifica el nombre o número de archivo MP4.", COLOR_ERROR_DEFAULT);
         return;
@@ -2080,8 +2092,25 @@ static void ejecutar_reproducir_mp4_vfs(const char *nombre) {
     consola_imprimir_linea_color("    [Control+C o ESC para detener reproducción en cualquier momento]", COLOR_AVISO_DEFAULT);
 
     struct vfs_fuente_mp4 fuente = {descriptor, descriptor_audio};
-    int resultado = reproductor_reproducir_fuente(leer_vfs_mp4, &fuente, tamano, nombre,
-                                                   MODO_INTERACTIVO, descriptor, descriptor_audio);
+    int resultado;
+    if(desde_ram) {
+        /* Diagnóstico explícito, nunca precarga implícita. Límite combinado:
+         * 32 MiB archivo + 256 MiB presupuesto propio del reproductor. */
+        void *ram=tamano<=32u*1024*1024?asignar_memoria((size_t)tamano):NULL;
+        if(!ram){consola_imprimir_linea("Diagnóstico RAM: archivo mayor de 32 MiB o memoria insuficiente; usa un MP4 recortado desde IDR.");resultado=-1;}
+        else {
+            uint64_t hechos=0;
+            while(hechos<tamano) {
+                size_t n=tamano-hechos>65536?65536:(size_t)(tamano-hechos);
+                int64_t r=vfs_leer_en(descriptor,hechos,(uint8_t *)ram+hechos,n);
+                if(r!=(int64_t)n)break;
+                hechos+=n;
+            }
+            resultado=hechos==tamano?reproductor_reproducir_memoria(ram,(size_t)tamano,nombre,modo):-1;
+            liberar_memoria(ram);
+        }
+    } else resultado = reproductor_reproducir_fuente(leer_vfs_mp4, &fuente, tamano, nombre,
+                                                   modo, descriptor, descriptor_audio);
     vfs_cerrar(descriptor);
     vfs_cerrar(descriptor_audio);
 
@@ -2607,6 +2636,21 @@ static void ejecutar_comando_usb(const char *arg) {
         return;
     }
 
+    // Subcomando: usb telemetria [reiniciar] / usb telem
+    if (arg && (str_comienza_con(arg, "telemetria") || str_comienza_con(arg, "telem"))) {
+        const char *sub = arg;
+        while (*sub != '\0' && *sub != ' ') sub++;
+        sub = str_saltar_espacios(sub);
+        if (*sub != '\0' && (str_igual(sub, "reiniciar") || str_igual(sub, "reset") || str_igual(sub, "limpiar"))) {
+            usb_msc_telemetria_reiniciar();
+            consola_imprimir_linea_color("==> Telemetria fina READ(10) reiniciada.", COLOR_EXITO_DEFAULT);
+        } else {
+            usb_msc_telemetria_imprimir_consola();
+            usb_msc_telemetria_volcar_serial();
+        }
+        return;
+    }
+
     // Subcomando: usb diag / usb volcado / usb dump
     if (arg && (str_igual(arg, "diag") || str_igual(arg, "diagnostico") || str_igual(arg, "volcado") || str_igual(arg, "dump"))) {
         xhci_imprimir_diagnostico_completo();
@@ -2751,6 +2795,7 @@ static void ejecutar_comando_usb(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'disco' para ver el diagnóstico detallado de unidades SCSI.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("Tip: Escribe 'usb monitor' para probar en vivo conectando y desconectando.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("Tip: Escribe 'usb reset <puerto>' para reiniciar un puerto especifico.", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("Tip: Escribe 'usb telemetria' para desglosar la latencia fina de READ(10).", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("======================================================================", COLOR_AVISO_DEFAULT);
 }
 
@@ -2840,6 +2885,296 @@ static void ejecutar_comando_pray(const char *arg) {
     consola_imprimir_linea_color("--------------------------------------------------------------------------------", COLOR_PROMPT_DEFAULT);
     consola_imprimir_linea_color("Tip: Escribe 'pray' u 'orar' para consultar otro pasaje del oráculo.", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
+}
+
+// ------------------------------ Red Ethernet: estado y subcomandos ------------------------------
+static const char *red_token(const char *p, char *destino, int max) {
+    p = str_saltar_espacios(p);
+    int i = 0;
+    while (*p && *p != ' ' && *p != '\t' && i < max - 1) destino[i++] = *p++;
+    destino[i] = '\0';
+    return p;
+}
+
+static int red_parsear_entero(const char *t, int por_defecto) {
+    if (!t || !*t) return por_defecto;
+    int v = 0;
+    while (*t >= '0' && *t <= '9') { v = v * 10 + (*t - '0'); t++; }
+    return v > 0 ? v : por_defecto;
+}
+
+static void red_hex8(uint8_t v) {
+    const char *h = "0123456789ABCDEF";
+    consola_escribir_caracter(h[(v >> 4) & 0xF]);
+    consola_escribir_caracter(h[v & 0xF]);
+}
+
+static void red_imprimir_estado(void) {
+    const struct red_info *info = red_obtener_info();
+    consola_imprimir_linea_color("=================== RED ETHERNET (e1000/e1000e) ===================", COLOR_AVISO_DEFAULT);
+    if (!info->presente) {
+        consola_imprimir_linea_color("  [AVISO] No se detectó ningún controlador Ethernet Intel soportado.", COLOR_ERROR_DEFAULT);
+        consola_imprimir_linea("  Comprueba el hardware con 'lspci' o conecta el cable/adaptador.");
+        return;
+    }
+
+    consola_imprimir_color("  Modelo       : ", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_linea(info->modelo);
+    consola_imprimir_color("  PCI          : ", COLOR_PROMPT_DEFAULT);
+    consola_imprimir_dec(info->bus); consola_imprimir(":");
+    consola_imprimir_dec(info->ranura); consola_imprimir(".");
+    consola_imprimir_dec(info->funcion);
+    consola_imprimir("  (");
+    red_hex8((uint8_t)(info->id_proveedor >> 8));
+    red_hex8((uint8_t)(info->id_proveedor & 0xFF));
+    consola_imprimir(":");
+    red_hex8((uint8_t)(info->id_dispositivo >> 8));
+    red_hex8((uint8_t)(info->id_dispositivo & 0xFF));
+    consola_imprimir_linea(")");
+
+    consola_imprimir_color("  MAC          : ", COLOR_PROMPT_DEFAULT);
+    for (int i = 0; i < 6; i++) {
+        red_hex8(info->mac[i]);
+        if (i < 5) consola_imprimir(":");
+    }
+    consola_imprimir_linea("");
+
+    red_enlace_actualizar();
+    consola_imprimir_color("  Enlace       : ", COLOR_PROMPT_DEFAULT);
+    if (info->enlace_activo) {
+        consola_imprimir_color("ACTIVO", COLOR_EXITO_DEFAULT);
+        consola_imprimir(" (");
+        consola_imprimir_dec(info->velocidad_mbps);
+        consola_imprimir(info->full_duplex ? " Mbps full-duplex)" : " Mbps half-duplex)");
+        consola_imprimir_linea("");
+    } else {
+        consola_imprimir_linea_color("SIN CABLE / CAÍDO", COLOR_ERROR_DEFAULT);
+    }
+
+    const struct red_config *cfg = red_obtener_config();
+    char buf[20];
+    consola_imprimir_color("  Configuración: ", COLOR_PROMPT_DEFAULT);
+    if (cfg->configurada) {
+        consola_imprimir_linea(cfg->por_dhcp ? "DHCP" : "Estática");
+        consola_imprimir_color("    IP    : ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(red_ip_a_texto(cfg->ip, buf, sizeof(buf)));
+        consola_imprimir_color("    Máscara: ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(red_ip_a_texto(cfg->mascara, buf, sizeof(buf)));
+        consola_imprimir_color("    Puerta: ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(red_ip_a_texto(cfg->puerta, buf, sizeof(buf)));
+        consola_imprimir_color("    DNS   : ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(red_ip_a_texto(cfg->dns[0], buf, sizeof(buf)));
+    } else {
+        consola_imprimir_linea_color("Sin IP. Ejecuta 'red dhcp' para obtener una por DHCP.", COLOR_AVISO_DEFAULT);
+    }
+
+    consola_imprimir_color("  Tráfico      : ", COLOR_PROMPT_DEFAULT);
+    consola_imprimir("RX ");
+    consola_imprimir_dec(info->rx_paquetes);
+    consola_imprimir(" tramas/");
+    consola_imprimir_dec(info->rx_bytes);
+    consola_imprimir(" B (desc. ");
+    consola_imprimir_dec(info->rx_descartados);
+    consola_imprimir(")  TX ");
+    consola_imprimir_dec(info->tx_paquetes);
+    consola_imprimir(" tramas/");
+    consola_imprimir_dec(info->tx_bytes);
+    consola_imprimir(" B (err. ");
+    consola_imprimir_dec(info->tx_errores);
+    consola_imprimir_linea(")");
+
+    consola_imprimir_linea_color("-------------------------------------------------------------------", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea_color("  Uso: red dhcp | red ping <ip|host> [n] | red dns <host> | red http <host> [ruta]", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea("       transmitir <mensaje> | recibir (terminal Windows por LAN)");
+    consola_imprimir_linea("       transmitir destino <IPv4-del-PC> [puerto 9151]");
+    consola_imprimir_linea("       red telemetria <IPv4-del-PC> [puerto 9150]");
+    consola_imprimir_linea_color("       red ip <ip> <mascara> <puerta> [dns] | red autoprueba | red enlace", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("===================================================================", COLOR_AVISO_DEFAULT);
+}
+
+static void ejecutar_comando_red(const char *arg) {
+    if (!arg || !*arg) {
+        red_imprimir_estado();
+        return;
+    }
+
+    if (str_comienza_con(arg, "telemetria")) {
+        char host[40], puerto_texto[12], extra[8];
+        const char *p = red_token(arg + 10, host, sizeof(host));
+        p = red_token(p, puerto_texto, sizeof(puerto_texto));
+        red_token(p, extra, sizeof(extra));
+        uint8_t ip[4];
+        uint32_t puerto = 9150;
+        int valido = !extra[0];
+        if (puerto_texto[0]) {
+            puerto = 0;
+            for (int i = 0; puerto_texto[i]; i++) {
+                if (puerto_texto[i] < '0' || puerto_texto[i] > '9' || puerto > 6553) { valido = 0; break; }
+                puerto = puerto * 10 + (uint32_t)(puerto_texto[i] - '0');
+            }
+        }
+        if (!valido || !puerto || puerto > 65535 || red_texto_a_ip(host, ip) != 0) {
+            consola_imprimir_linea("  Uso: red telemetria <IPv4-del-PC> [puerto 9150]");
+            return;
+        }
+        uint32_t bytes = 0;
+        uint64_t perdidos = 0;
+        consola_imprimir_linea("  Enviando snapshot del log por LAN (timeout 20 s)...");
+        int r = red_telemetria_enviar(ip, (uint16_t)puerto, &bytes, &perdidos);
+        if (r == 0) {
+            serial_imprimir("[TELEMETRIA_LAN] GUARDADO=1 BYTES=");
+            serial_imprimir_dec(bytes);
+            serial_imprimir(" LOST="); serial_imprimir_dec(perdidos); serial_imprimir_linea("");
+            consola_imprimir("  [TELEMETRIA] Receptor confirma expediente guardado: ");
+            consola_imprimir_dec(bytes); consola_imprimir_linea(" bytes.");
+            consola_imprimir("  Bytes antiguos perdidos por wrap del log: ");
+            consola_imprimir_dec(perdidos); consola_imprimir_linea("");
+        } else {
+            serial_imprimir("[TELEMETRIA_LAN] GUARDADO=0 ERROR=");
+            serial_imprimir_dec((uint64_t)(-r)); serial_imprimir_linea("");
+            consola_imprimir("  [TELEMETRIA] Sin confirmacion de guardado; codigo ");
+            consola_imprimir_dec((uint64_t)(-r)); consola_imprimir_linea(".");
+        }
+        return;
+    }
+
+    if (str_igual(arg, "dhcp") || str_igual(arg, "conectar")) {
+        const struct red_info *info = red_obtener_info();
+        if (!info->controlador_listo) {
+            consola_imprimir_linea_color("  [!] No hay controlador de red operativo.", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        if (!red_enlace_actualizar()) {
+            consola_imprimir_linea_color("  [!] Sin enlace físico: conecta el cable Ethernet.", COLOR_ERROR_DEFAULT);
+            return;
+        }
+        consola_imprimir_linea_color("  Solicitando dirección por DHCP...", COLOR_AVISO_DEFAULT);
+        int r = red_dhcp(9000);
+        if (r == 0) {
+            char buf[20];
+            const struct red_config *cfg = red_obtener_config();
+            consola_imprimir_linea_color("  [DHCP] Concedido [OK]", COLOR_EXITO_DEFAULT);
+            consola_imprimir("    IP: ");
+            consola_imprimir_linea(red_ip_a_texto(cfg->ip, buf, sizeof(buf)));
+            consola_imprimir("    Puerta: ");
+            consola_imprimir_linea(red_ip_a_texto(cfg->puerta, buf, sizeof(buf)));
+            consola_imprimir("    DNS: ");
+            consola_imprimir_linea(red_ip_a_texto(cfg->dns[0], buf, sizeof(buf)));
+        } else {
+            consola_imprimir_color("  [DHCP] Falló (código ", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec((uint64_t)(-r));
+            consola_imprimir_linea_color(")", COLOR_ERROR_DEFAULT);
+        }
+        return;
+    }
+
+    if (str_igual(arg, "autoprueba") || str_igual(arg, "test") || str_igual(arg, "probar")) {
+        red_autodiagnostico();
+        return;
+    }
+
+    if (str_igual(arg, "enlace") || str_igual(arg, "link") || str_igual(arg, "estado")) {
+        red_imprimir_estado();
+        return;
+    }
+
+    if (str_comienza_con(arg, "ping")) {
+        char host[80];
+        const char *p = red_token(arg + 4, host, sizeof(host));
+        if (!host[0]) { consola_imprimir_linea("  Uso: red ping <ip|host> [n]"); return; }
+        int veces = red_parsear_entero(str_saltar_espacios(p), 3);
+        uint8_t ip[4];
+        if (red_texto_a_ip(host, ip) != 0) {
+            if (red_resolver_nombre(host, ip, 5000) != 0) {
+                consola_imprimir_linea_color("  [!] No se pudo resolver el nombre.", COLOR_ERROR_DEFAULT);
+                return;
+            }
+        }
+        char buf[20];
+        consola_imprimir_color("  Haciendo ping a ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(red_ip_a_texto(ip, buf, sizeof(buf)));
+        int ok = red_ping(ip, veces, 1500);
+        consola_imprimir_color("  Resultado: ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_dec((uint64_t)(ok < 0 ? 0 : ok));
+        consola_imprimir("/");
+        consola_imprimir_dec((uint64_t)veces);
+        consola_imprimir_linea(" respuestas.");
+        return;
+    }
+
+    if (str_comienza_con(arg, "dns")) {
+        char host[120];
+        red_token(arg + 3, host, sizeof(host));
+        if (!host[0]) { consola_imprimir_linea("  Uso: red dns <host>"); return; }
+        uint8_t ip[4];
+        consola_imprimir_color("  Resolviendo ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(host);
+        if (red_resolver_nombre(host, ip, 5000) == 0) {
+            char buf[20];
+            consola_imprimir_color("  -> ", COLOR_EXITO_DEFAULT);
+            consola_imprimir_linea(red_ip_a_texto(ip, buf, sizeof(buf)));
+        } else {
+            consola_imprimir_linea_color("  [!] Sin resolución DNS.", COLOR_ERROR_DEFAULT);
+        }
+        return;
+    }
+
+    if (str_comienza_con(arg, "http") || str_comienza_con(arg, "curl") || str_comienza_con(arg, "web")) {
+        const char *p = arg;
+        if (str_comienza_con(arg, "http")) p = arg + 4;
+        else if (str_comienza_con(arg, "curl")) p = arg + 4;
+        else p = arg + 3;
+        char host[120];
+        char ruta[200];
+        p = red_token(p, host, sizeof(host));
+        red_token(p, ruta, sizeof(ruta));
+        if (!host[0]) { consola_imprimir_linea("  Uso: red http <host> [ruta]"); return; }
+        if (!ruta[0]) { ruta[0] = '/'; ruta[1] = '\0'; }
+        static char respuesta[4096];
+        consola_imprimir_color("  GET http://", COLOR_PROMPT_DEFAULT);
+        consola_imprimir(host);
+        consola_imprimir(ruta);
+        consola_imprimir_linea(" ...");
+        int n = red_http_obtener(host, ruta, 80, respuesta, sizeof(respuesta), 10000);
+        if (n > 0) {
+            consola_imprimir_color("  [HTTP] ", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec((uint64_t)n);
+            consola_imprimir_linea(" bytes recibidos:");
+            int mostrar = n < 1600 ? n : 1600;
+            for (int i = 0; i < mostrar; i++) {
+                char c = respuesta[i];
+                if (c == '\r') continue;
+                consola_escribir_caracter((c == '\n' || (c >= 32 && c < 127)) ? c : '.');
+            }
+            consola_imprimir_linea("");
+        } else {
+            consola_imprimir_color("  [!] Sin respuesta HTTP (código ", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec((uint64_t)(-n));
+            consola_imprimir_linea_color(").", COLOR_ERROR_DEFAULT);
+        }
+        return;
+    }
+
+    if (str_comienza_con(arg, "ip ")) {
+        char a[24], b[24], c[24], d[24];
+        const char *p = red_token(arg + 3, a, sizeof(a));
+        p = red_token(p, b, sizeof(b));
+        p = red_token(p, c, sizeof(c));
+        red_token(p, d, sizeof(d));
+        uint8_t ip[4], mascara[4], puerta[4], dns[4];
+        if (!a[0] || !b[0] || !c[0] ||
+            red_texto_a_ip(a, ip) != 0 || red_texto_a_ip(b, mascara) != 0 ||
+            red_texto_a_ip(c, puerta) != 0) {
+            consola_imprimir_linea("  Uso: red ip <ip> <mascara> <puerta> [dns]");
+            return;
+        }
+        int con_dns = d[0] && red_texto_a_ip(d, dns) == 0;
+        red_ip_estatica(ip, mascara, puerta, con_dns ? dns : NULL);
+        consola_imprimir_linea_color("  Configuración estática aplicada [OK]", COLOR_EXITO_DEFAULT);
+        return;
+    }
+
+    consola_imprimir_linea_color("  Subcomando no reconocido. Usa 'red' para ver la ayuda.", COLOR_ERROR_DEFAULT);
 }
 
 static void procesar_comando(const char *linea_cruda) {
@@ -3002,6 +3337,9 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Controlador Intel VT-d, remapeo DRHD y regiones RMRR ('iommu probar').");
         consola_imprimir_color("  teclado        ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Autodiagnóstico del teclado USB y puertos ('teclado probar').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  red [opción]   ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Red Ethernet: 'red dhcp', 'red ping <ip|host>', 'red dns <host>', 'red http <host> [ruta]', 'red autoprueba'.", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea("  transmitir <mensaje> | recibir : Mensajes con la terminal Windows por LAN.");
         consola_imprimir_color("  entradas / disco", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Lista los discos y memorias USB conectadas ('entradas', 'discos').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  seleccionar <d>  ", COLOR_EXITO_DEFAULT);
@@ -3410,6 +3748,77 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // Mensajes cortos entre la terminal TAEK y la terminal Windows.
+    if (str_igual(linea, "transmitir") || str_comienza_con(linea, "transmitir ") ||
+        str_igual(linea, "recibir") || str_comienza_con(linea, "recibir ")) {
+        const char *arg = str_comienza_con(linea, "transmitir ") ? str_saltar_espacios(linea + 11) : "";
+        if (str_comienza_con(arg, "destino ")) {
+            char host[40], port[12], extra[8];
+            const char *p = red_token(arg + 8, host, sizeof(host));
+            p = red_token(p, port, sizeof(port));
+            red_token(p, extra, sizeof(extra));
+            uint8_t ip[4];
+            uint32_t puerto = 9151;
+            int valido = !extra[0];
+            if (port[0]) {
+                puerto = 0;
+                for (int i = 0; port[i]; ++i) {
+                    if (port[i] < '0' || port[i] > '9' || puerto > 6553) { valido = 0; break; }
+                    puerto = puerto * 10 + (uint32_t)(port[i] - '0');
+                }
+            }
+            if (!valido || !puerto || puerto > 65535 || red_texto_a_ip(host, ip)) {
+                consola_imprimir_linea("Uso: transmitir destino <IPv4-del-PC> [puerto 9151]");
+                return;
+            }
+            red_mensajes_destino(ip, (uint16_t)puerto);
+            consola_imprimir("Destino Windows: "); consola_imprimir(host);
+            consola_imprimir(":"); consola_imprimir_dec(puerto); consola_imprimir_linea("");
+            return;
+        }
+        if (str_igual(linea, "transmitir") || (!*arg && !str_igual(linea, "recibir"))) {
+            uint8_t ip[4]; uint16_t puerto; char host[20];
+            red_mensajes_obtener_destino(ip, &puerto);
+            consola_imprimir_linea("Uso: transmitir <mensaje> | recibir | transmitir destino <IP> [puerto]");
+            consola_imprimir("Destino Windows: "); consola_imprimir(red_ip_a_texto(ip, host, sizeof(host)));
+            consola_imprimir(":"); consola_imprimir_dec(puerto); consola_imprimir_linea("");
+            return;
+        }
+        char respuesta[RED_MENSAJE_MAX + 1];
+        int leyendo = str_igual(linea, "recibir");
+        consola_imprimir_linea(leyendo ? "Consultando respuestas de Windows..." : "Enviando mensaje a Windows...");
+        int r = leyendo ? red_mensaje_recibir(respuesta, sizeof(respuesta)) : red_mensaje_transmitir(arg);
+        if (r < 0) {
+            consola_imprimir("No se pudo completar el intercambio (codigo ");
+            consola_imprimir_dec((uint64_t)(-r)); consola_imprimir_linea("). Comprueba red dhcp y la terminal Windows.");
+            serial_imprimir("[MENSAJES_LAN] ERROR="); serial_imprimir_dec((uint64_t)(-r)); serial_imprimir_linea("");
+        } else if (!leyendo) {
+            consola_imprimir_linea("[OK] Windows confirma mensaje recibido.");
+            serial_imprimir_linea("[MENSAJES_LAN] ENVIADO=1");
+        } else if (r == 0) {
+            consola_imprimir_linea("No hay respuestas nuevas de Windows.");
+            serial_imprimir_linea("[MENSAJES_LAN] COLA_VACIA=1");
+        } else {
+            consola_imprimir("Windows: "); consola_imprimir_linea(respuesta);
+            serial_imprimir("[MENSAJES_LAN] RECIBIDO=1 TEXTO="); serial_imprimir_linea(respuesta);
+        }
+        return;
+    }
+
+    // COMANDO: red / ethernet / nic / lan (soporte de red cableada)
+    if (str_igual(linea, "red") || str_comienza_con(linea, "red ") ||
+        str_igual(linea, "ethernet") || str_comienza_con(linea, "ethernet ") ||
+        str_igual(linea, "nic") || str_comienza_con(linea, "nic ") ||
+        str_igual(linea, "lan") || str_comienza_con(linea, "lan ")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "red ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "ethernet ")) arg = str_saltar_espacios(linea + 9);
+        else if (str_comienza_con(linea, "nic ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "lan ")) arg = str_saltar_espacios(linea + 4);
+        ejecutar_comando_red(arg);
+        return;
+    }
+
     // COMANDO: apic / irq
     if (str_comienza_con(linea, "apic") || str_comienza_con(linea, "irq")) {
         const char *arg = NULL;
@@ -3571,6 +3980,30 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea_color("==> Reproduciendo sintonía de introducción (7,152 s)...", COLOR_PROMPT_DEFAULT);
         uint32_t tam = (uint32_t)(_binary_audio_arranque_bin_end - _binary_audio_arranque_bin_start);
         audio_ac97_reproducir_pcm(_binary_audio_arranque_bin_start, tam);
+        return;
+    }
+
+    if (str_igual(linea, "intel") || str_comienza_con(linea, "intel ")) {
+        const char *arg = str_igual(linea, "intel") ? "" : str_saltar_espacios(linea + 5);
+        if (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "r0") || str_igual(arg, "h1")) {
+            intel_diagnostico_ring0_ejecutar();
+        } else if (str_igual(arg, "estado") || str_igual(arg, "drv")) {
+            i915_imprimir_estado();
+        } else if (str_igual(arg, "vcs") || str_igual(arg, "trabajo") || str_igual(arg, "batch")) {
+            uint32_t res = 0;
+            i915_vcs_primer_trabajo(0x5441454BU, &res);
+            consola_imprimir_linea_color("==> [ AVISO ] Envío de trabajos VCS deshabilitado temporalmente.", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea("Requisitos pendientes antes de submission:");
+            consola_imprimir_linea(" 1. Ownership formal de GGTT (protección estricta de apertura BAR2 GOP)");
+            consola_imprimir_linea(" 2. Verificación de direccionamiento DMA y estado de tablas VT-d");
+            consola_imprimir_linea(" 3. Selección de plataforma y protocolo de recuperación de motor");
+        } else {
+            intel_inventario_imprimir_h0();
+            consola_imprimir_linea_color("  Comandos disponibles:", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea("   intel probar  : Autodiagnóstico del runtime en Ring 0.");
+            consola_imprimir_linea("   intel estado  : Consulta pasiva del controlador i915 (sin MMIO/BusMaster).");
+            consola_imprimir_linea("   intel vcs     : Envío VCS (deshabilitado temporalmente).");
+        }
         return;
     }
 
@@ -3749,7 +4182,9 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "open ")) arg = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "play ")) arg = str_saltar_espacios(linea + 5);
         else if (str_comienza_con(linea, "reproducir ")) arg = str_saltar_espacios(linea + 11);
-        ejecutar_comando_abrir(arg);
+        if(arg && (str_comienza_con(arg,"ram ") || str_comienza_con(arg,"usb ") || str_comienza_con(arg,"bench ") || str_comienza_con(arg,"prueba ")))
+            ejecutar_reproducir_mp4_vfs(arg);
+        else ejecutar_comando_abrir(arg);
         return;
     }
 

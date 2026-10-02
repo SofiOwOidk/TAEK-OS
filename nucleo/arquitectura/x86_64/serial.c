@@ -4,7 +4,27 @@
 static int  g_serial_listo = 0;
 static char g_kernel_log[KERNEL_LOG_TAMANO];
 static uint32_t g_log_cursor = 0;
-static uint32_t g_log_total_bytes = 0;
+static uint64_t g_log_total_bytes = 0;
+static unsigned char g_log_lock;
+
+static uint64_t serial_log_bloquear(void) {
+    uint64_t flags = 0;
+#ifndef TAEK_SERIAL_HOST_TEST
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__atomic_test_and_set(&g_log_lock, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+    return flags;
+}
+
+static void serial_log_desbloquear(uint64_t flags) {
+    __atomic_clear(&g_log_lock, __ATOMIC_RELEASE);
+#ifndef TAEK_SERIAL_HOST_TEST
+    __asm__ volatile ("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+#else
+    (void)flags;
+#endif
+}
 
 int serial_iniciar(void) {
     escribir_puerto_b(PUERTO_COM1 + 1, 0x00);    // Desactivar todas las interrupciones
@@ -50,15 +70,13 @@ char serial_leer_caracter(void) {
 
 void serial_escribir_caracter(char c) {
     // 1. Guardar siempre en el búfer circular de log en memoria (dmesg)
-    if (g_log_cursor < KERNEL_LOG_TAMANO - 1) {
-        g_kernel_log[g_log_cursor++] = c;
-        g_kernel_log[g_log_cursor] = '\0';
-    } else {
-        // Avance circular si se llena
-        g_kernel_log[g_log_cursor] = c;
-        g_log_cursor = (g_log_cursor + 1) % (KERNEL_LOG_TAMANO - 1);
-    }
+    uint64_t flags = serial_log_bloquear();
+    g_kernel_log[g_log_cursor] = c;
+    g_log_cursor = (g_log_cursor + 1) % (KERNEL_LOG_TAMANO - 1);
     g_log_total_bytes++;
+    // No escribir un terminador sobre bytes retenidos cuando el anillo esta lleno.
+    if (g_log_total_bytes < KERNEL_LOG_TAMANO - 1) g_kernel_log[g_log_cursor] = '\0';
+    serial_log_desbloquear(flags);
 
     // Si no hay chip UART físico activo (modo dmesg en RAM), no perder ciclos sondeando puertos I/O
     if (!g_serial_listo) return;
@@ -112,7 +130,26 @@ void serial_imprimir_dec(uint64_t valor) {
 }
 
 const char *serial_obtener_log_buffer(uint32_t *tamano_out, uint32_t *cursor_out) {
-    if (tamano_out) *tamano_out = g_log_total_bytes > KERNEL_LOG_TAMANO ? KERNEL_LOG_TAMANO : g_log_cursor;
+    if (tamano_out) *tamano_out = g_log_total_bytes >= KERNEL_LOG_TAMANO - 1 ? KERNEL_LOG_TAMANO - 1 : (uint32_t)g_log_total_bytes;
     if (cursor_out) *cursor_out = g_log_cursor;
     return g_kernel_log;
+}
+
+int serial_copiar_log(char *salida, uint32_t capacidad, uint64_t *total, uint64_t *perdidos) {
+    if (!salida) return -1;
+    uint64_t flags = serial_log_bloquear();
+    uint32_t retenidos = g_log_total_bytes < KERNEL_LOG_TAMANO - 1 ?
+        (uint32_t)g_log_total_bytes : KERNEL_LOG_TAMANO - 1;
+    if (capacidad <= retenidos) {
+        serial_log_desbloquear(flags);
+        return -1;
+    }
+    uint32_t inicio = g_log_total_bytes >= KERNEL_LOG_TAMANO - 1 ? g_log_cursor : 0;
+    for (uint32_t i = 0; i < retenidos; i++)
+        salida[i] = g_kernel_log[(inicio + i) % (KERNEL_LOG_TAMANO - 1)];
+    salida[retenidos] = '\0';
+    if (total) *total = g_log_total_bytes;
+    if (perdidos) *perdidos = g_log_total_bytes - retenidos;
+    serial_log_desbloquear(flags);
+    return (int)retenidos;
 }

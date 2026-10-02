@@ -9,6 +9,38 @@
 
 ---
 
+## 🌐 Versión validada Hito 96 — Mensajes LAN (2026-10-02)
+
+Comunicación bidireccional verificada físicamente entre TAEK en el **i7-8650U**
+(Intel I219-LM) y una terminal Windows, conectados al router por Ethernet.
+También se probaron DHCP, DNS y ping externo. La campaña actual se limita al i7;
+el i9 queda aplazado para las nuevas integraciones.
+
+El kernel y la [ISO H96](build/taek-os-h96-2026-10-02.iso) son exactamente los
+binarios probados. SHA-256 de la ISO:
+`fecf820f7893264cf60f8c784bb7ccc2f94e59b5660a8b9ec767792fd96a3fee`.
+Identidad y hashes de fuentes: `build/release-h96.json`.
+
+En el PC receptor en la red local (Windows / Linux), escuchar por TCP en el puerto `9151`:
+
+En TAEK:
+
+```text
+red dhcp
+transmitir destino 192.168.18.146 9151
+transmitir hola windows
+```
+
+Responder desde el PC con `transmitir hola i7` (o enviando el mensaje por el socket) y ejecutar `recibir` en TAEK.
+Si DHCP cambia las IP, actualizar el destino con la IP del receptor. [Guía y límites](docs/red/MENSAJES_LAN.md).
+Los problemas y sus correcciones están registrados en [Hito 96](BITACORA.md).
+
+El canal actual intercambia texto; consola remota, telemetría continua y carga
+RAM de drivers se desarrollarán en la copia experimental. El inventario i915 es
+pasivo y el envío de trabajos GPU permanece bloqueado.
+
+---
+
 ## 🤖 Desarrollo y Co-Ingeniería
 
 > **Usando apoyo de Gemini (Google DeepMind)** como copiloto de ingeniería, arquitectura de sistemas bare-metal, depuración en bajo nivel y diseño de controladores de hardware.  
@@ -50,12 +82,26 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 * Renderizado directo en el búfer de cuadros gráfico UEFI (*Linear Framebuffer RGB/BGR*).
 * Reproductor de video y animaciones integrado para secuencias gráficas de Don Cangrejo con sincronización de audio.
 
-### 🎬 Decodificador H.264 por Software en Ring 0 (Experimental)
+### 🎬 Decodificador H.264 por Software en Ring 0 (Listo — 90%)
 * Implementación **100% nativa** en C11 para Anillo 0 (*Ring 0*), sin dependencias externas, librerías de usuario ni códecs de terceros.
-* Soporte experimental para AVC/H.264 CABAC: unidades NAL, conjuntos de parámetros SPS/PPS, predicción intra e inter-cuadro, compensación de movimiento y filtro de desbloqueo (*deblocking*). CAVLC, video entrelazado, POC 1/2 y otras funciones no están soportadas; consulta [resultados y límites](H264_VALIDACION.md).
-* **Demuxer de Contenedores MP4:** Parseo directo de la estructura jerárquica de cajas/átomos ISO Base Media File Format (`moov`, `trak`, `mdia`, `stbl`, tablas de muestras y chunks).
-* Reconstrucción y conversión de espacio de color YUV420p a RGB/BGR en memoria física con volcado en tiempo real directamente sobre el *framebuffer* lineal UEFI GOP.
-* Reproducción interactiva e integración directa en la consola del núcleo.
+* **Motor AVC/H.264 maduro:** Soporte para unidades NAL, SPS/PPS, entropía CABAC completa, predicción intra e inter-cuadro, compensación de movimiento fraccionaria y filtro de desbloqueo (*in-loop deblocking filter*).
+* **Aceleración Vectorial y Paralelismo:** Optimización con instrucciones SIMD SSE2 en etapas críticas y paralelismo multinúcleo SMP (escalado a 1, 2 y 4 núcleos en hardware real).
+* **Demuxer de Contenedores MP4:** Parseo directo de la jerarquía ISO Base Media File Format (`moov`, `trak`, `mdia`, `stbl`, tablas de muestras y chunks) con doble buffering de audio y video.
+* Conversión de espacio de color YUV420p a RGB/BGR en memoria física con volcado en tiempo real directamente sobre el *framebuffer* lineal UEFI GOP, sincronizado con pistas de audio AAC/MP3.
+* *Nota de alcance (90% listo):* El 10% restante corresponde a características avanzadas o poco frecuentes no requeridas para el objetivo del sistema (tales como CAVLC heredado, video entrelazado, campos o modos exóticos de POC). Consulta [pipeline multimedia y comandos de validación](MULTIMEDIA_PIPELINE.md).
+
+### 🎮 Decodificación por Hardware / Driver GPU Intel i915 (Experimental — En Desarrollo)
+* Driver nativo para GPUs integradas Intel (arquitecturas Gen8/Gen9/Gen9.5, probado en hardware real sobre Intel Core i7-8650U con GPU UHD Graphics 620).
+* Infraestructura en Ring 0 con gestión de objetos de memoria GEM, mapeo de tablas de traducción global GGTT y control de registros MMIO.
+* Inicialización del motor **VCS0 (Video Command Streamer)** y parseador de estructuras VA-API bare-metal (extracción RBSP, parámetros SPS/PPS, Slice Header y buffers de comandos MFX/BSD).
+* > [!WARNING]
+  > **Estado Experimental:** El backend de decodificación por hardware se encuentra **en desarrollo activo**. Aún falta completar la ejecución y validación completa de lotes de fotogramas en silicio real; la submission de comandos y la sincronización por interrupciones permanecen en desarrollo en la rama experimental antes de declararse estables.
+
+### 🌐 Transmisión por Red y Comunicación LAN (Intel Ethernet / TCP-IP)
+* Controlador bare-metal para adaptadores Gigabit Ethernet Intel (validado físicamente en **Intel I219-LM** sobre el i7-8650U y probado en emulación con **e1000/e1000e**).
+* Pila TCP/IPv4 autónoma en Anillo 0: resolución de direcciones ARP, cliente **DHCP** automático, cliente de resolución de nombres **DNS**, ping **ICMP** y cliente **HTTP**.
+* **Mensajería Bidireccional LAN:** Protocolo de intercambio de mensajes con Windows mediante sockets TCP dedicados (puerto 9151), con cola en memoria RAM, verificación de tramas y acuses de recibo (ACK).
+* **Streaming Interactivo y Telemetría:** Soporte para espejo interactivo de consola por TCP (puerto 9153) y consola remota de diagnóstico (puerto 9152), permitiendo control interactivo bidireccional desde un PC conectado a la red.
 
 ### 🐧 Capa de Compatibilidad Linux Shim
 * Infraestructura de compatibilidad a nivel de kernel diseñada para facilitar la adaptación de módulos y controladores complejos (gestión de `mutex`, `waitqueue`, `workqueue`, temporizadores e interfaces RPC para el microcontrolador GSP de tarjetas gráficas modernas).
@@ -64,10 +110,15 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 * Consola de comandos interactiva en vivo con soporte para depuración y exploración del hardware:
   * `ayuda`: Catálogo de comandos disponibles.
   * `pci`: Escaneo e inspección exhaustiva de dispositivos en el bus PCI/PCIe.
+  * `gpu`: Diagnóstico especializado de la GPU, VRAM y registros MMIO.
   * `audio`: Reproducción y pruebas de los subsistemas de audio HDA/AC97.
   * `video`: Lanzador de animaciones multimedia.
-  * `h264`: Reproductor de video H.264/MP4 por software.
-  * `huevo`: Diagnóstico del estado del canario de integridad.
+  * `h264`: Reproductor de video H.264/MP4 por software (`h264 360p`, `h264 1080p`, pruebas multihilo).
+  * `red`: Configuración y diagnóstico de red: `red dhcp`, `red ping <ip|host>`, `red dns <host>`, `red http <host>`, `red estado`.
+  * `transmitir <mensaje>` / `recibir`: Comunicación bidireccional de mensajes con la terminal Windows por LAN (puerto 9151).
+  * `stream iniciar <ip> [puerto]` / `stream detener`: Espejo interactivo de consola por TCP en tiempo real.
+  * `remoto iniciar <ip> [puerto]` / `remoto detener`: Consola remota de diagnóstico por TCP.
+  * `huevo`: Diagnóstico del estado del canario de integridad (`0xDEADBEEFCAFECAFE`).
   * `apagar` / `reiniciar`: Gestión de energía mediante controladores ACPI y teclado PS/2 / 8042.
 
 ---
@@ -77,7 +128,7 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 ### Requisitos Previos
 * **Compilador C:** `clang` (con soporte para destino `x86_64-elf` o `x86_64-unknown-linux-gnu`).
 * **Ensamblador:** `nasm`.
-* **Herramientas de construcción:** `make`, `mtools`, `xorriso`.
+* **Herramientas de construcción:** `make`, `mtools`, `xorriso`, `ffmpeg` y Python 3.
 * **Bootloader:** Limine (incluido en el repositorio).
 * **Emulador (Opcional):** QEMU x86_64 con firmware `OVMF.fd`.
 
@@ -86,19 +137,18 @@ Desde PowerShell en Windows:
 ```powershell
 .\run.ps1
 ```
-Este script automatiza:
-1. La compilación de los módulos en C y ensamblador utilizando WSL (Arch Linux / LLVM Clang).
-2. La creación del medio booteable FAT32 UEFI (`build/taek-os.img` o `.iso`).
-3. El lanzamiento de **QEMU x86_64** con soporte UEFI (`OVMF`), emulación de audio HDA/AC97, puertos USB 3.0 xHCI y telemetría por consola serie en la terminal.
+Este script arranca la ISO H96 conservada, con UEFI, audio HDA, USB xHCI,
+Ethernet e1000e y consola serie. `./run.ps1 -Recompilar` genera una nueva imagen
+con WSL/Arch; una recompilación requiere su propia validación.
 
 ### 2. Ejecución en Hardware Real (Bare Metal)
-1. Generar la imagen booteable:
+1. Usar la ISO H96 ya compilada. Para recompilar los fuentes:
    ```bash
    make iso
    ```
-2. Flashear el archivo ISO generado (`build/taek-os.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
+2. Flashear el archivo ISO generado (`build/taek-os-h96-2026-10-02.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
    ```bash
-   sudo dd if=build/taek-os.iso of=/dev/sdX bs=4M status=progress conv=fsync
+   sudo dd if=build/taek-os-h96-2026-10-02.iso of=/dev/sdX bs=4M status=progress conv=fsync
    ```
 3. Conectar la memoria USB a tu equipo, desactivar *Secure Boot* en la BIOS/UEFI, y arrancar desde el dispositivo USB.
 
@@ -111,14 +161,26 @@ taek-os/
 ├── boot/                      # Configuración y binarios de Limine Bootloader
 ├── nucleo/
 │   ├── arquitectura/x86_64/   # IDT, GDT, APIC, interrupciones, serial y VMX
-│   ├── base/                  # Memoria, DMA, canarios del Huevo y tiempo
-│   ├── controladores/         # Drivers: xHCI (USB 3.x), Audio HDA/AC97, Video/H.264, Teclado, Terminal
-│   ├── principal.c            # Punto de entrada del kernel (kmain)
-├── Recursos Asets/            # Medios, texturas, fuentes y pistas de audio/video
+│   ├── base/                  # Memoria, paginación, DMA, canarios del Huevo y tiempo
+│   ├── controladores/         # Drivers del sistema
+│   │   ├── multimedia/        # Decodificador H.264 por CPU (Listo 90%), AAC, MP3, MP4 demuxer
+│   │   ├── video/             # Driver Intel i915 VCS/GEM (Experimental), GPU diagnóstico, pantalla GOP
+│   │   ├── red/               # Ethernet Intel (I219-LM / e1000), pila TCP/IP, mensajes LAN, streaming
+│   │   └── xhci, audio, vfs…  # USB 3.x, Audio HDA/AC97, sistemas de archivos (FAT32/exFAT/NTFS/ext4)
+│   ├── compatibilidad/        # Capa Linux Shim y runtime i915
+│   └── principal.c            # Punto de entrada del kernel (kmain)
+├── docs/                      # Documentación técnica y guías de red
+├── recursos/assets/           # Medios, texturas y pistas de audio/video
 ├── BITACORA.md                # Registro histórico de hitos y sesiones de ingeniería
+├── MULTIMEDIA_PIPELINE.md     # Documentación y validación del pipeline multimedia H.264
 ├── Makefile                   # Reglas de compilación y enlace
 └── run.ps1                    # Script automatizado de compilación y prueba en QEMU
 ```
+
+> El árbol de integración y el estado experimental se mantienen en
+> [docs/ESTRUCTURA_PROYECTO.md](docs/ESTRUCTURA_PROYECTO.md). Se revisa cada vez
+> que el hito actual termina en `0` (Hito 70, 80, 90, 100, 110…) y el inventario
+> de archivos se regenera con `make estructura`.
 
 ---
 

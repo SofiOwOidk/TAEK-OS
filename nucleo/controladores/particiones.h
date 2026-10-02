@@ -22,6 +22,7 @@ int particiones_descubrir(uint8_t,struct particiones *);
 int particion_leer(const struct particion *,uint64_t,unsigned,void *,const volatile uint8_t *);
 int particion_identificar(struct particion *);
 void particiones_configurar_servicio(int (*)(void));
+int particiones_configurar_lectura(unsigned kib);
 const char *volumen_nombre(enum volumen_formato);
 const char *volumen_error(int);
 #endif

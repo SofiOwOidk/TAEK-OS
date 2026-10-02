@@ -29,6 +29,7 @@ typedef struct {
     mp4_lectura_posicional leer_fuente;
     void *fuente_contexto;
     int64_t ultimo_error_lectura; /* Código original de la fuente; no confundir USB con corrupción MP4. */
+    int solo_indice; /* Cursor privado de lookahead: valida y avanza sin I/O. */
     uint8_t *muestra_video_buffer;
     size_t muestra_video_capacidad;
     uint8_t *muestra_audio_buffer;

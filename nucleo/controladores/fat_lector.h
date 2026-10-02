@@ -17,6 +17,8 @@ struct fat_lector_cursor {
     uint32_t indice,cluster,tortuga,potencia,pasos,total_pasos;
     unsigned puntos, proximo;
     struct fat_lector_punto punto[FAT_LECTOR_PUNTOS];
+    uint64_t sector_parcial;
+    uint8_t parcial_valido, parcial[512];
 };
 struct fat_lector_volumen {
     struct particion particion;
@@ -27,6 +29,8 @@ struct fat_lector_volumen {
     struct fat_lector_cursor bitmap;
     uint64_t bitmap_pagina;
     uint8_t bitmap_cache[512];
+    uint64_t fat_sector[4];
+    uint8_t fat_valido[4], fat_cache[4][512];
 };
 struct fat_lector_iterador {
     struct fat_lector_cursor cursor;

@@ -1,0 +1,20 @@
+{
+  "created_utc": "2026-10-02T18:16:38.901761+00:00",
+  "platform": "i7 de octava generacion / Intel I219-LM; IP 192.168.18.135",
+  "windows": "192.168.18.146:9151",
+  "windows_to_taek": "Hola SofiOwOidk, te saludo desde windows",
+  "application_ack": true,
+  "user_confirmation": "Ya funciono",
+  "taek_to_windows": "hola windows",
+  "log_sha256": "c8799a67e6d60ac85bb8ece6755cc17482da81d47b6fc3c61783d082c998ae04",
+  "observed_issue": "Dos receptores SO_REUSEADDR en el mismo puerto; colas independientes",
+  "changes": "Un receptor SO_EXCLUSIVEADDRUSE; destino TAEK fijado explicitamente",
+  "causality_limit": "Sin captura de paquetes del intento fallido; el codigo 3 agrupa fallos TCP. No se aislo cual de ambas correcciones resolvio el intento.",
+  "receiver_tests": "PASS 4 suites sockets Windows y prueba QEMU despues de cambiar servidor",
+  "qemu_result": "OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/qemu-mensajes-20261002T181514753182Z/resultado.json",
+  "tool_hashes": {
+    "herramientas/intel/terminal_mensajes.py": "9b9fe09c7cbcc3fa46f08757c25272e030259ddc34b0720c8c0af1ed9a4523ad",
+    "herramientas/intel/abrir_terminal_mensajes.ps1": "8e212f2b080711a80b6021080f39ba2ee8b3600a4afa3daae02a1174c021c476",
+    "tests/red/pruebas_terminal_mensajes.py": "2c472150598e704e41170515c2f558657204e04137650c4427b68e0e2ef402d4"
+  }
+}

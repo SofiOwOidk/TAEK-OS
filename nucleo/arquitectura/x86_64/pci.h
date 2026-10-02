@@ -46,6 +46,8 @@ void     pci_escribir_config_16(uint8_t bus, uint8_t ranura, uint8_t funcion, ui
 void     pci_escribir_config_8 (uint8_t bus, uint8_t ranura, uint8_t funcion, uint8_t desplazamiento, uint8_t valor);
 
 void pci_iniciar(void);
+/* Consulta de estado sin efecto: no dispara la enumeración PCI. */
+int  pci_esta_iniciado(void);
 int  pci_obtener_conteo(void);
 const struct dispositivo_pci *pci_obtener_dispositivo(int indice);
 const struct dispositivo_pci *pci_obtener_gpu_primaria(void);

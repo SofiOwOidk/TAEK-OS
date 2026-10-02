@@ -289,6 +289,9 @@ void free_irq(unsigned int irq, void *dev);
 // Funciones del Linux Shim
 void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *dma_handle, unsigned int flag);
 void  dma_free_coherent(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle);
+/* Igual que dma_free_coherent pero devuelve 0/-1 para contabilidad interna.
+ * La API publica conserva el retorno void esperado por upstream. */
+int   dma_free_coherent_ex(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle);
 
 void *ioremap(phys_addr_t offset, size_t size);
 void *ioremap_nocache(phys_addr_t offset, size_t size);

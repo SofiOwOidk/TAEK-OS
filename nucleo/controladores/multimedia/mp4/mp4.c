@@ -335,6 +335,7 @@ mp4_resultado mp4_abrir_fuente(mp4_contenedor *m, uint64_t bytes,
 static int mp4_leer_muestra(mp4_contenedor *m, int pista, uint64_t offset, size_t tam,
                             uint8_t *buffer, size_t capacidad, const uint8_t **datos) {
     if (offset > m->bytes || (uint64_t)tam > m->bytes - offset) return MP4_DATOS_INVALIDOS;
+    if (m->solo_indice) { *datos = NULL; return 1; }
     if (m->leer_fuente) {
         if (!buffer || tam > capacidad) return MP4_LIMITE_EXCEDIDO;
         if (mp4_leer_exacto(m,pista,offset,buffer,tam)!=MP4_OK)

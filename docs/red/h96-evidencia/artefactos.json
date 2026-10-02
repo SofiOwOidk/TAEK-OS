@@ -1,0 +1,17 @@
+{
+  "purpose": "M02: inventario pasivo, submission i915 bloqueada",
+  "kernel": {
+    "path": "/mnt/c/Users/Pat/AndroidStudioProjects/taek-os/OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/iso_root/boot/nucleo.elf",
+    "sha256": "55ad437c5a2d361a545e8433bf7231274a498879c7078b2906baf81c4b84f6f0"
+  },
+  "iso": {
+    "path": "/mnt/c/Users/Pat/AndroidStudioProjects/taek-os/OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/taek-i915-m02.iso",
+    "sha256": "fecf820f7893264cf60f8c784bb7ccc2f94e59b5660a8b9ec767792fd96a3fee"
+  },
+  "sources": {
+    "path": "fuentes.json",
+    "sha256": "342b7fccdceaf9d6bef14668aced1e592c75337f4b6bb814d122583b123797bd"
+  },
+  "config": "timeout: 3\n\n/TAEK OS - i915 M02 inventario pasivo\n    protocol: limine\n    path: boot():/boot/nucleo.elf\n    cmdline: modo=xhci intel=inventario\n",
+  "hardware": "NO EJECUTADO; se requiere captura en i7 de octava generacion / 5917; i9 aplazado"
+}

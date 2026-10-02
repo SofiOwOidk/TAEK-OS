@@ -14,7 +14,13 @@ static uint16_t checksum16(uint16_t n,uint8_t b){return (uint16_t)(((n>>1)|(n<<1
 void fat_lector_desmontar(struct fat_lector_volumen *v){if(v->upcase)liberar_memoria(v->upcase);memset(v,0,sizeof(*v));}
 static int siguiente_cluster(struct fat_lector_volumen *v,uint32_t c,uint32_t *salida,const volatile uint8_t *cancel){
     if(!valido(v,c))return VOLUMEN_CORRUPTO;
-    uint8_t s[512];int r=particion_leer(&v->particion,v->fat+(uint64_t)c*4/512,1,s,cancel);if(r)return r;
+    uint64_t lba=v->fat+(uint64_t)c*4/512;unsigned slot=(unsigned)(lba%4);
+    int r=particion_leer(&v->particion,0,0,v->fat_cache[slot],cancel);if(r)return r;
+    if(!v->fat_valido[slot] || v->fat_sector[slot]!=lba) {
+        r=particion_leer(&v->particion,lba,1,v->fat_cache[slot],cancel);if(r)return r;
+        v->fat_sector[slot]=lba;v->fat_valido[slot]=1;
+    }
+    uint8_t *s=v->fat_cache[slot];
     uint32_t n=u32(s+(c*4u%512));if(!v->exfat)n&=0x0fffffff;
     if((v->exfat && n==0xffffffff) || (!v->exfat && n>=0x0ffffff8))return 1;
     /* Libre=0, reservado=1, defectuoso=fffffff7 y fuera de heap nunca son EOF. */
@@ -55,7 +61,7 @@ int64_t fat_lector_leer(struct fat_lector_volumen *v,struct fat_lector_cursor *c
     if(off>=c->nodo.longitud || !cantidad)return 0;
     if(cantidad>INT64_MAX)return VOLUMEN_CORRUPTO;
     if(cantidad>c->nodo.longitud-off)cantidad=(size_t)(c->nodo.longitud-off);
-    uint8_t *dst=buf;size_t hechos=0;uint8_t sector[512];
+    uint8_t *dst=buf;size_t hechos=0;
     while(hechos<cantidad){
         int identidad=particion_leer(&v->particion,0,0,dst,cancel);if(identidad)return identidad;
         uint64_t indice=(off+hechos)/v->bytes_cluster;if(indice>=v->clusters)return VOLUMEN_CORRUPTO;
@@ -65,9 +71,27 @@ int64_t fat_lector_leer(struct fat_lector_volumen *v,struct fat_lector_cursor *c
         if(n>v->bytes_cluster-dentro)n=v->bytes_cluster-dentro;
         if(off+hechos>=c->nodo.valida){memset(dst+hechos,0,n);hechos+=n;continue;}
         if(n>c->nodo.valida-(off+hechos))n=(size_t)(c->nodo.valida-(off+hechos));
+        /* Agrupar sólo después de recorrer/validar FAT y bitmap. Nunca
+         * inferir contigüidad por offsets MP4 o por número de cluster. */
+        if(!(dentro%512) && n>=512) {
+            size_t objetivo=cantidad-hechos;
+            if(objetivo>262144)objetivo=262144; /* tope READ(10): 256 KiB */
+            if(objetivo>c->nodo.valida-(off+hechos))objetivo=(size_t)(c->nodo.valida-(off+hechos));
+            struct fat_lector_cursor prueba=*c;
+            while(n<objetivo) {
+                uint32_t anterior=prueba.cluster;
+                r=localizar(v,&prueba,prueba.indice+1,cancel);
+                if(r)return r>0?VOLUMEN_CORRUPTO:r;
+                if(prueba.cluster!=anterior+1)break;
+                if(c!=&v->bitmap){r=asignado(v,prueba.cluster,cancel);if(r)return r;}
+                size_t k=objetivo-n;if(k>v->bytes_cluster)k=v->bytes_cluster;n+=k;
+            }
+        }
         uint64_t lba=v->datos+(uint64_t)(c->cluster-2)*v->sectores_cluster+dentro/512;
-        if((dentro%512) || n<512){size_t k=512-dentro%512;if(k>n)k=n;r=particion_leer(&v->particion,lba,1,sector,cancel);if(r)return r;memcpy(dst+hechos,sector+dentro%512,k);n=k;}
-        else {unsigned bloques=(unsigned)(n/512);if(bloques>128)bloques=128;r=particion_leer(&v->particion,lba,bloques,dst+hechos,cancel);if(r)return r;n=(size_t)bloques*512;}
+        if((dentro%512) || n<512){size_t k=512-dentro%512;if(k>n)k=n;
+            if(!c->parcial_valido || c->sector_parcial!=lba){r=particion_leer(&v->particion,lba,1,c->parcial,cancel);if(r)return r;c->sector_parcial=lba;c->parcial_valido=1;}
+            memcpy(dst+hechos,c->parcial+dentro%512,k);n=k;}
+        else {unsigned bloques=(unsigned)(n/512);if(bloques>512)bloques=512;/* 256 KiB */r=particion_leer(&v->particion,lba,bloques,dst+hechos,cancel);if(r)return r;n=(size_t)bloques*512;}
         hechos+=n;
     }
     return (int64_t)hechos;

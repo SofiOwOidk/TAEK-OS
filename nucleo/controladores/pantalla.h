@@ -16,5 +16,8 @@ void pantalla_desplazar_arriba(int lineas, uint32_t color_fondo);
 
 uint64_t pantalla_obtener_ancho(void);
 uint64_t pantalla_obtener_alto(void);
+void    *pantalla_obtener_base(void);
+uint64_t pantalla_obtener_tamano_bytes(void);
+uint64_t pantalla_obtener_stride_bytes(void);
 
 #endif // CONTROLADORES_PANTALLA_H

@@ -5,6 +5,13 @@ static uint16_t u16(const uint8_t *p){return p[0]|((uint16_t)p[1]<<8);}
 static uint32_t u32(const uint8_t *p){return u16(p)|((uint32_t)u16(p+2)<<16);}
 static uint64_t u64(const uint8_t *p){return u32(p)|((uint64_t)u32(p+4)<<32);}
 static int (*servicio)(void);
+static unsigned lectura_sectores=8; /* conservar valor previo hasta medir */
+int particiones_configurar_lectura(unsigned kib) {
+    /* Tamano de cada READ(10)/WRITE(10) en KiB. 512 B/sector => kib*2 sectores.
+       El maximo coincide con el bufer DMA de USB MSC (256 KiB = 512 sectores). */
+    if(kib!=4 && kib!=16 && kib!=32 && kib!=64 && kib!=128 && kib!=256)return 0;
+    lectura_sectores=(uint16_t)(kib*2);return 1;
+}
 void particiones_configurar_servicio(int (*f)(void)){servicio=f;}
 static uint32_t crc(uint32_t c,const uint8_t *p,unsigned n){while(n--){c^=*p++;for(unsigned b=0;b<8;b++)c=(c>>1)^(0xedb88320u&-(c&1));}return c;}
 int particion_leer(const struct particion *p,uint64_t sector,unsigned n,void *buf,const volatile uint8_t *cancel) {
@@ -23,7 +30,7 @@ int particion_leer(const struct particion *p,uint64_t sector,unsigned n,void *bu
         const struct usb_msc_dispositivo *dev=usb_msc_obtener_dispositivo(p->unidad);
         if(!dev || !dev->activo || !dev->listo || dev->generacion!=p->generacion_msc)return VOLUMEN_DESCONECTADO;
         if(dev->tamano_sector!=512)return VOLUMEN_SECTOR_NO_SOPORTADO;
-        unsigned k=n>8?8:n;uint64_t lba=p->inicio+sector;
+        unsigned k=n>lectura_sectores?lectura_sectores:n;uint64_t lba=p->inicio+sector;
         if(lba>UINT32_MAX || k>dev->sectores_totales || lba>dev->sectores_totales-k)return VOLUMEN_CORRUPTO;
         if(usb_msc_leer_sectores(p->unidad,(uint32_t)lba,(uint16_t)k,d))return VOLUMEN_TRANSPORTE;
         dev=usb_msc_obtener_dispositivo(p->unidad);

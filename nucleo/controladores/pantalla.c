@@ -27,6 +27,18 @@ uint64_t pantalla_obtener_alto(void) {
     return g_alto;
 }
 
+void *pantalla_obtener_base(void) {
+    return g_fb_base;
+}
+
+uint64_t pantalla_obtener_tamano_bytes(void) {
+    return g_alto * g_pitch;
+}
+
+uint64_t pantalla_obtener_stride_bytes(void) {
+    return g_pitch;
+}
+
 void pantalla_dibujar_pixel(int x, int y, uint32_t color) {
     if (!g_fb_base || x < 0 || x >= (int)g_ancho || y < 0 || y >= (int)g_alto) {
         return;

@@ -1,5 +1,6 @@
 #include "decodificador.h"
 #include "etapas_sse2.h"
+#include "invariante_smp.h"
 #define RECON_MAX_MB 8192
 #define RECON_MAX_FILAS 256
 typedef struct {int32_t coef[24][16];int modo16;} datos_mb;
@@ -7,9 +8,10 @@ struct h264_reconstruccion {
     datos_mb *datos;
     unsigned capacidad, primero, fin, fallo;
     unsigned avance[RECON_MAX_FILAS];
+    uint8_t vista[RECON_MAX_FILAS];
     h264_decodificador *privados[4];
     h264_decodificador *dueno;
-    uint64_t cpu[4], espera[4];
+    uint64_t cpu[4], espera[4], regiones[4];
 };
 static uint64_t reloj(void){unsigned a,d;__asm__ volatile("lfence;rdtsc":"=a"(a),"=d"(d)::"memory");return ((uint64_t)d<<32)|a;}
 void h264_cancelar_trabajadores(h264_decodificador *d) {
@@ -53,6 +55,8 @@ static void fila(void *u,unsigned region,unsigned ejecutor) {
     unsigned ini=y*ancho<r->primero?r->primero:y*ancho;
     unsigned fin=(y+1)*ancho>r->fin?r->fin:(y+1)*ancho;
     uint64_t inicio=reloj();
+    r->regiones[ejecutor]++;
+    if(region<RECON_MAX_FILAS)r->vista[region]++;
     for(unsigned idx=ini;idx<fin;idx++) {
         unsigned x=idx%ancho;
         if(!ejecutor && (x&7)==0 && r->dueno->servicio_coordinador &&
@@ -64,6 +68,9 @@ static void fila(void *u,unsigned region,unsigned ejecutor) {
             while(__atomic_load_n(&r->avance[y-1],__ATOMIC_ACQUIRE)<requerido &&
                   !__atomic_load_n(&r->fallo,__ATOMIC_ACQUIRE))__asm__ volatile("pause");
             r->espera[ejecutor]+=reloj()-t;
+#if H264_TELEMETRIA_DETALLADA
+            if(r->dueno->traza)r->dueno->traza(r->dueno->usuario_traza,ejecutor,5,d->actual->tiempo,t,reloj(),((uint64_t)y<<32)|requerido);
+#endif
         }
         if(__atomic_load_n(&r->fallo,__ATOMIC_ACQUIRE))break;
         h264_mb privado=d->actual->mb[idx];d->mb_actual=idx;d->mb_privado=&privado;
@@ -76,14 +83,17 @@ static void fila(void *u,unsigned region,unsigned ejecutor) {
     /* Desbloquear dependientes al cancelar; ninguno sigue reconstruyendo. */
     __atomic_store_n(&r->avance[y],ancho,__ATOMIC_RELEASE);
     r->cpu[ejecutor]+=reloj()-inicio;
+#if H264_TELEMETRIA_DETALLADA
+    if(r->dueno->traza)r->dueno->traza(r->dueno->usuario_traza,ejecutor,4,d->actual->tiempo,inicio,reloj(),y);
+#endif
 }
 int h264_reconstruccion_ejecutar(h264_decodificador *d,unsigned primero,unsigned fin) {
     struct h264_reconstruccion *r=d->reconstruccion;
     r->primero=primero;r->fin=fin;r->dueno=d;r->fallo=0;
     /* El parser acaba antes de publicar: SPS/PPS/MB sintácticos y referencias
      * permanecen inmutables hasta el retorno síncrono del backend. */
-    for(unsigned i=0;i<4;i++){r->cpu[i]=r->espera[i]=0;}
-    for(unsigned y=0;y<d->s->alto_mb;y++)r->avance[y]=0;
+    for(unsigned i=0;i<4;i++){r->cpu[i]=r->espera[i]=0;r->regiones[i]=0;}
+    for(unsigned y=0;y<d->s->alto_mb;y++){r->avance[y]=0;r->vista[y]=0;}
     for(unsigned i=0;i<d->trabajadores;i++) {
         h264_decodificador *p=r->privados[i];p->s=d->s;p->p=d->p;p->sl=d->sl;
         p->actual=d->actual;p->slice_id=d->slice_id;p->inter_sse2=d->inter_sse2;
@@ -94,10 +104,26 @@ int h264_reconstruccion_ejecutar(h264_decodificador *d,unsigned primero,unsigned
     unsigned filas=(fin-1)/d->s->ancho_mb-primero/d->s->ancho_mb+1;
     uint64_t inicio=reloj();
     int ok=d->ejecutar_lote(d->usuario_lote,fila,r,filas);
-    d->telemetria.ciclos_reconstruccion_pared+=reloj()-inicio;
+    uint64_t pared=reloj()-inicio;
+    d->telemetria.ciclos_reconstruccion_pared+=pared;
+    d->telemetria.lotes_reconstruccion++;
+    unsigned unicas=0,duplicadas=0,faltantes=0;
+    unicas=h264_regiones_contar(r->vista,filas,&duplicadas,&faltantes);
+    uint64_t cpu_total=0;
+    int incoherente=0;
+    for(unsigned i=0;i<4;i++) {
+        uint64_t computo = r->espera[i]<=r->cpu[i] ? r->cpu[i]-r->espera[i] : 0;
+        d->telemetria.regiones_ejecutor[i]+=r->regiones[i];
+        d->telemetria.computo_ejecutor[i]+=computo;
+        d->telemetria.espera_ejecutor[i]+=r->espera[i];
+        d->telemetria.pared_ejecutor[i]+=r->cpu[i];
+        cpu_total+=r->cpu[i];
+        if(r->espera[i]>r->cpu[i])incoherente=1;
+    }
     for(unsigned i=0;i<d->trabajadores;i++) {
         h264_telemetria *t=&r->privados[i]->telemetria;
-        d->telemetria.ciclos_reconstruccion_cpu+=r->cpu[i]-r->espera[i];
+        uint64_t computo = r->espera[i]<=r->cpu[i] ? r->cpu[i]-r->espera[i] : 0;
+        d->telemetria.ciclos_reconstruccion_cpu+=computo;
         d->telemetria.ciclos_dependencias_cpu+=r->espera[i];
         d->telemetria.ciclos_transformadas+=t->ciclos_transformadas;
         d->telemetria.ciclos_suma_residuo+=t->ciclos_suma_residuo;
@@ -106,6 +132,20 @@ int h264_reconstruccion_ejecutar(h264_decodificador *d,unsigned primero,unsigned
             d->telemetria.bloques_inter_etapa[k]+=t->bloques_inter_etapa[k];
             d->telemetria.pixeles_inter_etapa[k]+=t->pixeles_inter_etapa[k];
         }
+    }
+    d->telemetria.regiones_reconstruccion+=filas;
+    d->telemetria.regiones_ok_reconstruccion+=unicas;
+    d->telemetria.regiones_duplicadas+=duplicadas;
+    d->telemetria.regiones_faltantes+=faltantes;
+    if(ok && !r->fallo) {
+        if(unicas!=filas || duplicadas || faltantes)incoherente=1;
+        /* Invariante de reloj: el cómputo sumado de los trabajadores no puede
+         * exceder participantes*pared, salvo desincronía entre relojes por CPU.
+         * La relación se conserva aunque el lote se descarte por otra causa. */
+        uint64_t ratio_miles=0;
+        if(h264_smp_invariante(cpu_total,pared,d->trabajadores,&ratio_miles))incoherente=1;
+        if(ratio_miles>d->telemetria.ratio_worst_miles)d->telemetria.ratio_worst_miles=ratio_miles;
+        if(incoherente)d->telemetria.lotes_incoherentes++;
     }
     if(!ok || r->fallo){d->error="Lote de reconstrucción cancelado o inválido";return 0;}
     for(unsigned i=primero;i<fin;i++)d->actual->mb[i].reconstruidos=65535;

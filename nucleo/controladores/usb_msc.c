@@ -1,11 +1,20 @@
 #include "vfs.h"
 #include "usb_msc.h"
+#include "usb_msc_telemetria.h"
 #include "xhci.h"
 #include "consola.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../base/dma.h"
 #include "../base/memoria.h"
 #include "../base/tiempo.h"
+
+// Tamano del primer tramo de la fase DATA (por sector logico). Permite fechar
+// el "primer DATA recibido" con un IOC propio sin romper la transferencia.
+#define USB_MSC_TELEM_TRAMO_PRIMERO 512U
+
+// Capacidad maxima de una transaccion BOT (un READ(10)/WRITE(10) completo).
+// 256 KiB = 512 sectores; el xHCI reparte internamente en TRBs <= 64 KiB.
+#define USB_MSC_DMA_BYTES (256U * 1024U)
 
 // ============================================================================
 // TAEK OS - CONTROLADOR USB MASS STORAGE CLASS (MSC / SCSI BOT)
@@ -14,6 +23,11 @@
 
 static struct usb_msc_dispositivo g_msc_dispositivos[USB_MSC_MAX_DISPOSITIVOS] = {0};
 static int g_msc_inicializado = 0;
+static uint64_t comandos_lectura, bytes_lectura;
+void usb_msc_obtener_lecturas(uint64_t *comandos,uint64_t *bytes) {
+    if(comandos)*comandos=comandos_lectura;
+    if(bytes)*bytes=bytes_lectura;
+}
 
 // Búferes DMA contiguos físicos para transacciones BOT
 static struct usb_msc_cbw *g_cbw = NULL;
@@ -39,25 +53,40 @@ void usb_msc_iniciar(void) {
     // Asignar búferes DMA contiguos alineados a 64 bytes
     g_cbw = (struct usb_msc_cbw *)dma_asignar_bufer_contiguo(sizeof(struct usb_msc_cbw), 64, &g_cbw_fisica);
     g_csw = (struct usb_msc_csw *)dma_asignar_bufer_contiguo(sizeof(struct usb_msc_csw), 64, &g_csw_fisica);
-    g_msc_dma_buffer = (uint8_t *)dma_asignar_bufer_contiguo(65536, 64, &g_msc_dma_buffer_fisica);
+    g_msc_dma_buffer = (uint8_t *)dma_asignar_bufer_contiguo(USB_MSC_DMA_BYTES, 64, &g_msc_dma_buffer_fisica);
 
     if (g_cbw && g_csw && g_msc_dma_buffer) {
         g_msc_inicializado = 1;
-        serial_imprimir_linea("[USB MSC] Subsistema Bulk-Only Transport inicializado en Ring 0 (DMA 64KB OK).");
+        serial_imprimir("[USB MSC] Subsistema Bulk-Only Transport inicializado en Ring 0 (DMA ");
+        serial_imprimir_dec(USB_MSC_DMA_BYTES / 1024);
+        serial_imprimir_linea("KB OK).");
     } else {
         serial_imprimir_linea("[USB MSC ERROR] No se pudieron asignar búferes DMA para Mass Storage.");
     }
 }
 
-// Ejecuta una transacción SCSI completa de 3 fases bajo el protocolo BOT
-static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
+// Ejecuta una transacción SCSI completa de 3 fases bajo el protocolo BOT.
+// Si `fases` no es nulo, instrumenta cada fase con TSC y segmenta la fase DATA
+// para fechar el primer byte recibido. Un único punto de salida mantiene la
+// invariante suma(fases 0..4) == fase TOTAL.
+static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
                                        const void *cdb, uint8_t cdb_len,
-                                       void *datos, uint32_t datos_len, int es_in) {
+                                       void *datos, uint32_t datos_len, int es_in,
+                                       uint32_t primer_tramo, uint64_t *fases) {
     if (!g_msc_inicializado || !dev || !dev->activo) return -1;
     if (!g_cbw || !g_csw || !g_msc_dma_buffer) return -2;
-    if (cdb_len == 0 || cdb_len > 16 || datos_len > 65536 || (datos_len && !datos)) return -3;
+    if (cdb_len == 0 || cdb_len > 16 || datos_len > USB_MSC_DMA_BYTES || (datos_len && !datos)) return -3;
+
+    if (fases) {
+        for (unsigned i = 0; i < USB_MSC_FASE_CANTIDAD; i++) fases[i] = 0;
+    }
 
     uint32_t etiqueta = g_etiqueta_actual++;
+    uint64_t t0 = rdtsc();
+    uint64_t t_cbw = t0;
+    uint64_t t_after_data = t0;
+    uint64_t t_csw = t0;
+    int resultado = 0;
 
     // --- FASE 1: Command Block Wrapper (CBW - 31 bytes enviados por Bulk OUT) ---
     for (uint32_t i = 0; i < sizeof(struct usb_msc_cbw); i++) ((uint8_t *)g_cbw)[i] = 0;
@@ -74,11 +103,16 @@ static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
     int res = xhci_transferencia_bulk(dev->slot_id, dev->ep_out_dci,
                                      g_cbw, g_cbw_fisica,
                                      sizeof(struct usb_msc_cbw), 0 /* OUT */, 2000);
+    t_cbw = rdtsc();
+    t_after_data = t_cbw;
+    t_csw = t_cbw;
+    if (fases) fases[USB_MSC_FASE_CBW] = t_cbw - t0;
     if (res != 0) {
         serial_imprimir("  [USB MSC] Error enviando CBW (código: ");
         serial_imprimir_dec(res);
         serial_imprimir_linea(")");
-        return -10;
+        resultado = -10;
+        goto fin;
     }
 
     // --- FASE 2: Data Phase (opcional, si hay datos a transferir) ---
@@ -88,28 +122,57 @@ static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
 
         // Si es OUT (escritura de datos al dispositivo), copiar datos al búfer DMA
         if (!es_in) {
-            for (uint32_t i = 0; i < datos_len && i < 65536; i++) {
+            for (uint32_t i = 0; i < datos_len && i < USB_MSC_DMA_BYTES; i++) {
                 ((uint8_t *)buf_ptr)[i] = ((const uint8_t *)datos)[i];
             }
         }
 
         uint8_t target_dci = es_in ? dev->ep_in_dci : dev->ep_out_dci;
-        res = xhci_transferencia_bulk(dev->slot_id, target_dci,
-                                     buf_ptr, buf_fisica,
-                                     datos_len, es_in, 3000);
+        uint64_t t_evento_fin;
+        if (fases && es_in && primer_tramo > 0 && primer_tramo < datos_len) {
+            // Ruta segmentada: el IOC del primer TRB fecha el primer DATA real.
+            uint64_t c_primer = 0, c_fin = 0;
+            res = xhci_transferencia_bulk_segmentada(dev->slot_id, target_dci,
+                                                     buf_ptr, buf_fisica,
+                                                     datos_len, es_in,
+                                                     primer_tramo, 3000,
+                                                     &c_primer, &c_fin);
+            if (res == 0 && c_primer >= t_cbw && c_fin >= c_primer) {
+                t_evento_fin = c_fin;
+                fases[USB_MSC_FASE_DATA_INICIO] = c_primer - t_cbw;
+                fases[USB_MSC_FASE_DATA_RESTO]  = c_fin - c_primer;
+            } else {
+                // Timeout o error: sin marcas validas, no inventar fases.
+                t_evento_fin = t_cbw;
+                fases[USB_MSC_FASE_DATA_INICIO] = 0;
+                fases[USB_MSC_FASE_DATA_RESTO]  = 0;
+            }
+        } else {
+            res = xhci_transferencia_bulk(dev->slot_id, target_dci,
+                                          buf_ptr, buf_fisica,
+                                          datos_len, es_in, 3000);
+            t_evento_fin = rdtsc();
+            if (fases) {
+                fases[USB_MSC_FASE_DATA_INICIO] = t_evento_fin - t_cbw;
+                fases[USB_MSC_FASE_DATA_RESTO]  = 0;
+            }
+        }
         if (res != 0) {
             serial_imprimir("  [USB MSC] Error en Data Phase (código: ");
             serial_imprimir_dec(res);
             serial_imprimir_linea(")");
-            return -11;
+            resultado = -11;
+            goto fin;
         }
 
         // Si es IN (lectura de datos desde el dispositivo), copiar datos recibidos al búfer destino
         if (es_in) {
-            for (uint32_t i = 0; i < datos_len && i < 65536; i++) {
+            for (uint32_t i = 0; i < datos_len && i < USB_MSC_DMA_BYTES; i++) {
                 ((uint8_t *)datos)[i] = ((const uint8_t *)buf_ptr)[i];
             }
         }
+        t_after_data = rdtsc();
+        if (fases) fases[USB_MSC_FASE_DATA_RESTO] += t_after_data - t_evento_fin;
     }
 
     // --- FASE 3: Command Status Wrapper (CSW - 13 bytes recibidos por Bulk IN) ---
@@ -117,11 +180,14 @@ static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
     res = xhci_transferencia_bulk(dev->slot_id, dev->ep_in_dci,
                                  g_csw, g_csw_fisica,
                                  sizeof(struct usb_msc_csw), 1 /* IN */, 2000);
+    t_csw = rdtsc();
+    if (fases) fases[USB_MSC_FASE_CSW] = t_csw - t_after_data;
     if (res != 0) {
         serial_imprimir("  [USB MSC] Error recibiendo CSW (código: ");
         serial_imprimir_dec(res);
         serial_imprimir_linea(")");
-        return -12;
+        resultado = -12;
+        goto fin;
     }
 
     // --- FASE 4: Validación y Chequeo de Integridad del CSW ---
@@ -129,22 +195,39 @@ static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
         serial_imprimir("  [USB MSC ERROR] Firma CSW inválida: 0x");
         serial_imprimir_hex(g_csw->firma);
         serial_imprimir_linea("");
-        return -13;
+        resultado = -13;
+        goto fin;
     }
 
     if (g_csw->etiqueta != etiqueta) {
         serial_imprimir_linea("  [USB MSC ERROR] Desfase en etiqueta de CSW");
-        return -14;
+        resultado = -14;
+        goto fin;
     }
 
     if (g_csw->estado != USB_MSC_CSW_ESTADO_OK) {
         serial_imprimir("  [USB MSC AVISO] Comando SCSI rechazado (CSW Estado: ");
         serial_imprimir_dec(g_csw->estado);
         serial_imprimir_linea(")");
-        return -15;
+        resultado = -15;
+        goto fin;
     }
 
-    return 0; // Transacción SCSI BOT exitosa
+fin:
+    if (fases) {
+        uint64_t t_ret = rdtsc();
+        fases[USB_MSC_FASE_RETORNO] = t_ret - t_csw;
+        fases[USB_MSC_FASE_TOTAL]   = t_ret - t0;
+    }
+    return resultado; // 0 = Transacción SCSI BOT exitosa
+}
+
+// Ruta sin instrumentación: conserva el contrato previo para el resto de SCSI.
+static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
+                                       const void *cdb, uint8_t cdb_len,
+                                       void *datos, uint32_t datos_len, int es_in) {
+    return usb_msc_ejecutar_transaccion_ex(dev, cdb, cdb_len, datos, datos_len,
+                                           es_in, 0, NULL);
 }
 
 int usb_msc_registrar_dispositivo(uint8_t slot_id, uint8_t puerto_idx,
@@ -315,7 +398,7 @@ int usb_msc_leer_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, vo
         (uint64_t)lba + cantidad > dev->sectores_totales) return -4;
 
     uint32_t tamano_total = (uint32_t)cantidad * dev->tamano_sector;
-    if (tamano_total > 65536) return -3; // Límite de búfer DMA por operación
+    if (tamano_total > USB_MSC_DMA_BYTES) return -3; // Límite de búfer DMA por operación
 
     uint8_t cdb_read[10] = {
         SCSI_CMD_READ_10,
@@ -330,7 +413,23 @@ int usb_msc_leer_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, vo
         0
     };
 
-    return usb_msc_ejecutar_transaccion(dev, cdb_read, 10, buffer_destino, tamano_total, 1 /* IN */);
+    uint64_t fases[USB_MSC_FASE_CANTIDAD] = {0};
+    uint64_t espera0  = xhci_telemetria_espera_ciclos();
+    uint64_t sondeo0  = xhci_telemetria_sondeo_ciclos();
+    uint64_t timbre0  = xhci_telemetria_timbre_ciclos();
+
+    comandos_lectura++;
+    int r = usb_msc_ejecutar_transaccion_ex(dev, cdb_read, 10, buffer_destino,
+                                            tamano_total, 1 /* IN */,
+                                            USB_MSC_TELEM_TRAMO_PRIMERO, fases);
+    if(!r)bytes_lectura+=tamano_total;
+
+    usb_msc_telemetria_registrar(fases, r ? 0 : tamano_total,
+                                 xhci_telemetria_espera_ciclos() - espera0,
+                                 xhci_telemetria_sondeo_ciclos() - sondeo0,
+                                 xhci_telemetria_timbre_ciclos() - timbre0,
+                                 r == 0);
+    return r;
 }
 
 int usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, const void *buffer_origen) {
@@ -342,7 +441,7 @@ int usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad
         (uint64_t)lba + cantidad > dev->sectores_totales) return -4;
 
     uint32_t tamano_total = (uint32_t)cantidad * dev->tamano_sector;
-    if (tamano_total > 65536) return -3; // Límite de búfer DMA
+    if (tamano_total > USB_MSC_DMA_BYTES) return -3; // Límite de búfer DMA
 
     uint8_t cdb_write[10] = {
         SCSI_CMD_WRITE_10,

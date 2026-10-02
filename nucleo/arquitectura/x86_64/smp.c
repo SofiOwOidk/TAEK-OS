@@ -15,12 +15,15 @@ static volatile struct limine_smp_request peticion={.id=LIMINE_SMP_REQUEST,.revi
 typedef struct {
     uint64_t pila;
     unsigned indice, lapic, listo, epoca_vista, detenido, xmm;
+    uint64_t ticks_por_ms;
     x86_64_capacidades_simd capacidades;
     uint8_t espacio[65536];
 } datos_cpu;
 static datos_cpu cpus[TRABAJOS_MAX_CPU] __attribute__((aligned(64)));
 static trabajos_lote lote;
 static unsigned cantidad=1, detectadas=1, arrancadas=1, epoca, parar, ocupado;
+static unsigned seleccion_cpu=4;
+static int bsp_calcula=1;
 static unsigned limite_cpu=4, bsp_id;
 static uint64_t cr3;
 extern void smp_entrada(struct limine_smp_info *);
@@ -53,6 +56,9 @@ void smp_trabajador(datos_cpu *c) {
     __asm__ volatile("wrmsr"::"c"(0xc0000101),"a"((uint32_t)base),"d"((uint32_t)(base>>32)):"memory");
     c->xmm=x86_64_fpu_sse2_lista();
     c->capacidades=x86_64_fpu_capacidades_cpu();
+    /* A1.6: calibra el TSC de esta CPU contra el PIT para poder comparar
+     * relojes entre participantes. No altera el valor global del BSP. */
+    c->ticks_por_ms=tiempo_calibrar_ticks_por_ms();
     __atomic_store_n(&c->listo,1,__ATOMIC_RELEASE);
     for(;;) {
         __asm__ volatile("cli":::"memory");
@@ -66,15 +72,23 @@ void smp_trabajador(datos_cpu *c) {
             __asm__ volatile("mov %0,%%cr4;mov %1,%%cr4"::"r"(sin_global),"r"(cr4):"memory");
         }
         __asm__ volatile("mov %0,%%cr3; sti"::"r"(cr3):"memory");
-        while(trabajos_tomar(&lote,c->indice)){}
+        if(c->indice<trabajos_cpu_activas())while(trabajos_tomar(&lote,c->indice)){}
         __atomic_store_n(&c->epoca_vista,e,__ATOMIC_RELEASE);
     }
     __atomic_store_n(&c->detenido,1,__ATOMIC_RELEASE);
     for(;;)__asm__ volatile("cli; hlt");
 }
-unsigned trabajos_cpu_activas(void){return cantidad;}
+unsigned trabajos_cpu_activas(void){unsigned n=__atomic_load_n(&seleccion_cpu,__ATOMIC_RELAXED);return cantidad<n?cantidad:n;}
+int trabajos_configurar_distribucion(unsigned n,int bsp) {
+    if(trabajos_en_curso() || n<1 || n>cantidad)return 0;
+    __atomic_store_n(&seleccion_cpu,n,__ATOMIC_RELAXED);bsp_calcula=bsp || n==1;return 1;
+}
 unsigned trabajos_cpu_arrancadas(void){return arrancadas;}
 unsigned trabajos_cpu_detectadas(void){return detectadas;}
+uint64_t trabajos_ticks_por_ms(unsigned cpu){
+    if(cpu==0)return tiempo_ciclos_por_ms();
+    return cpu<cantidad?cpus[cpu].ticks_por_ms:0;
+}
 int trabajos_en_curso(void){return __atomic_load_n(&ocupado,__ATOMIC_ACQUIRE);}
 void trabajos_cancelar_actual(void){if(trabajos_en_curso())trabajos_cancelar(&lote);}
 void trabajos_limitar_cpu(unsigned n){if(n<=4)limite_cpu=n;}
@@ -119,11 +133,30 @@ int trabajos_iniciar(void) {
         serial_imprimir("SMP CPU=");serial_imprimir_dec(k);serial_imprimir(" LAPIC=");serial_imprimir_dec(p->lapic);
         serial_imprimir(" SSE2=");serial_imprimir_dec(p->capacidades.sse2);
         serial_imprimir(" AVX2_CPUID=");serial_imprimir_dec(p->capacidades.avx2);
-        serial_imprimir(" YMM_ENABLED=");serial_imprimir_dec(p->capacidades.ymm_habilitado);serial_imprimir_linea("");
+        serial_imprimir(" YMM_ENABLED=");serial_imprimir_dec(p->capacidades.ymm_habilitado);
+        serial_imprimir(" TICKS_PER_MS=");serial_imprimir_dec(p->ticks_por_ms);serial_imprimir_linea("");
     }
     serial_imprimir("SMP CPU_DETECTADAS=");serial_imprimir_dec(detectadas);
     serial_imprimir(" CPU_ARRANCADAS=");serial_imprimir_dec(arrancadas);
     serial_imprimir(" EJECUTORES=");serial_imprimir_dec(cantidad);serial_imprimir_linea(" SMT=0");
+    {
+        /* A1.6: si el TSC de un AP difiere del BSP, los ciclos no son
+         * comparables sin normalizar. Se diagnostica, no se oculta. */
+        uint64_t tsc_bsp=tiempo_ciclos_por_ms();
+        for(unsigned k=1;k<cantidad;k++){
+            uint64_t t=cpus[k].ticks_por_ms;
+            if(!t || !tsc_bsp)continue;
+            int64_t dif=(int64_t)t-(int64_t)tsc_bsp;
+            uint64_t por_mil=(uint64_t)((dif<0?-dif:dif)*1000/(int64_t)tsc_bsp);
+            if(por_mil>5){
+                serial_imprimir("SMP TSC_DESVIACION CPU=");serial_imprimir_dec(k);
+                serial_imprimir(" BSP_TICKS_PER_MS=");serial_imprimir_dec(tsc_bsp);
+                serial_imprimir(" CPU_TICKS_PER_MS=");serial_imprimir_dec(t);
+                serial_imprimir(" POR_MIL=");serial_imprimir_dec(por_mil);
+                serial_imprimir_linea(" [normalizar ciclos por CPU]");
+            }
+        }
+    }
     return cantidad>1;
 }
 int trabajos_ejecutar(trabajo_fn f,void *p,unsigned n,void (*servicio)(void *),void *u) {
@@ -131,12 +164,13 @@ int trabajos_ejecutar(trabajo_fn f,void *p,unsigned n,void (*servicio)(void *),v
     __atomic_store_n(&ocupado,1,__ATOMIC_RELEASE);
     trabajos_preparar(&lote,f,p,n);
     unsigned e=__atomic_add_fetch(&epoca,1,__ATOMIC_RELEASE);
-    for(unsigned i=1;i<cantidad;i++)despertar(cpus[i].lapic);
+    unsigned participantes=trabajos_cpu_activas();
+    for(unsigned i=1;i<participantes;i++)despertar(cpus[i].lapic);
     while(!trabajos_terminados(&lote)) {
-        trabajos_tomar(&lote,0);if(servicio)servicio(u);
+        if(bsp_calcula)trabajos_tomar(&lote,0);if(servicio)servicio(u);
         __asm__ volatile("pause");
     }
-    for(unsigned i=1;i<cantidad;i++)while(__atomic_load_n(&cpus[i].epoca_vista,__ATOMIC_ACQUIRE)!=e) {
+    for(unsigned i=1;i<participantes;i++)while(__atomic_load_n(&cpus[i].epoca_vista,__ATOMIC_ACQUIRE)!=e) {
         if(servicio)servicio(u);__asm__ volatile("pause");
     }
     __atomic_store_n(&lote.activo,0,__ATOMIC_RELEASE);

@@ -59,8 +59,14 @@ int  iommu_iniciar(void);
 // Devuelve 1 si se detectó Intel VT-d (tabla ACPI DMAR)
 int  iommu_vt_d_detectado(void);
 
-// Obtiene el estado actual del controlador IOMMU
+// Obtiene el estado actual del controlador IOMMU (inicializa si no lo estaba)
 const iommu_estado_t *iommu_obtener_estado(void);
+
+// Devuelve 1 si el subsistema IOMMU ya fue inicializado, 0 si no.
+int  iommu_esta_iniciado(void);
+
+// Consulta pasiva: devuelve el estado si ya está inicializado, NULL si no. Sin efectos colaterales.
+const iommu_estado_t *iommu_obtener_estado_pasivo(void);
 
 // Telemetría de DMAR/DRHD/RMRR. No configura root/context tables ni aísla DMA.
 int  iommu_ejecutar_autodiagnostico(void);

@@ -20,7 +20,8 @@ void *nv_os_alloc_pages(size_t size, uint64_t *dma_phys) {
 
 void nv_os_free_pages(void *cpu_addr, uint64_t dma_phys, size_t size) {
     if (!cpu_addr || size == 0) return;
-    dma_free_coherent(NULL, size, cpu_addr, (dma_addr_t)dma_phys);
+    // Solo descontar la contabilidad propia si la liberación fue aceptada.
+    if (dma_free_coherent_ex(NULL, size, cpu_addr, (dma_addr_t)dma_phys) != 0) return;
     size_t pags = (size + 4095) / 4096;
     if (g_nv_paginas_dma >= pags) {
         g_nv_paginas_dma -= pags;

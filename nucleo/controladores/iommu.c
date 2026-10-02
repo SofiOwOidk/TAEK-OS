@@ -302,6 +302,14 @@ int iommu_vt_d_detectado(void) {
     return g_estado_iommu.tabla_dmar_detectada;
 }
 
+int iommu_esta_iniciado(void) {
+    return g_iommu_iniciado;
+}
+
+const iommu_estado_t *iommu_obtener_estado_pasivo(void) {
+    return g_iommu_iniciado ? &g_estado_iommu : NULL;
+}
+
 const iommu_estado_t *iommu_obtener_estado(void) {
     if (!g_iommu_iniciado) iommu_iniciar();
     return &g_estado_iommu;
@@ -312,8 +320,8 @@ int iommu_ejecutar_autodiagnostico(void) {
     if (!g_iommu_iniciado) iommu_iniciar();
 
     if (!g_estado_iommu.tabla_dmar_detectada) {
-        serial_imprimir_linea("[INFO] Plataforma sin tabla ACPI DMAR. Operando en modo DMA Directo Físico 1:1.");
-        serial_imprimir_linea("[OK] Bus PCIe autorizado para transacciones directas Bus Master sin aislamiento IOMMU.");
+        serial_imprimir_linea("[INFO] Plataforma sin tabla ACPI DMAR. Traducción VT-d inactiva (DMA 1:1 no acreditado formalmente).");
+        serial_imprimir_linea("[INFO] Dispositivos operan sin aislamiento IOMMU.");
         serial_imprimir_linea("--- DESCUBRIMIENTO IOMMU COMPLETADO; SIN AISLAMIENTO DMA ---");
         return 0;
     }

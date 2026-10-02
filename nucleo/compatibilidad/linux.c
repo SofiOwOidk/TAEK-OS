@@ -113,16 +113,20 @@ void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *dma_handle, unsigne
     return virt;
 }
 
-void dma_free_coherent(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle) {
+int dma_free_coherent_ex(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle) {
     (void)dev;
-    if (size == 0) return;
-
-    dma_liberar_bufer_contiguo(cpu_addr, (uint64_t)dma_handle, size);
-
+    if (size == 0) return -1;
+    // No descontar la contabilidad si la liberación fue rechazada (error real).
+    if (dma_liberar_bufer_contiguo(cpu_addr, (uint64_t)dma_handle, size) != 0) return -1;
     size_t num_paginas = (size + 4095) / 4096;
     if (g_mem_dma_asignada >= num_paginas * 4096) {
         g_mem_dma_asignada -= num_paginas * 4096;
     }
+    return 0;
+}
+
+void dma_free_coherent(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle) {
+    (void)dma_free_coherent_ex(dev, size, cpu_addr, dma_handle);
 }
 
 static void *ioremap_interno(phys_addr_t offset, size_t size, uint64_t atributos) {
@@ -138,6 +142,9 @@ static void *ioremap_interno(phys_addr_t offset, size_t size, uint64_t atributos
     for (uint64_t p = 0; p < tam_alineado; p += 4096) {
         int res = paginacion_mapear(virt_inicio + p, phys_inicio + p, atributos);
         if (res != 0) {
+            // Rollback: desmapear lo ya mapeado y devolver el cursor virtual.
+            for (uint64_t q = 0; q < p; q += 4096) paginacion_desmapear(virt_inicio + q);
+            g_cursor_ioremap_virtual = virt_inicio;
             return NULL;
         }
     }

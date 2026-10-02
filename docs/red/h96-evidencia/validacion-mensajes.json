@@ -1,0 +1,32 @@
+{
+  "created_utc": "2026-10-02T18:05:16.322228+00:00",
+  "compiled_sources_verified": 197,
+  "files_sha256": {
+    "OS_experimental/i915/nucleo/controladores/red/mensajes.c": "ea1da12efd1bf145b71c67169a98f1ae763c5bb341b27cae865fac96ac853a0f",
+    "OS_experimental/i915/nucleo/controladores/red/red.h": "aafb2beb91777c0a838f295624dfaae0fc9c182a98a5e062acedcec946a649f0",
+    "OS_experimental/i915/nucleo/controladores/terminal.c": "c87034785e7dcf8428b665d318d9337de1b411aa14a2bd86fb8e81f2971a9e59",
+    "herramientas/intel/terminal_mensajes.py": "f85c956c5f9ed4e3d41015fd1937d7e1eacba6c59a3cf11f176664b749bf27e1",
+    "herramientas/intel/abrir_terminal_mensajes.ps1": "04d12ef600a27fdb13886aae731c03bcaa78fe53fb7990b676f69b7206ec8783",
+    "tests/red/pruebas_mensajes_host.c": "e6c9e72f31f85c12243a50313b08b53dc8a7c8517c4307d7febf39d345d0a0aa",
+    "tests/red/probar_mensajes_host.sh": "eb48f174c5ef5eeadf37d88cb21e5d2eb40ac048730451911402ccc46f2ddeda",
+    "tests/red/pruebas_terminal_mensajes.py": "70b361dc0a276515091957d454db7c3e10a1de0b9cce5a1541efc426c909dfb2",
+    "tests/red/probar_mensajes_qemu.py": "a688eb34664148f446495fadbd0f4b1b9a34038dcb3656c9769527972cb7e6ac",
+    "OS_experimental/i915/docs/MENSAJES_LAN.md": "4ba432259789e8a67c1c329a192189abe3b0cab8665ff6fdb2d058f844531641"
+  },
+  "iso_sha256": "fecf820f7893264cf60f8c784bb7ccc2f94e59b5660a8b9ec767792fd96a3fee",
+  "host_C": "PASS ASan/UBSan; limites, errores TCP, ACK incorrecto y recuperacion sin perder texto",
+  "windows_socket_tests": "PASS 3 suites; fragmentacion, UTF-8, FIFO de 100, protocolos invalidos, filtro peer, ACK repetido",
+  "qemu_result": "qemu-mensajes-20261002T180320331462Z\\resultado.json",
+  "physical_test": "PENDIENTE i7 TAEK a Windows; solo DHCP/DNS/ping fisico acreditados",
+  "windows_terminal": {
+    "pid": 31664,
+    "bind": "192.168.18.146",
+    "port": 9151,
+    "peer": "192.168.18.135"
+  },
+  "stable_artifacts_sha256": {
+    "nucleo.elf": "bd082540291dd6e7d720f212fef579190de1906978e85e7b3542d8c8ba65e85f",
+    "taek-os-2026-09-30_21-49-43.iso": "2abbd55db9d2dd5367477ded20389c94f6a6f24e3dd63a5836e7fb7966f3d349",
+    "taek-os.img": "cf4cd2f27fe820c81fb143eeedce71e408af6ec9ef111f6f721048281c25a1fa"
+  }
+}

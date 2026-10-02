@@ -14,7 +14,17 @@ uint64_t rdtsc(void) {
 }
 
 void tiempo_iniciar(void) {
-    // Calibrar el contador TSC con el temporizador PIT Canal 2 durante 10 ms
+    g_ciclos_por_ms = tiempo_calibrar_ticks_por_ms();
+    if (g_ciclos_por_ms == 0) {
+        // Fallback tipico para CPUs modernas (~2.5 GHz -> 2,500,000 ciclos/ms)
+        g_ciclos_por_ms = 2500000;
+    }
+}
+
+/* Calibración de TSC con el PIT Canal 2 durante 10 ms, ejecutable en cualquier
+ * CPU. No modifica el valor global: cada AP puede comparar su reloj (A1.6).
+ * Devuelve ciclos/ms, o 0 si el PIT no responde en esta CPU. */
+uint64_t tiempo_calibrar_ticks_por_ms(void) {
     // Frecuencia PIT = 1193182 Hz -> 10 ms = 11932 ticks
     uint16_t ticks_pit = 11932;
 
@@ -41,11 +51,9 @@ void tiempo_iniciar(void) {
     uint64_t tsc_fin = rdtsc_interno();
 
     if (timeout > 0 && tsc_fin > tsc_inicio) {
-        g_ciclos_por_ms = (tsc_fin - tsc_inicio) / 10;
-    } else {
-        // Fallback tipico para CPUs modernas (~2.5 GHz -> 2,500,000 ciclos/ms)
-        g_ciclos_por_ms = 2500000;
+        return (tsc_fin - tsc_inicio) / 10;
     }
+    return 0;
 }
 
 void esperar_milisegundos(uint32_t ms) {

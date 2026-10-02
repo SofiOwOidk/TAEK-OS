@@ -30,9 +30,12 @@
 #include "compatibilidad/linux.h"
 #include "controladores/video/nvidia/core/nvidia_core.h"
 #include "controladores/xhci.h"
+#include "controladores/red/red.h"
 #include "controladores/terminal.h"
 #include "controladores/teclado.h"
 #include "controladores/multimedia/reproductor/reproductor.h"
+#include "controladores/video/intel/intel_diagnostico_ring0.h"
+#include "controladores/video/intel/intel_info.h"
 
 // Revision 3 del protocolo Limine
 __attribute__((used, section(".requests")))
@@ -305,6 +308,25 @@ void principal(void) {
         huevo_etapa_ok();
     }
 
+    huevo_etapa("Controlador de Red Ethernet (Intel e1000/e1000e / I219)");
+    if (red_iniciar() == 0) {
+        const struct red_info *ered = red_obtener_info();
+        serial_imprimir("[");
+        serial_imprimir(ered->modelo);
+        serial_imprimir(" | Enlace: ");
+        serial_imprimir(ered->enlace_activo ? "ACTIVO " : "SIN CABLE ");
+        if (ered->enlace_activo) {
+            serial_imprimir_dec(ered->velocidad_mbps);
+            serial_imprimir(" Mbps");
+        }
+        serial_imprimir("] ");
+        consola_imprimir(" [Red Ethernet OK] ");
+        huevo_etapa_ok();
+    } else {
+        serial_imprimir_linea("[Sin controlador Ethernet Intel soportado en el bus PCI]");
+        huevo_etapa_ok();
+    }
+
     huevo_etapa("Verificación de Pantalla GOP UEFI");
     if (g_peticion_framebuffer.response == NULL || g_peticion_framebuffer.response->framebuffer_count < 1) {
         serial_imprimir("[ERROR: SIN PANTALLA GOP] ");
@@ -411,8 +433,22 @@ void principal(void) {
     esperar_milisegundos(1000);
 
     // Iniciar la Terminal interactiva con el usuario 'sudo'
-    if (g_peticion_ejecutable.response && g_peticion_ejecutable.response->executable_file)
-        video_h264_arranque(g_peticion_ejecutable.response->executable_file->cmdline);
+    if (g_peticion_ejecutable.response && g_peticion_ejecutable.response->executable_file) {
+        const char *cl = g_peticion_ejecutable.response->executable_file->cmdline;
+        if (cl && str_contiene(cl, "intel=inventario")) {
+            serial_imprimir_linea("[I915_M02] CONSULTA_PASIVA=1 SUBMISSION=0");
+            intel_inventario_imprimir_h0();
+            serial_imprimir_linea("[I915_M02] INVENTARIO_FIN");
+        }
+        if (cl && (str_contiene(cl, "intel=probar") || str_contiene(cl, "intel=test"))) {
+            intel_diagnostico_ring0_ejecutar();
+        }
+        if (cl && (str_contiene(cl, "red=prueba") || str_contiene(cl, "red=test") ||
+                   str_contiene(cl, "net=prueba"))) {
+            red_autodiagnostico();
+        }
+        video_h264_arranque(cl);
+    }
     terminal_ejecutar();
 
     for (;;) {

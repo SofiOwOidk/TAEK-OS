@@ -93,6 +93,7 @@ int  usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantida
 
 // Retorna la cantidad de unidades USB Mass Storage detectadas y operativas
 int  usb_msc_obtener_cantidad(void);
+void usb_msc_obtener_lecturas(uint64_t *comandos,uint64_t *bytes);
 
 // Obtiene la estructura de información de una unidad USB (0..USB_MSC_MAX_DISPOSITIVOS-1)
 const struct usb_msc_dispositivo *usb_msc_obtener_dispositivo(uint8_t id_unidad);

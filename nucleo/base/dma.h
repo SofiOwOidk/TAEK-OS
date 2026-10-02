@@ -25,7 +25,9 @@ int   dma_iniciar(void);
 void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *dir_fisica);
 
 // Libera un búfer DMA asignado previamente
-void  dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes);
+/* Libera un buffer contiguo. Devuelve 0 en exito, <0 si rechaza (fuera de
+ * arena, double free, tamaño incorrecto). El error se propaga al llamador. */
+int   dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes);
 
 // Barrera de coherencia: Fuerza el vaciado de las líneas de caché de CPU (clflush/clflushopt + mfence)
 void  dma_sincronizar_cpu_a_dispositivo(const void *dir_virtual, uint64_t bytes);

@@ -95,6 +95,9 @@ char xhci_leer_caracter(void);
 
 // Sondea activamente el anillo de eventos de xHCI para capturar eventos USB pendientes
 void xhci_sondeo(void);
+/* BSP: evita enumeración, resets y comandos síncronos durante tareas con
+ * dependencias. Los cambios de puerto se atienden en el siguiente sondeo normal. */
+void xhci_configurar_sondeo_breve(int activo);
 
 // Devuelve el estado actual de detección e inicialización de xHCI
 const struct estado_xhci *xhci_obtener_estado(void);
@@ -113,6 +116,24 @@ int  xhci_forzar_reset_puerto(uint8_t puerto);
 
 // Ejecuta una transferencia Bulk síncrona en un endpoint de datos (IN o OUT)
 int  xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms);
+
+// Transferencia Bulk multi-TRB: reparte la fase de datos en TRBs de a lo sumo
+// 64 KiB (limite de 17 bits del Normal TRB) encolados bajo un unico timbre. Un
+// `primer_tramo` opcional con IOC propio fecha el "primer DATA recibido".
+// `primer_tramo` en bytes; 0 usa bloques uniformes. Entrega los ciclos TSC del
+// primer y ultimo evento si los punteros no son NULL. Soporta hasta 256 KiB.
+int  xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
+                                        void *buffer, uint64_t buffer_fisica,
+                                        uint32_t longitud, int es_in,
+                                        uint32_t primer_tramo, int timeout_ms,
+                                        uint64_t *ciclos_primer_evento,
+                                        uint64_t *ciclos_fin_evento);
+
+// Contadores de atribucion acumulados durante esperas Bulk (TSC, sin I/O).
+uint64_t xhci_telemetria_espera_ciclos(void);   // CPU ociosa en esperar_milisegundos
+uint64_t xhci_telemetria_sondeo_ciclos(void);   // MMIO/eventos bombeados
+uint64_t xhci_telemetria_timbre_ciclos(void);   // doorbell (incluye traza serial)
+void     xhci_telemetria_reiniciar(void);
 
 // Despliega un volcado de diagnóstico forense de los registros y anillos xHCI
 void xhci_imprimir_diagnostico_completo(void);
