@@ -123,34 +123,20 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 
 ---
 
-## 🚀 Cómo Compilar y Ejecutar
+## 🚀 Cómo Ejecutar
 
-### Requisitos Previos
-* **Compilador C:** `clang` (con soporte para destino `x86_64-elf` o `x86_64-unknown-linux-gnu`).
-* **Ensamblador:** `nasm`.
-* **Herramientas de construcción:** `make`, `mtools`, `xorriso`, `ffmpeg` y Python 3.
-* **Bootloader:** Limine (incluido en el repositorio).
-* **Emulador (Opcional):** QEMU x86_64 con firmware `OVMF.fd`.
-
-### 1. Ejecución en Emulador (QEMU)
-Desde PowerShell en Windows:
-```powershell
-.\run.ps1
-```
-Este script arranca la ISO H96 conservada, con UEFI, audio HDA, USB xHCI,
-Ethernet e1000e y consola serie. `./run.ps1 -Recompilar` genera una nueva imagen
-con WSL/Arch; una recompilación requiere su propia validación.
-
-### 2. Ejecución en Hardware Real (Bare Metal)
-1. Usar la ISO H96 ya compilada. Para recompilar los fuentes:
-   ```bash
-   make iso
-   ```
-2. Flashear el archivo ISO generado (`build/taek-os-h96-2026-10-02.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
+### 1. Grabación y Ejecución en Hardware Real (Bare Metal)
+1. Flashear la imagen ISO estable (`build/taek-os-h96-2026-10-02.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
    ```bash
    sudo dd if=build/taek-os-h96-2026-10-02.iso of=/dev/sdX bs=4M status=progress conv=fsync
    ```
-3. Conectar la memoria USB a tu equipo, desactivar *Secure Boot* en la BIOS/UEFI, y arrancar desde el dispositivo USB.
+2. Conectar la memoria USB al equipo, desactivar *Secure Boot* en la BIOS/UEFI, y arrancar desde el dispositivo USB.
+
+### 2. Ejecución en Emulador (QEMU)
+Se puede arrancar directamente la ISO en QEMU x86_64 con firmware UEFI (`OVMF.fd`), tarjeta de audio Intel HDA y controlador xHCI:
+```text
+qemu-system-x86_64 -bios OVMF.fd -cdrom build/taek-os-h96-2026-10-02.iso -m 1024M -M q35 -device intel-hda -device hda-output -device qemu-xhci -device usb-kbd -serial stdio
+```
 
 ---
 
@@ -171,16 +157,17 @@ taek-os/
 │   └── principal.c            # Punto de entrada del kernel (kmain)
 ├── docs/                      # Documentación técnica y guías de red
 ├── recursos/assets/           # Medios, texturas y pistas de audio/video
+├── .gitignore                 # Filtros limpios para el repositorio
 ├── BITACORA.md                # Registro histórico de hitos y sesiones de ingeniería
+├── LICENSE                    # Licencia MIT
+├── linker.ld                  # Script de enlace ELF64
 ├── MULTIMEDIA_PIPELINE.md     # Documentación y validación del pipeline multimedia H.264
-├── Makefile                   # Reglas de compilación y enlace
-└── run.ps1                    # Script automatizado de compilación y prueba en QEMU
+└── README.md                  # Descripción y estado del proyecto
 ```
 
 > El árbol de integración y el estado experimental se mantienen en
 > [docs/ESTRUCTURA_PROYECTO.md](docs/ESTRUCTURA_PROYECTO.md). Se revisa cada vez
-> que el hito actual termina en `0` (Hito 70, 80, 90, 100, 110…) y el inventario
-> de archivos se regenera con `make estructura`.
+> que el hito actual termina en `0` (Hito 70, 80, 90, 100, 110…).
 
 ---
 
