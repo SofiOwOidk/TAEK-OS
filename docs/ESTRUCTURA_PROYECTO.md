@@ -5,7 +5,7 @@
 > [Regla de mantenimiento](#3-regla-de-mantenimiento).
 
 <!-- META:INICIO -->
-**Versión:** `v0.1.0` · **Hito:** `Hito 96` · **Actualizado:** `2026-10-15`
+**Versión:** `v0.1.0` · **Hito:** `Hito 132` · **Actualizado:** `2026-11-07`
 <!-- META:FIN -->
 
 **Leyenda:** 🧪 = experimental / en integración / no testeado en silicio.
@@ -37,7 +37,7 @@ taek-os/                        Raíz del repositorio. Solo github/ se publica.
 ├── experimental/               Apuntes sueltos fuera de la compilación: ext4_tmp.c,
 │                               ntfs_tmp.c y scratch_usb_tree.py.
 │
-├── github/                     Último OS estable y publicable (Hito 96).
+├── github/                     Último OS publicable (Hito 132, experimental).
 │   │
 │   ├── boot/                   Arranque: limine/ (bootloader) y limine.conf (menú UEFI).
 │   ├── build/                  Artefactos de la release: nucleo.elf, ISO H96 y manifiestos JSON.
