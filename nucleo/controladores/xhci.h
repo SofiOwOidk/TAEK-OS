@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../arquitectura/x86_64/pci.h"
+#include "driver_abi.h"
 
 // Base virtual donde se mapea el espacio de registros MMIO del controlador xHCI
 // Ubicado en 0xFFFFFE0004000000ULL para evitar cualquier colisión con Intel VT-d (0x2000000) o HDA (0x3000000)
@@ -116,12 +117,15 @@ int  xhci_forzar_reset_puerto(uint8_t puerto);
 
 // Ejecuta una transferencia Bulk síncrona en un endpoint de datos (IN o OUT)
 int  xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms);
+/* Recupera exclusivamente un Bulk Halt: Reset EP, CLEAR_FEATURE, Set Dequeue. */
+int xhci_bulk_limpiar_halt(uint8_t slot_id,uint8_t ep_dci);
 
 // Transferencia Bulk multi-TRB: reparte la fase de datos en TRBs de a lo sumo
 // 64 KiB (limite de 17 bits del Normal TRB) encolados bajo un unico timbre. Un
-// `primer_tramo` opcional con IOC propio fecha el "primer DATA recibido".
+// `primer_tramo` opcional divide TRBs, sin IOC intermedio ni otro TD.
 // `primer_tramo` en bytes; 0 usa bloques uniformes. Entrega los ciclos TSC del
-// primer y ultimo evento si los punteros no son NULL. Soporta hasta 256 KiB.
+// evento final en ambos punteros no NULL: DATA completo, no primer byte.
+// Soporta hasta 256 KiB.
 int  xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
                                         void *buffer, uint64_t buffer_fisica,
                                         uint32_t longitud, int es_in,
@@ -137,5 +141,9 @@ void     xhci_telemetria_reiniciar(void);
 
 // Despliega un volcado de diagnóstico forense de los registros y anillos xHCI
 void xhci_imprimir_diagnostico_completo(void);
+int xhci_hid_mouse_tomar(void);
+int xhci_hid_mouse_leer(struct taek_hid_mouse_reporte *);
+void xhci_hid_mouse_liberar(void);
+uint64_t xhci_hid_mouse_perdidos(void);
 
 #endif // CONTROLADORES_XHCI_H

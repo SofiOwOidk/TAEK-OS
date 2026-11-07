@@ -10,6 +10,7 @@
 #undef GFP_ATOMIC
 #include "base/memoria.h"
 #include "base/paginacion.h"
+#include "base/trabajos.h"
 #else
 #include <stdlib.h>
 void *asignar_memoria(uint64_t n);
@@ -163,6 +164,15 @@ static void i915_evaluar_liberacion_bloque_locked(struct page *page) {
         return; /* aún en uso por referencias, pins o mappings */
     }
 
+#ifndef TAEK_HOST_TEST
+    /* liberar_memoria no hace nada fuera del coordinador. No marcar el bloque
+     * libre fingiendo haberlo devuelto: queda retenido y contabilizado. */
+    if (!trabajos_es_coordinador()) {
+        g_stats.fugas++;
+        return;
+    }
+#endif
+
     /* Transición protegida bajo el mismo cerrojo: marcar DESTRUYENDO */
     for (unsigned int j = 0; j < n; j++) {
         h[j].estado = PAGE_ESTADO_DESTRUYENDO;
@@ -184,6 +194,17 @@ static void i915_evaluar_liberacion_bloque_locked(struct page *page) {
     if (g_stats.paginas >= n) g_stats.paginas -= n; else g_stats.paginas = 0;
 
     i915_kfree(bloque);
+}
+
+void get_page(struct page *page) {
+    if (!page) return;
+    unsigned long flags;
+    spin_lock_irqsave(&g_pool_lock, flags);
+    if (page->estado == PAGE_ESTADO_ASIGNADA) {
+        atomic_inc(&page->refcount);
+        g_stats.refs++;
+    }
+    spin_unlock_irqrestore(&g_pool_lock, flags);
 }
 
 void put_page(struct page *page) {
@@ -447,6 +468,31 @@ err_rollback:
 // ============================================================================
 // DMA
 // ============================================================================
+/* Un segmento fusionado abarca varias páginas: todas quedan mapeadas, no solo la
+ * primera, para que ninguna se libere mientras el dispositivo pueda acceder a ella. */
+static unsigned int sg_paginas_segmento(const struct scatterlist *sg) {
+    uint64_t bytes = (uint64_t)sg->offset + sg->length;
+    return (unsigned int)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+}
+
+/* Orden inverso: sg_get_page calcula las demás desde la primera, que debe seguir
+ * viva hasta el final porque el último desmapeo puede liberarla. */
+static void sg_desmapear_paginas(struct scatterlist *sg, unsigned int cuantas) {
+    for (unsigned int k = cuantas; k > 0; k--) i915_page_desmapear(sg_get_page(sg, k - 1));
+}
+
+static int sg_mapear_paginas(struct scatterlist *sg) {
+    unsigned int n = sg_paginas_segmento(sg);
+    for (unsigned int k = 0; k < n; k++) {
+        struct page *p = sg_get_page(sg, k);
+        if (!p || i915_page_mapear(p) != 0) {
+            sg_desmapear_paginas(sg, k);
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
 int dma_map_sg(void *dev, struct scatterlist *sg, int nents, int dir) {
     (void)dir;
     if (!sg || nents <= 0) return -EINVAL;
@@ -481,7 +527,7 @@ int dma_map_sg(void *dev, struct scatterlist *sg, int nents, int dir) {
             dma_unmap_sg(dev, sg, i, dir);
             return -EFAULT;   /* la máscara se aplica a TODO el rango */
         }
-        if (i915_page_mapear(sg[i].page) != 0) {
+        if (sg_mapear_paginas(&sg[i]) != 0) {
             dma_unmap_sg(dev, sg, i, dir);
             return -EINVAL;
         }
@@ -495,7 +541,7 @@ void dma_unmap_sg(void *dev, struct scatterlist *sg, int nents, int dir) {
     (void)dev; (void)dir;
     if (!sg || nents <= 0) return;
     for (int i = 0; i < nents; i++) {
-        if (sg[i].dma_address && sg[i].page) i915_page_desmapear(sg[i].page);
+        if (sg[i].dma_address && sg[i].page) sg_desmapear_paginas(&sg[i], sg_paginas_segmento(&sg[i]));
         sg[i].dma_address = 0;
         sg[i].dma_length  = 0;
     }

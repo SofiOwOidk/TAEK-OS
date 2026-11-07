@@ -45,6 +45,9 @@ int  paginacion_desmapear(uint64_t dir_virtual);
 // Obtiene la dirección física asociada a una dirección virtual mediante recorrido de 4 niveles
 uint64_t paginacion_obtener_fisica(uint64_t dir_virtual);
 
+// Publica en dir_destino la misma traducción que dir_origen (ambas alineadas a 512 GiB, mitad superior).
+int  paginacion_alias_pml4(uint64_t dir_destino, uint64_t dir_origen);
+
 // Invalida la entrada correspondiente en el TLB de la CPU (instrucción invlpg)
 void paginacion_invalidar_tlb(uint64_t dir_virtual);
 

@@ -5,7 +5,7 @@ static uint16_t u16(const uint8_t *p){return p[0]|((uint16_t)p[1]<<8);}
 static uint32_t u32(const uint8_t *p){return u16(p)|((uint32_t)u16(p+2)<<16);}
 static uint64_t u64(const uint8_t *p){return u32(p)|((uint64_t)u32(p+4)<<32);}
 static int (*servicio)(void);
-static unsigned lectura_sectores=8; /* conservar valor previo hasta medir */
+static unsigned lectura_sectores=128; /* 64 KiB: con 4 KiB el USB no pasaba de 1,3 MB/s y 1080p no llegaba a tiempo real */
 int particiones_configurar_lectura(unsigned kib) {
     /* Tamano de cada READ(10)/WRITE(10) en KiB. 512 B/sector => kib*2 sectores.
        El maximo coincide con el bufer DMA de USB MSC (256 KiB = 512 sectores). */
@@ -47,6 +47,12 @@ const char *volumen_error(int r){switch(r){
     case VOLUMEN_ELEGIR:return "Elige una particion";case VOLUMEN_SECTOR_NO_SOPORTADO:return "Sector logico no soportado (se requiere 512 B)";
     case VOLUMEN_SOLO_LECTURA:return "Volumen abierto en solo lectura";case VOLUMEN_NO_ENCONTRADO:return "Archivo o directorio no encontrado";
     case VOLUMEN_TEXFAT_NO_SOPORTADO:return "TexFAT o dos FAT no soportados";
+    case VOLUMEN_EXISTE:return "El destino ya existe (no se sobreescribe)";
+    case VOLUMEN_OCUPADO:return "Archivo o escritor en uso";
+    case VOLUMEN_SIN_ESPACIO:return "Espacio insuficiente en el volumen";
+    case VOLUMEN_NOMBRE_INVALIDO:return "Nombre de archivo no valido";
+    case VOLUMEN_SIN_MEMORIA:return "Memoria insuficiente para la operacion";
+    case VOLUMEN_COPIA_CONSERVADA:return "Copia verificada en destino; no se completo la eliminacion del origen. Movimiento parcial: revisar ambos medios";
     default:return "Formato desconocido";
 }}
 int particion_identificar(struct particion *p) {

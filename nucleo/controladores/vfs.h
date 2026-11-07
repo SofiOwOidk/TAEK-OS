@@ -177,4 +177,17 @@ int  vfs_crear_archivo(const char *nombre, const char *contenido);
 // Crea un nuevo directorio ('mkdir')
 int  vfs_crear_directorio(const char *nombre);
 
+// Mueve un archivo de una ruta a otra ('mover')
+int  vfs_mover_archivo(const char *origen, const char *destino);
+
+// Copia un archivo de una ruta a otra ('copiar')
+int  vfs_copiar_archivo(const char *origen, const char *destino);
+/* Destino usb:<unidad>:<particion>:/ruta; no cambia el montaje actual. */
+int vfs_operar_entre_discos(const char *origen,const char *destino,int mover);
+int vfs_copiar_portapapeles(const char *origen);
+int vfs_pegar_portapapeles(const char *destino);
+
+// Elimina un archivo del sistema de archivos ('eliminar')
+int  vfs_eliminar_archivo(const char *ruta);
+
 #endif // CONTROLADORES_VFS_H

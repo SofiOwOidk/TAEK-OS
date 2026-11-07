@@ -157,6 +157,22 @@ int paginacion_desmapear(uint64_t dir_virtual) {
     return 0;
 }
 
+#define PML4_ALIAS_USUARIO 192ULL
+int paginacion_alias_pml4(uint64_t dir_destino, uint64_t dir_origen) {
+    const uint64_t lim = (UINT64_C(1) << 39) - 1;
+    if (trabajos_en_curso() || !g_paginacion_iniciada || g_pml4_kernel == NULL) return -1;
+    if ((dir_destino & lim) || (dir_origen & lim)) return -1;
+    uint64_t d = (dir_destino >> 39) & 0x1FFULL, o = (dir_origen >> 39) & 0x1FFULL;
+    /* Mitad inferior: solo la ventana 0x6000_0000_0000, memoria "de usuario" del driver multimedia en el mismo Ring 0. */
+    if ((d < 256 && d != PML4_ALIAS_USUARIO) || o < 256) return -1;
+    uint64_t entrada = g_pml4_kernel->entradas[o];
+    if (!(entrada & PAGINA_PRESENTE)) return -2;
+    if (g_pml4_kernel->entradas[d] == entrada) return 0;
+    if (g_pml4_kernel->entradas[d] & PAGINA_PRESENTE) return -3;
+    g_pml4_kernel->entradas[d] = entrada;
+    return 0;
+}
+
 uint64_t paginacion_obtener_fisica(uint64_t dir_virtual) {
     if (!g_paginacion_iniciada || g_pml4_kernel == NULL) {
         return 0;

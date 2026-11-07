@@ -5,9 +5,11 @@
 #include "gdt.h"
 #include "idt.h"
 #include "fpu.h"
+#include "tls.h"
 #include "apic.h"
 #include "serial.h"
 #include "vmx.h"
+#include "../../compatibilidad/linux_i915/cpu_runtime.h"
 _Static_assert(offsetof(struct limine_smp_info,extra_argument)==24,"ABI del trampoline Limine");
 
 __attribute__((used,section(".requests")))
@@ -43,6 +45,8 @@ static void despertar(unsigned id) {
 void smp_trabajador(datos_cpu *c) {
     __asm__ volatile("mov %0,%%cr3"::"r"(cr3):"memory");
     gdt_iniciar_cpu(c->indice);x86_64_fpu_iniciar();idt_cargar_cpu();
+    if(taek_tls_cpu_iniciar(c->indice))for(;;)__asm__ volatile("cli; hlt");
+    if(i915_scheduler_registrar_cpu(c->indice,c->lapic))for(;;)__asm__ volatile("cli; hlt");
     unsigned lo,hi;
     __asm__ volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(0x1b));
     uint64_t apic_base=((uint64_t)hi<<32)|lo;
@@ -79,6 +83,7 @@ void smp_trabajador(datos_cpu *c) {
     for(;;)__asm__ volatile("cli; hlt");
 }
 unsigned trabajos_cpu_activas(void){unsigned n=__atomic_load_n(&seleccion_cpu,__ATOMIC_RELAXED);return cantidad<n?cantidad:n;}
+int trabajos_bsp_calcula(void){return bsp_calcula;}
 int trabajos_configurar_distribucion(unsigned n,int bsp) {
     if(trabajos_en_curso() || n<1 || n>cantidad)return 0;
     __atomic_store_n(&seleccion_cpu,n,__ATOMIC_RELAXED);bsp_calcula=bsp || n==1;return 1;

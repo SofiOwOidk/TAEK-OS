@@ -9,17 +9,38 @@
 
 ---
 
-## 🌐 Versión validada Hito 96 — Mensajes LAN (2026-10-02)
+## 🎬 Versión actual: Hito 132 — H.264 por GPU en Ring 0 (2026-11-07)
+
+TAEK OS reproduce H.264 con la **GPU Intel real**, usando el `i915` original de Linux 6.6.78 y el Media Driver de Intel 24.3.4 sobre un shim propio, sin espacio de usuario. Es **experimental y solo está probado en un equipo**: Dell Latitude 5490, i7-8650U, GPU `8086:5917`. En cualquier otro equipo, incluidas otras GPU Intel y las AMD, usa el decodificador por software.
+
+| Prueba en el i7-8650U | Resultado |
+|---|---|
+| 10 videos de prueba frente a FFmpeg (1080p, varios cortes por cuadro, CAVLC, B, recorte) | Por GPU, misma huella en los 10. Un video entrelazado se rechaza con motivo y no se reproduce |
+| `Video 1080p.mp4` completo, 4637 cuadros | Misma huella que FFmpeg |
+| Reproducción normal 1080p con audio | Tiempo real: 193 s de video en 193 s, 3 cuadros tardíos de 4637 |
+| Grabación real de 940 MB, 16001 cuadros | Termina por GPU sin errores, pero a unos 45 cuadros por segundo: **no llega a tiempo real** |
+| Fallo provocado en la muestra 100 o 500, o GPU sin responder | Sigue por software desde el último IDR, con la huella correcta del video completo |
+
+**Límites conocidos:**
+* No usa libva: el cliente H.264 llama directamente al driver.
+* Por GPU no admite entrelazado, más de 8 bits, formatos distintos de 4:2:0, POC tipo 1, FMO, ASO ni SP/SI. Lo que no admite se rechaza por su nombre.
+* Por software solo admite CABAC y POC tipo 0, sin I_PCM.
+* Un MP4 de más de unos 70 minutos podría exceder el búfer de índice de 2 MiB (estimación, sin probar). No hay pruebas con archivos mayores de 940 MB.
+* Reserva 256 MiB de RAM sobre 4 GiB para los búferes de la GPU, si el equipo tiene RAM ahí; el mayor pico medido fue de 47 MiB.
+* El escritor exFAT a veces no encuentra sitio en un directorio y devuelve el código 21. Es un error conocido sin corregir.
+
+También nuevo desde H96: consola remota y streaming por LAN, transferencia de archivos por LAN con hashes, copiar, mover y eliminar en FAT32/exFAT, HTTPS con TLS 1.3, módulos `.chad` cargables en Ring 0 (`modulos/`), `bateria` y `especificaciones`. Detalle y evidencia en la [bitácora](BITACORA.md).
+
+La ISO no está en este repositorio; se conserva localmente en `build/`, con su identidad en `build/release-h132.json`. SHA-256 de la ISO probada: `4738d811ba03c0196086ac5854037b86a4d0d2c16f1d8365c742e5b23c6833f4`.
+
+---
+
+## 🌐 Hito 96 — Mensajes LAN (2026-10-02)
 
 Comunicación bidireccional verificada físicamente entre TAEK en el **i7-8650U**
 (Intel I219-LM) y una terminal Windows, conectados al router por Ethernet.
 También se probaron DHCP, DNS y ping externo. La campaña actual se limita al i7;
 el i9 queda aplazado para las nuevas integraciones.
-
-El kernel y la [ISO H96](build/taek-os-h96-2026-10-02.iso) son exactamente los
-binarios probados. SHA-256 de la ISO:
-`fecf820f7893264cf60f8c784bb7ccc2f94e59b5660a8b9ec767792fd96a3fee`.
-Identidad y hashes de fuentes: `build/release-h96.json`.
 
 En el PC receptor en la red local (Windows / Linux), escuchar por TCP en el puerto `9151`:
 
@@ -35,16 +56,13 @@ Responder desde el PC con `transmitir hola i7` (o enviando el mensaje por el soc
 Si DHCP cambia las IP, actualizar el destino con la IP del receptor. [Guía y límites](docs/red/MENSAJES_LAN.md).
 Los problemas y sus correcciones están registrados en [Hito 96](BITACORA.md).
 
-El canal actual intercambia texto; consola remota, telemetría continua y carga
-RAM de drivers se desarrollarán en la copia experimental. El inventario i915 es
-pasivo y el envío de trabajos GPU permanece bloqueado.
-
 ---
 
 ## 🤖 Desarrollo y Co-Ingeniería
 
 > **Usando apoyo de Gemini (Google DeepMind)** como copiloto de ingeniería, arquitectura de sistemas bare-metal, depuración en bajo nivel y diseño de controladores de hardware.  
-> **Documentación creada por Gemini:** Bitácoras técnicas, guías de arranque en hardware real, especificaciones de controladores y manuales de referencia.
+> **Documentación creada por Gemini:** Bitácoras técnicas, guías de arranque en hardware real, especificaciones de controladores y manuales de referencia.  
+> **Hitos recientes:** el shim i915, la decodificación por GPU y su registro en la bitácora se hicieron con apoyo de **Claude (Anthropic)**.
 
 ---
 
@@ -55,7 +73,7 @@ pasivo y el envío de trabajos GPU permanece bloqueado.
 El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel (USB 3.x xHCI, controladores de audio por DMA, telemetría de hardware) con una identidad satírica de cultura de internet y humor negro, manteniendo los estándares de seguridad de memoria mediante su guardián residente: **El Huevo de la Estabilidad**.
 
 > [!NOTE]
-> **Compatibilidad en Hardware Real:** Testeado y verificado en bare metal en procesadores Intel desde la **8ª Generación (Core i7-8650U)** hasta la **14ª Generación (Core i9-14900HX)**. En generaciones o arquitecturas más allá de la 14ª Generación se desconoce si funcionará.
+> **Compatibilidad en Hardware Real:** El sistema base se probó en bare metal en procesadores Intel desde la **8ª Generación (Core i7-8650U)** hasta la **14ª Generación (Core i9-14900HX)**, sin incluir las novedades posteriores a H96: la decodificación por GPU y esta versión solo se probaron en el **i7-8650U**. En generaciones o arquitecturas más allá de la 14ª Generación se desconoce si funcionará.
 
 ---
 
@@ -90,12 +108,12 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 * Conversión de espacio de color YUV420p a RGB/BGR en memoria física con volcado en tiempo real directamente sobre el *framebuffer* lineal UEFI GOP, sincronizado con pistas de audio AAC/MP3.
 * *Nota de alcance (90% listo):* El 10% restante corresponde a características avanzadas o poco frecuentes no requeridas para el objetivo del sistema (tales como CAVLC heredado, video entrelazado, campos o modos exóticos de POC). Consulta [pipeline multimedia y comandos de validación](MULTIMEDIA_PIPELINE.md).
 
-### 🎮 Decodificación por Hardware / Driver GPU Intel i915 (Experimental — En Desarrollo)
-* Driver nativo para GPUs integradas Intel (arquitecturas Gen8/Gen9/Gen9.5, probado en hardware real sobre Intel Core i7-8650U con GPU UHD Graphics 620).
-* Infraestructura en Ring 0 con gestión de objetos de memoria GEM, mapeo de tablas de traducción global GGTT y control de registros MMIO.
-* Inicialización del motor **VCS0 (Video Command Streamer)** y parseador de estructuras VA-API bare-metal (extracción RBSP, parámetros SPS/PPS, Slice Header y buffers de comandos MFX/BSD).
+### 🎮 Decodificación por Hardware / Driver GPU Intel i915 (Experimental)
+* Módulo `.chad` en Ring 0 con el `i915` original de Linux 6.6.78 y el Media Driver y GmmLib de Intel, enlazados sobre un shim propio (`nucleo/compatibilidad/linux_i915/`). El módulo se compila aparte y no está en este repositorio; aquí están el shim, el cliente H.264 y su interfaz.
+* Decodifica en el motor de video real de la GPU (VCS). La salida se compara cuadro a cuadro con FFmpeg mediante una huella.
+* Se activa solo si la GPU está en la lista de equipos probados. Si falla o deja de responder, el reproductor sigue por software sin perder la imagen.
 * > [!WARNING]
-  > **Estado Experimental:** El backend de decodificación por hardware se encuentra **en desarrollo activo**. Aún falta completar la ejecución y validación completa de lotes de fotogramas en silicio real; la submission de comandos y la sincronización por interrupciones permanecen en desarrollo en la rama experimental antes de declararse estables.
+  > **Estado Experimental:** Probado solo en el Intel Core i7-8650U con GPU UHD Graphics 620 (`8086:5917`). Aún sin descarga del módulo ni libva. Ver los límites al inicio de este documento.
 
 ### 🌐 Transmisión por Red y Comunicación LAN (Intel Ethernet / TCP-IP)
 * Controlador bare-metal para adaptadores Gigabit Ethernet Intel (validado físicamente en **Intel I219-LM** sobre el i7-8650U y probado en emulación con **e1000/e1000e**).
@@ -113,7 +131,12 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
   * `gpu`: Diagnóstico especializado de la GPU, VRAM y registros MMIO.
   * `audio`: Reproducción y pruebas de los subsistemas de audio HDA/AC97.
   * `video`: Lanzador de animaciones multimedia.
-  * `h264`: Reproductor de video H.264/MP4 por software (`h264 360p`, `h264 1080p`, pruebas multihilo).
+  * `h264`: Reproductor de video H.264/MP4 (`h264 360p`, `h264 1080p`, pruebas multihilo). `h264 motor auto` usa la GPU si está probada; `h264 motor software` fuerza el software.
+  * `abrir <número>` / `reproducir <archivo>`: Reproduce un video del disco seleccionado. `reproducir prueba <archivo>` lo decodifica sin esperar al tiempo real y da motor y huella.
+  * `disco` / `seleccionar <número>`: Lista los discos y abre uno.
+  * `bateria`: Telemetría de batería y carga, leída del firmware ACPI: estado, voltaje, potencia, salud y tiempo restante.
+  * `especificaciones`: Datos del equipo: modelo, CPU, memoria, GPU, red y discos.
+  * `dma`: Uso de las reservas de memoria física, incluida la de la GPU.
   * `red`: Configuración y diagnóstico de red: `red dhcp`, `red ping <ip|host>`, `red dns <host>`, `red http <host>`, `red estado`.
   * `transmitir <mensaje>` / `recibir`: Comunicación bidireccional de mensajes con la terminal Windows por LAN (puerto 9151).
   * `stream iniciar <ip> [puerto]` / `stream detener`: Espejo interactivo de consola por TCP en tiempo real.
@@ -126,16 +149,18 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 ## 🚀 Cómo Ejecutar
 
 ### 1. Grabación y Ejecución en Hardware Real (Bare Metal)
-1. Flashear la imagen ISO estable (`build/taek-os-h96-2026-10-02.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
+La ISO se conserva localmente en `build/` y no se publica en este repositorio.
+
+1. Flashear la imagen ISO (`build/taek-os-h132-2026-11-07.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
    ```bash
-   sudo dd if=build/taek-os-h96-2026-10-02.iso of=/dev/sdX bs=4M status=progress conv=fsync
+   sudo dd if=build/taek-os-h132-2026-11-07.iso of=/dev/sdX bs=4M status=progress conv=fsync
    ```
 2. Conectar la memoria USB al equipo, desactivar *Secure Boot* en la BIOS/UEFI, y arrancar desde el dispositivo USB.
 
 ### 2. Ejecución en Emulador (QEMU)
 Se puede arrancar directamente la ISO en QEMU x86_64 con firmware UEFI (`OVMF.fd`), tarjeta de audio Intel HDA y controlador xHCI:
 ```text
-qemu-system-x86_64 -bios OVMF.fd -cdrom build/taek-os-h96-2026-10-02.iso -m 1024M -M q35 -device intel-hda -device hda-output -device qemu-xhci -device usb-kbd -serial stdio
+qemu-system-x86_64 -bios OVMF.fd -cdrom build/taek-os-h132-2026-11-07.iso -m 1024M -M q35 -device intel-hda -device hda-output -device qemu-xhci -device usb-kbd -serial stdio
 ```
 
 ---
@@ -149,12 +174,14 @@ taek-os/
 │   ├── arquitectura/x86_64/   # IDT, GDT, APIC, interrupciones, serial y VMX
 │   ├── base/                  # Memoria, paginación, DMA, canarios del Huevo y tiempo
 │   ├── controladores/         # Drivers del sistema
-│   │   ├── multimedia/        # Decodificador H.264 por CPU (Listo 90%), AAC, MP3, MP4 demuxer
-│   │   ├── video/             # Driver Intel i915 VCS/GEM (Experimental), GPU diagnóstico, pantalla GOP
+│   │   ├── multimedia/        # Decodificador H.264 por CPU (Listo 90%), reproductor con GPU, AAC, MP3, MP4 demuxer
+│   │   ├── acpi/              # Intérprete AML y batería
+│   │   ├── video/             # Diagnóstico de GPU y pantalla GOP
 │   │   ├── red/               # Ethernet Intel (I219-LM / e1000), pila TCP/IP, mensajes LAN, streaming
 │   │   └── xhci, audio, vfs…  # USB 3.x, Audio HDA/AC97, sistemas de archivos (FAT32/exFAT/NTFS/ext4)
-│   ├── compatibilidad/        # Capa Linux Shim y runtime i915
+│   ├── compatibilidad/        # Capa Linux Shim, shim i915 y cliente H.264 por GPU
 │   └── principal.c            # Punto de entrada del kernel (kmain)
+├── modulos/                   # Módulos .chad en Ring 0, incluido el de la GPU i915
 ├── docs/                      # Documentación técnica y guías de red
 ├── recursos/assets/           # Medios, texturas y pistas de audio/video
 ├── .gitignore                 # Filtros limpios para el repositorio

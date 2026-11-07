@@ -92,8 +92,14 @@ static int            g_memoria_inicializada = 0;
 // Tamaño inicial asignado al Heap del kernel (8 MiB)
 #define TAMANO_ARENA_INICIAL (8ULL * 1024ULL * 1024ULL)
 
-// Tamaño reservado para la arena contigua de DMA físico (32 MiB alineados a 2 MiB)
+// Arena contigua de DMA físico, alineada a 2 MiB. De aquí salen las superficies de la GPU, que a 1080p
+// son 3 MiB cada una: se pide la máxima si la RAM lo permite y se baja hasta la mínima de siempre.
 #define TAMANO_ARENA_DMA     (32ULL * 1024ULL * 1024ULL)
+#define TAMANO_ARENA_DMA_MAX (256ULL * 1024ULL * 1024ULL)
+// Arena de los objetos de la GPU, por encima de 4 GiB: bajo 4 GiB suele no quedar un bloque así de grande.
+#define TAMANO_ARENA_GPU     (256ULL * 1024ULL * 1024ULL)
+static uint64_t g_arena_gpu_fisica = 0;
+static uint64_t g_arena_gpu_tamano = 0;
 static uint64_t g_arena_dma_fisica = 0;
 static uint64_t g_arena_dma_tamano = 0;
 
@@ -515,25 +521,51 @@ void memoria_iniciar(void) {
         }
     }
 
-    // Encontrar región utilizable para la arena contigua de DMA físico (32 MiB alineados a 2 MiB)
-    uint64_t arena_dma_tamano = TAMANO_ARENA_DMA;
+    // Encontrar región utilizable para la arena contigua de DMA físico. Una arena ampliada no pasa de
+    // 1/8 de la RAM y queda bajo 4 GiB, donde la exigen el shim de la GPU y los controladores de 32 bits.
+    uint64_t ram_usable = 0;
     for (uint64_t i = 0; i < cantidad_entradas; i++) {
+        if (mapa->entries[i]->type == LIMINE_MEMMAP_USABLE) ram_usable += mapa->entries[i]->length;
+    }
+    for (uint64_t arena_dma_tamano = TAMANO_ARENA_DMA_MAX;
+         arena_dma_tamano >= TAMANO_ARENA_DMA && g_arena_dma_fisica == 0;
+         arena_dma_tamano /= 2) {
+        int ampliada = arena_dma_tamano > TAMANO_ARENA_DMA;
+        if (ampliada && arena_dma_tamano > ram_usable / 8) continue;
+
+        for (uint64_t i = 0; i < cantidad_entradas; i++) {
+            struct limine_memmap_entry *e = mapa->entries[i];
+            if (e->type != LIMINE_MEMMAP_USABLE) continue;
+
+            uint64_t base_candidata = (e->base + 0x1FFFFFULL) & ~0x1FFFFFULL;
+            if (base_candidata < 0x200000) base_candidata = 0x200000;
+
+            // Si solapa con la arena del heap, buscar inmediatamente después
+            if (arena_heap_fisica != 0 &&
+                base_candidata < arena_heap_fisica + arena_heap_tamano &&
+                arena_heap_fisica < base_candidata + arena_dma_tamano) {
+                base_candidata = ((arena_heap_fisica + arena_heap_tamano) + 0x1FFFFFULL) & ~0x1FFFFFULL;
+            }
+
+            if (ampliada && base_candidata + arena_dma_tamano > 0x100000000ULL) continue;
+
+            if (base_candidata >= e->base && (base_candidata + arena_dma_tamano) <= (e->base + e->length)) {
+                g_arena_dma_fisica = base_candidata;
+                g_arena_dma_tamano = arena_dma_tamano;
+                break;
+            }
+        }
+    }
+
+    // Arena de los objetos de la GPU: sin RAM por encima de 4 GiB, o con poca RAM, no hay.
+    for (uint64_t i = 0; i < cantidad_entradas && TAMANO_ARENA_GPU <= ram_usable / 8; i++) {
         struct limine_memmap_entry *e = mapa->entries[i];
         if (e->type != LIMINE_MEMMAP_USABLE) continue;
-
         uint64_t base_candidata = (e->base + 0x1FFFFFULL) & ~0x1FFFFFULL;
-        if (base_candidata < 0x200000) base_candidata = 0x200000;
-
-        // Si solapa con la arena del heap, buscar inmediatamente después
-        if (arena_heap_fisica != 0 &&
-            base_candidata < arena_heap_fisica + arena_heap_tamano &&
-            arena_heap_fisica < base_candidata + arena_dma_tamano) {
-            base_candidata = ((arena_heap_fisica + arena_heap_tamano) + 0x1FFFFFULL) & ~0x1FFFFFULL;
-        }
-
-        if (base_candidata >= e->base && (base_candidata + arena_dma_tamano) <= (e->base + e->length)) {
-            g_arena_dma_fisica = base_candidata;
-            g_arena_dma_tamano = arena_dma_tamano;
+        if (base_candidata < 0x100000000ULL) base_candidata = 0x100000000ULL;
+        if (base_candidata >= e->base && base_candidata + TAMANO_ARENA_GPU <= e->base + e->length) {
+            g_arena_gpu_fisica = base_candidata;
+            g_arena_gpu_tamano = TAMANO_ARENA_GPU;
             break;
         }
     }
@@ -560,6 +592,10 @@ void memoria_iniciar(void) {
 
                 // Si esta página pertenece a la arena reservada para DMA contiguo, omitirla del PMM
                 if (g_arena_dma_fisica != 0 && p >= g_arena_dma_fisica && p < (g_arena_dma_fisica + g_arena_dma_tamano)) {
+                    continue;
+                }
+
+                if (g_arena_gpu_fisica != 0 && p >= g_arena_gpu_fisica && p < (g_arena_gpu_fisica + g_arena_gpu_tamano)) {
                     continue;
                 }
 
@@ -640,6 +676,11 @@ uint64_t memoria_obtener_dma_arena(uint64_t *tamano_out) {
     return g_arena_dma_fisica;
 }
 
+uint64_t memoria_obtener_gpu_arena(uint64_t *tamano_out) {
+    if (tamano_out) *tamano_out = g_arena_gpu_tamano;
+    return g_arena_gpu_fisica;
+}
+
 uint64_t pmm_asignar_bloque_contiguo(uint32_t num_paginas, uint64_t alineacion) {
     if (num_paginas == 0) return 0;
     uint64_t phys = 0;
@@ -650,6 +691,7 @@ uint64_t pmm_asignar_bloque_contiguo(uint32_t num_paginas, uint64_t alineacion) 
 
 void pmm_liberar_bloque_contiguo(uint64_t dir_fisica, uint32_t num_paginas) {
     if (dir_fisica == 0 || num_paginas == 0) return;
+    if (dma_gpu_es_suya(dir_fisica)) { dma_gpu_liberar(dir_fisica, num_paginas); return; }
     void *v = (void *)FISICA_A_VIRTUAL(dir_fisica);
     dma_liberar_bufer_contiguo(v, dir_fisica, (uint64_t)num_paginas * TAMANO_PAGINA);
 }

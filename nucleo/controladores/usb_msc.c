@@ -8,13 +8,18 @@
 #include "../base/memoria.h"
 #include "../base/tiempo.h"
 
-// Tamano del primer tramo de la fase DATA (por sector logico). Permite fechar
-// el "primer DATA recibido" con un IOC propio sin romper la transferencia.
+// Tamano orientativo del primer TRB; el TD se encadena con IOC solo final.
+// La telemetria fecha DATA completo, no llegada del primer byte/paquete.
 #define USB_MSC_TELEM_TRAMO_PRIMERO 512U
 
 // Capacidad maxima de una transaccion BOT (un READ(10)/WRITE(10) completo).
 // 256 KiB = 512 sectores; el xHCI reparte internamente en TRBs <= 64 KiB.
 #define USB_MSC_DMA_BYTES (256U * 1024U)
+
+static void usb_msc_imprimir_error(int codigo) {
+    if(codigo<0){serial_imprimir("-");serial_imprimir_dec((uint64_t)(-(int64_t)codigo));}
+    else serial_imprimir_dec((uint64_t)codigo);
+}
 
 // ============================================================================
 // TAEK OS - CONTROLADOR USB MASS STORAGE CLASS (MSC / SCSI BOT)
@@ -67,12 +72,14 @@ void usb_msc_iniciar(void) {
 
 // Ejecuta una transacción SCSI completa de 3 fases bajo el protocolo BOT.
 // Si `fases` no es nulo, instrumenta cada fase con TSC y segmenta la fase DATA
-// para fechar el primer byte recibido. Un único punto de salida mantiene la
+// con finalizacion unica. Un único punto de salida mantiene la
 // invariante suma(fases 0..4) == fase TOTAL.
 static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
                                        const void *cdb, uint8_t cdb_len,
                                        void *datos, uint32_t datos_len, int es_in,
-                                       uint32_t primer_tramo, uint64_t *fases) {
+                                       uint32_t primer_tramo, uint64_t *fases,
+                                       uint32_t *recibidos) {
+    if(recibidos)*recibidos=0;
     if (!g_msc_inicializado || !dev || !dev->activo) return -1;
     if (!g_cbw || !g_csw || !g_msc_dma_buffer) return -2;
     if (cdb_len == 0 || cdb_len > 16 || datos_len > USB_MSC_DMA_BYTES || (datos_len && !datos)) return -3;
@@ -109,7 +116,7 @@ static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
     if (fases) fases[USB_MSC_FASE_CBW] = t_cbw - t0;
     if (res != 0) {
         serial_imprimir("  [USB MSC] Error enviando CBW (código: ");
-        serial_imprimir_dec(res);
+        usb_msc_imprimir_error(res);
         serial_imprimir_linea(")");
         resultado = -10;
         goto fin;
@@ -119,6 +126,7 @@ static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
     if (datos_len > 0 && datos) {
         uint64_t buf_fisica = g_msc_dma_buffer_fisica;
         void *buf_ptr = g_msc_dma_buffer;
+        if(es_in && recibidos)memset(buf_ptr,0,datos_len);
 
         // Si es OUT (escritura de datos al dispositivo), copiar datos al búfer DMA
         if (!es_in) {
@@ -130,7 +138,7 @@ static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
         uint8_t target_dci = es_in ? dev->ep_in_dci : dev->ep_out_dci;
         uint64_t t_evento_fin;
         if (fases && es_in && primer_tramo > 0 && primer_tramo < datos_len) {
-            // Ruta segmentada: el IOC del primer TRB fecha el primer DATA real.
+            // Ruta segmentada: ambos timestamps corresponden al DATA completo.
             uint64_t c_primer = 0, c_fin = 0;
             res = xhci_transferencia_bulk_segmentada(dev->slot_id, target_dci,
                                                      buf_ptr, buf_fisica,
@@ -157,9 +165,12 @@ static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
                 fases[USB_MSC_FASE_DATA_RESTO]  = 0;
             }
         }
+        /* BOT permite terminar Data-IN con STALL y luego entregar CSW. Solo
+         * consultas con residuo explícito; no reutilizar datos de sector parcial. */
+        if(res==-6 && es_in && recibidos && !xhci_bulk_limpiar_halt(dev->slot_id,target_dci))res=0;
         if (res != 0) {
             serial_imprimir("  [USB MSC] Error en Data Phase (código: ");
-            serial_imprimir_dec(res);
+            usb_msc_imprimir_error(res);
             serial_imprimir_linea(")");
             resultado = -11;
             goto fin;
@@ -180,11 +191,17 @@ static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
     res = xhci_transferencia_bulk(dev->slot_id, dev->ep_in_dci,
                                  g_csw, g_csw_fisica,
                                  sizeof(struct usb_msc_csw), 1 /* IN */, 2000);
+    /* USB BOT §5.3.3: limpiar STALL y reintentar CSW una vez. No repetir
+     * CBW, DATA ni escrituras; identidad, estado y residuo siguen obligatorios. */
+    if(res==-6 && !xhci_bulk_limpiar_halt(dev->slot_id,dev->ep_in_dci)){
+        memset(g_csw,0,sizeof(*g_csw));
+        res=xhci_transferencia_bulk(dev->slot_id,dev->ep_in_dci,g_csw,g_csw_fisica,sizeof(*g_csw),1,2000);
+    }
     t_csw = rdtsc();
     if (fases) fases[USB_MSC_FASE_CSW] = t_csw - t_after_data;
     if (res != 0) {
         serial_imprimir("  [USB MSC] Error recibiendo CSW (código: ");
-        serial_imprimir_dec(res);
+        usb_msc_imprimir_error(res);
         serial_imprimir_linea(")");
         resultado = -12;
         goto fin;
@@ -209,9 +226,14 @@ static int usb_msc_ejecutar_transaccion_ex(struct usb_msc_dispositivo *dev,
         serial_imprimir("  [USB MSC AVISO] Comando SCSI rechazado (CSW Estado: ");
         serial_imprimir_dec(g_csw->estado);
         serial_imprimir_linea(")");
-        resultado = -15;
+        resultado = g_csw->estado==USB_MSC_CSW_ESTADO_FALLO?-15:-17;
         goto fin;
     }
+    if(g_csw->residuo>datos_len || (!recibidos && g_csw->residuo)){
+        resultado=-16;
+        goto fin;
+    }
+    if(recibidos)*recibidos=datos_len-g_csw->residuo;
 
 fin:
     if (fases) {
@@ -227,7 +249,7 @@ static int usb_msc_ejecutar_transaccion(struct usb_msc_dispositivo *dev,
                                        const void *cdb, uint8_t cdb_len,
                                        void *datos, uint32_t datos_len, int es_in) {
     return usb_msc_ejecutar_transaccion_ex(dev, cdb, cdb_len, datos, datos_len,
-                                           es_in, 0, NULL);
+                                           es_in, 0, NULL, NULL);
 }
 
 int usb_msc_registrar_dispositivo(uint8_t slot_id, uint8_t puerto_idx,
@@ -421,7 +443,7 @@ int usb_msc_leer_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad, vo
     comandos_lectura++;
     int r = usb_msc_ejecutar_transaccion_ex(dev, cdb_read, 10, buffer_destino,
                                             tamano_total, 1 /* IN */,
-                                            USB_MSC_TELEM_TRAMO_PRIMERO, fases);
+                                            USB_MSC_TELEM_TRAMO_PRIMERO, fases, NULL);
     if(!r)bytes_lectura+=tamano_total;
 
     usb_msc_telemetria_registrar(fases, r ? 0 : tamano_total,
@@ -457,6 +479,61 @@ int usb_msc_escribir_sectores(uint8_t id_unidad, uint32_t lba, uint16_t cantidad
     };
 
     return usb_msc_ejecutar_transaccion(dev, cdb_write, 10, (void *)buffer_origen, tamano_total, 0 /* OUT */);
+}
+// Solo acepta sense actual, no deferred, y una respuesta completa declarada.
+static int sense_actual(const uint8_t *p,uint32_t n,uint8_t *key,uint8_t *asc,uint8_t *ascq){
+    if(n<8 || (uint32_t)p[7]+8>n)return -1;
+    if((p[0]&0x7f)==0x70){if(n<14 || p[7]<6)return -1;*key=p[2]&15;*asc=p[12];*ascq=p[13];return 0;}
+    if((p[0]&0x7f)==0x72){*key=p[1]&15;*asc=p[2];*ascq=p[3];return 0;}
+    return -1;
+}
+static int pedir_sense(struct usb_msc_dispositivo *dev,uint8_t *key,uint8_t *asc,uint8_t *ascq){
+    uint8_t p[252]={0},cdb[6]={0x03,0,0,0,sizeof(p),0};uint32_t n=0;
+    int r=usb_msc_ejecutar_transaccion_ex(dev,cdb,6,p,sizeof(p),1,0,NULL,&n);
+    if(r)return r;return sense_actual(p,n,key,asc,ascq);
+}
+// MODE SENSE, pagina Caching 08h / valores actuales (PC=0). No inferir WCE=0
+// de una pagina ausente, truncada, subpagina o respuesta de solo cabecera.
+static int cache_wce(const uint8_t *p,uint32_t n,int diez){
+    unsigned cab=diez?8:4;if(n<cab)return -1;
+    unsigned total=diez?(((unsigned)p[0]<<8)|p[1])+2:(unsigned)p[0]+1;
+    unsigned bloques=diez?((unsigned)p[6]<<8)|p[7]:p[3];
+    if(total>n || total<cab || bloques>total-cab || (p[diez?3:2]&0x80))return -1;
+    unsigned off=cab+bloques;
+    if(total-off<20 || (p[off]&0x7f)!=8 || p[off+1]<18 || (unsigned)p[off+1]+2>total-off)return -1;
+    return !!(p[off+2]&4);
+}
+static int consultar_cache(struct usb_msc_dispositivo *dev){
+    uint8_t p[252],cdb6[6]={0x1a,0x08,0x08,0,sizeof(p),0};uint32_t n=0;
+    int r=usb_msc_ejecutar_transaccion_ex(dev,cdb6,6,p,sizeof(p),1,0,NULL,&n);
+    if(!r){int w=cache_wce(p,n,0);if(w<0){serial_imprimir("[USB CACHE] MODE SENSE 6 sin pagina valida; bytes=");serial_imprimir_dec(n);serial_imprimir_linea("");}return w;}
+    // No recuperar errores de transporte/fase como si fueran pagina no soportada.
+    if(r!=-15)return -1;
+    uint8_t key,asc,ascq;if(pedir_sense(dev,&key,&asc,&ascq) || key!=5 || ascq || (asc!=0x20 && asc!=0x24))return -1;
+    uint8_t cdb10[10]={0x5a,0x08,0x08,0,0,0,0,0,sizeof(p),0};n=0;
+    r=usb_msc_ejecutar_transaccion_ex(dev,cdb10,10,p,sizeof(p),1,0,NULL,&n);
+    if(r){serial_imprimir("[USB CACHE] MODE SENSE 10 fallo; codigo=");usb_msc_imprimir_error(r);serial_imprimir_linea("");return -1;}
+    int w=cache_wce(p,n,1);if(w<0){serial_imprimir("[USB CACHE] MODE SENSE 10 sin pagina valida; bytes=");serial_imprimir_dec(n);serial_imprimir_linea("");}return w;
+}
+int usb_msc_sincronizar(uint8_t id){
+    if(id>=USB_MSC_MAX_DISPOSITIVOS)return -1;
+    struct usb_msc_dispositivo *dev=&g_msc_dispositivos[id];
+    if(!dev->activo || !dev->listo)return -2;
+    uint8_t cdb[10]={0x35,0,0,0,0,0,0,0,0,0};
+    int r=usb_msc_ejecutar_transaccion(dev,cdb,10,NULL,0,0);
+    if(!r)return 0;
+    if(r!=-15)return r;
+    uint8_t key=0,asc=0,ascq=0;
+    if(pedir_sense(dev,&key,&asc,&ascq))return -18;
+    serial_imprimir("[USB CACHE] sense key=");serial_imprimir_hex(key);
+    serial_imprimir(" ASC=");serial_imprimir_hex(asc);serial_imprimir(" ASCQ=");serial_imprimir_hex(ascq);serial_imprimir_linea("");
+    // Unit Attention: un unico reintento, sin ocultar errores de medio ni I/O.
+    if(key==6)return usb_msc_ejecutar_transaccion(dev,cdb,10,NULL,0,0);
+    if(key!=5 || asc!=0x20 || ascq)return -18;
+    int wce=consultar_cache(dev);
+    if(wce==0){serial_imprimir_linea("[USB CACHE] MODE SENSE actual: WCE=0; escritura sin cache habilitada.");return 0;}
+    serial_imprimir_linea(wce==1?"[USB CACHE] WCE=1 y flush no soportado; escritura rechazada.":"[USB CACHE] Cache desconocida; escritura rechazada.");
+    return -18;
 }
 
 int usb_msc_obtener_cantidad(void) {

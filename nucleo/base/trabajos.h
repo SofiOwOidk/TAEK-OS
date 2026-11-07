@@ -21,6 +21,7 @@ int trabajos_terminados(const trabajos_lote *);
 /* Backend kernel: no reentrante, sólo BSP. servicio nunca se ejecuta en AP. */
 int trabajos_ejecutar(trabajo_fn, void *, unsigned, void (*servicio)(void *), void *);
 unsigned trabajos_cpu_activas(void);
+int trabajos_bsp_calcula(void);
 unsigned trabajos_cpu_arrancadas(void);
 unsigned trabajos_cpu_detectadas(void);
 /* Reloj calibrado del ejecutor: 0 = BSP, 1..3 = AP. 0 si no hay dato. */

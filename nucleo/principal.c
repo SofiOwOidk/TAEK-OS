@@ -8,6 +8,7 @@
 #include "arquitectura/x86_64/gdt.h"
 #include "arquitectura/x86_64/idt.h"
 #include "arquitectura/x86_64/fpu.h"
+#include "arquitectura/x86_64/tls.h"
 #include "base/trabajos.h"
 #include "arquitectura/x86_64/apic.h"
 #include "arquitectura/x86_64/pci.h"
@@ -31,11 +32,13 @@
 #include "controladores/video/nvidia/core/nvidia_core.h"
 #include "controladores/xhci.h"
 #include "controladores/red/red.h"
+#include "controladores/red/stream.h"
 #include "controladores/terminal.h"
 #include "controladores/teclado.h"
 #include "controladores/multimedia/reproductor/reproductor.h"
 #include "controladores/video/intel/intel_diagnostico_ring0.h"
 #include "controladores/video/intel/intel_info.h"
+#include "compatibilidad/linux_i915/cpu_runtime.h"
 
 // Revision 3 del protocolo Limine
 __attribute__((used, section(".requests")))
@@ -176,12 +179,20 @@ void principal(void) {
     idt_iniciar();
     huevo_etapa_ok();
 
+    huevo_etapa("TLS estatico x86_64 del BSP (FS / imagen ELF)");
+    if(taek_tls_cpu_iniciar(0)) {
+        serial_imprimir_linea("[FATAL] Imagen TLS estatica fuera del contrato; arranque detenido.");
+        detener_cpu();
+    }
+    huevo_etapa_ok();
+
     huevo_etapa("Calibración del Temporizador TSC / PIT");
     tiempo_iniciar();
     huevo_etapa_ok();
 
     huevo_etapa("Gestor de Memoria Dinámica (PMM + Kernel Heap)");
     memoria_iniciar();
+    i915_tareas_iniciar();
     huevo_etapa_ok();
 
     huevo_etapa("Tablas de Paginación x86_64 (PML4 / VMM)");
@@ -240,13 +251,13 @@ void principal(void) {
     iommu_iniciar();
     const iommu_estado_t *eiommu = iommu_obtener_estado();
     if (eiommu->tabla_dmar_detectada) {
-        serial_imprimir("[Intel VT-d Activo | DRHD: ");
+        serial_imprimir("[Inventario VT-d | DRHD: ");
         serial_imprimir_dec((uint64_t)eiommu->conteo_drhd);
         serial_imprimir(" | Modo: ");
-        serial_imprimir(eiommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH ? "PassThrough" : "Traducción");
+        serial_imprimir(eiommu->modo_operacion == IOMMU_MODO_VT_D_TRADUCCION_ACTIVA ? "TES activo en alguna unidad" : "TES inactivo o desconocido");
         serial_imprimir("] ");
     } else {
-        serial_imprimir("[Modo DMA Directo 1:1 Transparente (Sin DMAR)] ");
+        serial_imprimir("[DMAR no disponible; ruta DMA desconocida] ");
     }
     huevo_etapa_ok();
 
@@ -448,6 +459,7 @@ void principal(void) {
             red_autodiagnostico();
         }
         video_h264_arranque(cl);
+        red_stream_arranque(cl);
     }
     terminal_ejecutar();
 

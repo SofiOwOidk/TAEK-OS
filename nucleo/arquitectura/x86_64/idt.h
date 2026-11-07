@@ -34,7 +34,13 @@ typedef void (*manejador_irq_fn)(struct marco_interrupcion *marco);
 
 void idt_iniciar(void);
 void idt_registrar_manejador(uint8_t vector, manejador_irq_fn manejador);
+/* Reserva condicional; el llamador drena sus IRQ antes de liberar. */
+int idt_reservar_manejador(uint8_t vector,manejador_irq_fn manejador);
+int idt_liberar_manejador(uint8_t vector,manejador_irq_fn manejador);
 void despachador_interrupciones(struct marco_interrupcion *marco);
+/* Profundidad del despachador en la CPU registrada actual; CPU desconocida
+ * se considera no admitida. No depende de IF ni de TLS de una fibra. */
+int idt_en_interrupcion(void);
 void idt_corromper_para_harakiri(void);
 
 #endif // ARQUITECTURA_X86_64_IDT_H

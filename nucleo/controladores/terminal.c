@@ -20,6 +20,8 @@
 #include "../base/memoria.h"
 #include "../base/dma.h"
 #include "../base/paginacion.h"
+#include "driver_ram.h"
+#include "puntero.h"
 #include "../arquitectura/x86_64/pci.h"
 #include "../arquitectura/x86_64/apic.h"
 #include "iommu.h"
@@ -30,10 +32,19 @@
 #include "exfat.h"
 #include "ntfs.h"
 #include "vfs.h"
+#include "archivo_comando.h"
 #include "red/red.h"
+#include "red/remoto.h"
+#include "red/stream.h"
+#include "red/archivos.h"
+#include "red/tls.h"
+#include "red/navegador.h"
 #include "video/intel/intel_info.h"
 #include "video/intel/intel_diagnostico_ring0.h"
+#include "compatibilidad/linux_i915/upstream_mm.h"
 #include "video/intel/i915_drv.h"
+#include "acpi/bateria.h"
+#include "equipo.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/vmx.h"
 #include "../arquitectura/x86_64/triple_fault.h"
@@ -1193,7 +1204,7 @@ static void ejecutar_comando_dma(const char *arg) {
             consola_imprimir_linea_color("[FALLO - ARENA NO INICIADA]", COLOR_ERROR_DEFAULT);
             return;
         }
-        consola_imprimir_linea_color("[OK - 32 MiB DEDICADOS]", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color("[OK - ARENA DEDICADA]", COLOR_EXITO_DEFAULT);
 
         consola_imprimir("  2. Asignación de bloque contiguo de 64 KiB alineado a 64 KiB... ");
         uint64_t phys_test = 0;
@@ -1286,23 +1297,39 @@ static void ejecutar_comando_dma(const char *arg) {
     consola_imprimir_dec((uint64_t)dma.tamano_maximo_asignado_kb);
     consola_imprimir_linea(" KiB");
 
+    dma_gpu_estadisticas_t gpu;
+    dma_gpu_obtener_estadisticas(&gpu);
+    consola_imprimir("  Arena GPU sobre 4 GiB  : ");
+    if (gpu.tamano_bytes) {
+        consola_imprimir_dec(gpu.tamano_bytes / (1024 * 1024));
+        consola_imprimir(" MiB | En uso ");
+        consola_imprimir_dec((uint64_t)gpu.paginas_en_uso / 256);
+        consola_imprimir(" MiB | Pico ");
+        consola_imprimir_dec((uint64_t)gpu.paginas_pico / 256);
+        consola_imprimir(" MiB | Bloques ");
+        consola_imprimir_dec((uint64_t)gpu.asignaciones_activas);
+        consola_imprimir_linea("");
+    } else {
+        consola_imprimir_linea("no hay; se usa la arena de arriba");
+    }
+
     consola_imprimir("  Coherencia de Silicio  : ");
     consola_imprimir_linea_color("Vaciado por hardware con clflushopt / clflush + mfence", COLOR_EXITO_DEFAULT);
 
     consola_imprimir("  Estado IOMMU / VT-d    : ");
     if (iommu->tabla_dmar_detectada) {
         if (iommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH) {
-            consola_imprimir_linea_color("Intel VT-d Activo (Modo PassThrough de Silicio - Cero Sobrecarga)", COLOR_EXITO_DEFAULT);
+            consola_imprimir_linea_color("Contexto PT acreditado por dispositivo", COLOR_EXITO_DEFAULT);
         } else {
-            consola_imprimir_linea_color("Intel VT-d Activo (Tablas de Traducción Activas)", COLOR_AVISO_DEFAULT);
+            consola_imprimir_linea_color("Estado global VT-d; consultar unidad y TES por dispositivo", COLOR_AVISO_DEFAULT);
         }
         consola_imprimir("  Unidades DRHD / RMRR   : ");
         consola_imprimir_dec((uint64_t)iommu->conteo_drhd);
         consola_imprimir(" DRHD remapeadas | ");
         consola_imprimir_dec((uint64_t)iommu->conteo_rmrr);
-        consola_imprimir_linea(" RMRR reservadas protegidas");
+        consola_imprimir_linea(" reservas RMRR de firmware (sin proteccion CPU acreditada)");
     } else {
-        consola_imprimir_linea_color("DMA Físico Directo 1:1 Transparente (Sin bloqueo IOMMU)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("Ruta DMA desconocida; ausencia de DMAR no acredita 1:1", COLOR_PROMPT_DEFAULT);
     }
 
     consola_imprimir_linea_color("=========================================================================", COLOR_AVISO_DEFAULT);
@@ -1310,29 +1337,47 @@ static void ejecutar_comando_dma(const char *arg) {
     consola_imprimir_linea_color("Tip: Escribe 'iommu' para ver el desglose técnico de unidades DRHD y RMRR.", COLOR_TEXTO_DEFAULT);
 }
 
+static void imprimir_scopes_iommu(const iommu_scope_t *scopes, unsigned n) {
+    for (unsigned i = 0; i < n && i < IOMMU_MAX_SCOPES; ++i) {
+        const iommu_scope_t *s = &scopes[i];
+        consola_imprimir("      Scope tipo="); consola_imprimir_dec(s->tipo);
+        consola_imprimir(" bus="); consola_imprimir_dec(s->bus_inicio);
+        consola_imprimir(" ruta=");
+        for (unsigned j = 0; j < s->conteo_pasos && j < IOMMU_MAX_PASOS; ++j) {
+            if (j) consola_imprimir("/");
+            consola_imprimir_dec(s->pasos[j].dispositivo); consola_imprimir(".");
+            consola_imprimir_dec(s->pasos[j].funcion);
+        }
+        consola_imprimir_linea("");
+    }
+}
 static void ejecutar_comando_iommu(const char *arg) {
     const iommu_estado_t *iommu = iommu_obtener_estado();
 
     if (arg && (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "diag"))) {
-        iommu_ejecutar_autodiagnostico();
-        consola_imprimir_linea_color("==> [ AUTODIAGNÓSTICO IOMMU CONCLUIDO ]", COLOR_EXITO_DEFAULT);
+        int r = iommu_ejecutar_autodiagnostico();
+        consola_imprimir_linea_color(r ? "==> [ DESCUBRIMIENTO IOMMU INCOMPLETO ]" :
+            "==> [ CONSULTA IOMMU CONCLUIDA; SIN PRUEBA DMA ]", r ? COLOR_AVISO_DEFAULT : COLOR_EXITO_DEFAULT);
         return;
     }
 
     consola_imprimir_linea_color("================ SUBSISTEMA IOMMU & INTEL VT-d (DMAR ACPI) ================", COLOR_AVISO_DEFAULT);
+    consola_imprimir_linea(iommu->inventario_completo ? "  Inventario/scopes: VALIDO" : "  Inventario/scopes: DESCONOCIDO O INCOMPLETO");
     consola_imprimir("  Tabla ACPI DMAR        : ");
     if (iommu->tabla_dmar_detectada) {
-        consola_imprimir_linea_color("DETECTADA Y PROCESADA [OK]", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color("DETECTADA; validez y MMIO se informan por separado", COLOR_EXITO_DEFAULT);
         consola_imprimir("  Ancho Dirección Host   : ");
         consola_imprimir_dec((uint64_t)iommu->ancho_direccion_host);
         consola_imprimir_linea(" bits de direccionamiento físico");
         consola_imprimir("  Modo de Operación      : ");
-        if (iommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH) {
-            consola_imprimir_linea_color("PassThrough de Hardware (PT) - 1:1 Directo sin traducción", COLOR_EXITO_DEFAULT);
+        if (iommu->modo_operacion == IOMMU_MODO_DESCONOCIDO) {
+            consola_imprimir_linea_color("DESCONOCIDO; no se presume TES ni ruta DMA", COLOR_AVISO_DEFAULT);
+        } else if (iommu->modo_operacion == IOMMU_MODO_VT_D_PASSTHROUGH) {
+            consola_imprimir_linea_color("Contexto PT acreditado por dispositivo", COLOR_EXITO_DEFAULT);
         } else if (iommu->modo_operacion == IOMMU_MODO_VT_D_TRADUCCION_ACTIVA) {
             consola_imprimir_linea_color("Traducción de Direcciones Activa por Firmware", COLOR_AVISO_DEFAULT);
         } else {
-            consola_imprimir_linea_color("Directo Físico Transparente", COLOR_PROMPT_DEFAULT);
+            consola_imprimir_linea_color("TES global inactivo; consultar dispositivo, buffers no acreditados", COLOR_PROMPT_DEFAULT);
         }
 
         consola_imprimir("  Unidades DRHD Encontradas: ");
@@ -1356,12 +1401,13 @@ static void ejecutar_comando_iommu(const char *arg) {
             consola_imprimir("      Versión: 0x");
             terminal_imprimir_hex_fijo((uint64_t)u->version, 4);
             consola_imprimir(" | TES: ");
-            consola_imprimir(u->traduccion_activa ? "Activa" : "Inactiva");
+            consola_imprimir(!u->activa ? "Desconocido" : u->traduccion_activa ? "Activa" : "Inactiva");
             consola_imprimir(" | PassThrough (PT): ");
             consola_imprimir(u->soporta_passthrough ? "Soportado" : "No");
             consola_imprimir(" | Coherente: ");
             consola_imprimir(u->coherente ? "Sí" : "No");
             consola_imprimir_linea("");
+            imprimir_scopes_iommu(u->scopes, u->conteo_scopes);
         }
 
         if (iommu->conteo_rmrr > 0) {
@@ -1376,15 +1422,16 @@ static void ejecutar_comando_iommu(const char *arg) {
                 terminal_imprimir_hex_fijo(r->dir_base_fisica, 16);
                 consola_imprimir(" - Límite 0x");
                 terminal_imprimir_hex_fijo(r->dir_limite_fisica, 16);
-                consola_imprimir_linea_color(" [PROTEGIDA CONTRA ESCRITURA]", COLOR_AVISO_DEFAULT);
+                consola_imprimir_linea_color(" [RESERVA FIRMWARE; NO IMPLICA PROTECCION CPU]", COLOR_AVISO_DEFAULT);
+                imprimir_scopes_iommu(r->scopes, r->conteo_scopes);
             }
         }
     } else {
-        consola_imprimir_linea_color("NO DETECTADA (QEMU Estándar / MoDT con VT-d deshabilitado)", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea_color("NO DETECTADA O DESCUBRIMIENTO INCOMPLETO", COLOR_PROMPT_DEFAULT);
         consola_imprimir("  Modo de Operación      : ");
-        consola_imprimir_linea_color("DMA Directo Físico 1:1 Transparente", COLOR_EXITO_DEFAULT);
-        consola_imprimir_linea("  El bus PCIe opera sin intermediación ni restricciones de aislamiento.");
-        consola_imprimir_linea("  La GPU GeForce RTX y dispositivos periféricos acceden libremente a la RAM física.");
+        consola_imprimir_linea_color("Ruta DMA desconocida (1:1 no acreditado)", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea("  No se deduce una ruta DMA valida de la ausencia de una tabla.");
+        consola_imprimir_linea("  La acreditacion GPU requiere unidad, TES, memoria y ownership por dispositivo.");
     }
 
     consola_imprimir_linea_color("===========================================================================", COLOR_AVISO_DEFAULT);
@@ -2393,6 +2440,62 @@ static void ejecutar_comando_leer(const char *arg) {
     ejecutar_comando_abrir(arg);
 }
 
+static void ejecutar_operacion_archivo(const char *arg,int operacion) {
+    const char *verbo=operacion==0?"copiar":operacion==1?"mover":"eliminar";
+    if(!vfs_esta_montado()){
+        consola_imprimir_linea_color("[ERROR] No hay un sistema de archivos montado. Use montar <disco>.",COLOR_ERROR_DEFAULT);return;
+    }
+    char archivo[1024],destino[4096],origen[4096],final[4096];
+    int portapapeles=0;
+    if(operacion==0 && arg){const char *cursor=arg;if(!archivo_argumento(&cursor,archivo,sizeof(archivo)) && !*archivo_espacios(cursor))portapapeles=1;}
+    if(!portapapeles && archivo_parsear(arg,operacion==2,archivo,sizeof(archivo),destino,sizeof(destino))){
+        consola_imprimir("Uso: ");consola_imprimir(verbo);consola_imprimir_linea(operacion==2?" \"archivo\"":" \"archivo\" a <ruta>");return;
+    }
+    const char *nombre=archivo;int indice;int numerico=archivo_indice(archivo,&indice);
+    if(numerico<0){consola_imprimir_linea_color("[ERROR] Indice invalido.",COLOR_ERROR_DEFAULT);return;}
+    const struct vfs_entrada *entrada=numerico?vfs_obtener_entrada_catalogo(indice):vfs_buscar_entrada_catalogo(archivo);
+    if(numerico && !entrada){consola_imprimir_linea_color("[ERROR] Indice fuera del catalogo actual. Use ls.",COLOR_ERROR_DEFAULT);return;}
+    if(entrada)nombre=entrada->nombre;
+    const char *base=vfs_obtener_ruta_catalogo();
+    if(archivo_ruta(base,nombre,origen,sizeof(origen))){consola_imprimir_linea_color("[ERROR] Ruta demasiado larga.",COLOR_ERROR_DEFAULT);return;}
+    enum vfs_tipo_nodo tipo;int r=vfs_consultar_ruta(origen,&tipo);
+    if(r){consola_imprimir("[ERROR] Origen: ");consola_imprimir_linea(volumen_error(r));return;}
+    if(tipo!=VFS_NODO_ARCHIVO){consola_imprimir_linea_color("[ERROR] Solo se permiten archivos regulares; directorios protegidos.",COLOR_ERROR_DEFAULT);return;}
+    if(portapapeles){
+        r=vfs_copiar_portapapeles(origen);if(r)consola_imprimir_linea(volumen_error(r));
+        else consola_imprimir_linea("[PORTAPAPELES] Origen seleccionado. Monta el otro disco y usa pegar [ruta]. No se copian datos hasta pegar.");return;
+    }
+    uint8_t unidad_destino;unsigned particion_destino;const char *ruta_destino;
+    int entre=operacion!=2?archivo_disco(destino,&unidad_destino,&particion_destino,&ruta_destino):0;
+    if(entre<0){consola_imprimir_linea("[ERROR] Uso destino: usb:<unidad>:<particion>:/ruta");return;}
+    if(operacion!=2 && !entre){
+        if(archivo_ruta(base,destino,final,sizeof(final))){consola_imprimir_linea_color("[ERROR] Ruta demasiado larga.",COLOR_ERROR_DEFAULT);return;}
+        size_t len=(size_t)str_longitud(final);enum vfs_tipo_nodo dst;
+        r=vfs_consultar_ruta(final,&dst);
+        if(r && r!=VOLUMEN_NO_ENCONTRADO){consola_imprimir("[ERROR] Destino: ");consola_imprimir_linea(volumen_error(r));return;}
+        if((!r && dst==VFS_NODO_DIRECTORIO) || (len && (final[len-1]=='/' || final[len-1]=='\\'))){
+            const char *solo=nombre;for(const char *p=nombre;*p;p++)if(*p=='/' || *p=='\\')solo=p+1;
+            if(archivo_ruta(final,solo,destino,sizeof(destino))){consola_imprimir_linea_color("[ERROR] Ruta demasiado larga.",COLOR_ERROR_DEFAULT);return;}
+            memcpy(final,destino,(size_t)str_longitud(destino)+1);
+        }
+        if(str_igual(origen,final)){consola_imprimir_linea_color("[AVISO] El origen y el destino son la misma ruta.",COLOR_AVISO_DEFAULT);return;}
+    }
+    consola_imprimir("==> ");consola_imprimir(verbo);consola_imprimir(" '");consola_imprimir(origen);consola_imprimir_linea("'...");
+    r=entre?vfs_operar_entre_discos(origen,destino,operacion==1):operacion==0?vfs_copiar_archivo(origen,final):operacion==1?vfs_mover_archivo(origen,final):vfs_eliminar_archivo(origen);
+    if(r){consola_imprimir("[ERROR] ");consola_imprimir_linea(volumen_error(r));}
+    else {consola_imprimir_linea_color("==> Operacion completada.",COLOR_EXITO_DEFAULT);vfs_listar_directorio(NULL);}
+}
+static void ejecutar_comando_mover(const char *arg){ejecutar_operacion_archivo(arg,1);}
+static void ejecutar_comando_copiar(const char *arg){ejecutar_operacion_archivo(arg,0);}
+static void ejecutar_comando_eliminar(const char *arg){ejecutar_operacion_archivo(arg,2);}
+static void ejecutar_comando_pegar(const char *arg){
+    char ruta[4096];ruta[0]=0;
+    if(arg && *arg){const char *p=arg;if(archivo_argumento(&p,ruta,sizeof(ruta)) || *archivo_espacios(p)){consola_imprimir_linea("Uso: pegar [ruta]");return;}}
+    int r=vfs_pegar_portapapeles(ruta);
+    if(r){consola_imprimir("[ERROR] ");consola_imprimir_linea(volumen_error(r));}
+    else{consola_imprimir_linea("==> Operacion completada.");vfs_listar_directorio(NULL);}
+}
+
 static void ejecutar_comando_disco(const char *arg) {
     if (arg) arg = str_saltar_espacios(arg);
 
@@ -2473,6 +2576,34 @@ static void ejecutar_comando_disco(const char *arg) {
         } else {
             vfs_crear_archivo(archivo, resto);
         }
+        return;
+    }
+
+    if (str_igual(arg, "mover") || str_comienza_con(arg, "mover ") ||
+        str_igual(arg, "mv") || str_comienza_con(arg, "mv ")) {
+        const char *sub = str_comienza_con(arg, "mover ") ? (arg + 6) :
+                          str_comienza_con(arg, "mv ") ? (arg + 3) : "";
+        ejecutar_comando_mover(sub);
+        return;
+    }
+
+    if (str_igual(arg, "copiar") || str_comienza_con(arg, "copiar ") ||
+        str_igual(arg, "cp") || str_comienza_con(arg, "cp ")) {
+        const char *sub = str_comienza_con(arg, "copiar ") ? (arg + 7) :
+                          str_comienza_con(arg, "cp ") ? (arg + 3) : "";
+        ejecutar_comando_copiar(sub);
+        return;
+    }
+
+    if(str_igual(arg,"pegar") || str_comienza_con(arg,"pegar ")){
+        ejecutar_comando_pegar(str_comienza_con(arg,"pegar ")?arg+6:"");return;
+    }
+
+    if (str_igual(arg, "eliminar") || str_comienza_con(arg, "eliminar ") ||
+        str_igual(arg, "borrar") || str_comienza_con(arg, "borrar ")) {
+        const char *sub = str_comienza_con(arg, "eliminar ") ? (arg + 9) :
+                          str_comienza_con(arg, "borrar ") ? (arg + 7) : "";
+        ejecutar_comando_eliminar(sub);
         return;
     }
 
@@ -2619,6 +2750,15 @@ static void ejecutar_comando_usb(const char *arg) {
         return;
     }
 
+    // Consulta la politica de persistencia SCSI sin escribir sectores.
+    if(arg && str_comienza_con(arg,"cache ")){
+        const char *p=str_saltar_espacios(arg+6);
+        if(p[0]>='0' && p[0]<'0'+USB_MSC_MAX_DISPOSITIVOS && !*str_saltar_espacios(p+1)){
+            int r=usb_msc_sincronizar((uint8_t)(p[0]-'0'));
+            consola_imprimir_linea(r?"USB: persistencia no confirmada; no habilitar escritura.":"USB: barrera de persistencia confirmada por SCSI. No se escribieron sectores.");
+        }else consola_imprimir_linea("Uso: usb cache <indice-usb>");
+        return;
+    }
     // Subcomando: usb reset <puerto>
     if (arg && (str_comienza_con(arg, "reset ") || str_comienza_con(arg, "reiniciar "))) {
         const char *p_str = arg + (str_comienza_con(arg, "reset ") ? 6 : 10);
@@ -2984,7 +3124,8 @@ static void red_imprimir_estado(void) {
     consola_imprimir_linea(")");
 
     consola_imprimir_linea_color("-------------------------------------------------------------------", COLOR_AVISO_DEFAULT);
-    consola_imprimir_linea_color("  Uso: red dhcp | red ping <ip|host> [n] | red dns <host> | red http <host> [ruta]", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("  Uso: red dhcp | red ping <ip|host> | red dns <host> | red https <host> [ruta]", COLOR_TEXTO_DEFAULT);
+    consola_imprimir_linea_color("       red web <url> | web <url> (Navegador web con TLS 1.3 nativo)", COLOR_TEXTO_DEFAULT);
     consola_imprimir_linea("       transmitir <mensaje> | recibir (terminal Windows por LAN)");
     consola_imprimir_linea("       transmitir destino <IPv4-del-PC> [puerto 9151]");
     consola_imprimir_linea("       red telemetria <IPv4-del-PC> [puerto 9150]");
@@ -3119,11 +3260,50 @@ static void ejecutar_comando_red(const char *arg) {
         return;
     }
 
-    if (str_comienza_con(arg, "http") || str_comienza_con(arg, "curl") || str_comienza_con(arg, "web")) {
+    if (str_comienza_con(arg, "web ") || str_comienza_con(arg, "navegador ")) {
+        const char *url = str_saltar_espacios(arg + (str_comienza_con(arg, "web ") ? 4 : 10));
+        if (!url || !url[0]) { consola_imprimir_linea("  Uso: red web <url>"); return; }
+        navegador_abrir_url(url);
+        return;
+    }
+
+    if (str_comienza_con(arg, "https")) {
+        const char *p = arg + 5;
+        char host[120];
+        char ruta[200];
+        p = red_token(p, host, sizeof(host));
+        red_token(p, ruta, sizeof(ruta));
+        if (!host[0]) { consola_imprimir_linea("  Uso: red https <host> [ruta]"); return; }
+        if (!ruta[0]) { ruta[0] = '/'; ruta[1] = '\0'; }
+        static char respuesta[16384];
+        consola_imprimir_color("  GET https://", COLOR_PROMPT_DEFAULT);
+        consola_imprimir(host);
+        consola_imprimir(ruta);
+        consola_imprimir_linea(" (TLS 1.3)...");
+        int n = red_https_obtener(host, ruta, 443, respuesta, sizeof(respuesta), 15000);
+        if (n > 0) {
+            consola_imprimir_color("  [HTTPS/TLS 1.3] ", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec((uint64_t)n);
+            consola_imprimir_linea(" bytes recibidos y descifrados:");
+            int mostrar = n < 2000 ? n : 2000;
+            for (int i = 0; i < mostrar; i++) {
+                char c = respuesta[i];
+                if (c == '\r') continue;
+                consola_escribir_caracter((c == '\n' || (c >= 32 && c < 127)) ? c : '.');
+            }
+            consola_imprimir_linea("");
+        } else {
+            consola_imprimir_color("  [!] Error HTTPS (código ", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec((uint64_t)(-n));
+            consola_imprimir_linea_color(").", COLOR_ERROR_DEFAULT);
+        }
+        return;
+    }
+
+    if (str_comienza_con(arg, "http") || str_comienza_con(arg, "curl")) {
         const char *p = arg;
         if (str_comienza_con(arg, "http")) p = arg + 4;
-        else if (str_comienza_con(arg, "curl")) p = arg + 4;
-        else p = arg + 3;
+        else p = arg + 4;
         char host[120];
         char ruta[200];
         p = red_token(p, host, sizeof(host));
@@ -3339,7 +3519,17 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea_color(": Autodiagnóstico del teclado USB y puertos ('teclado probar').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  red [opción]   ", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Red Ethernet: 'red dhcp', 'red ping <ip|host>', 'red dns <host>', 'red http <host> [ruta]', 'red autoprueba'.", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  web <url>        ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Navegador web ligero con soporte HTTPS (TLS 1.3 nativo, RFC 8446).", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  https <host>     ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Descarga y descifra datos HTTPS/TLS 1.3 directamente por consola.");
         consola_imprimir_linea("  transmitir <mensaje> | recibir : Mensajes con la terminal Windows por LAN.");
+        consola_imprimir_linea("  remoto iniciar <IP> [puerto] | remoto detener : Consola remota de diagnostico.");
+        consola_imprimir_linea("  stream iniciar <IP> [puerto] | stream detener : Espejo interactivo de consola.");
+    consola_imprimir_linea("  archivo servidor <IP> [9154] | destino <USB> <particion> | recibir <nombre>: Archivos por LAN.");
+    consola_imprimir_linea("  archivo estado | listar | cancelar | reintentar: Estado y control de recepcion.");
+    consola_imprimir_linea("  archivo verificar <nombre> [SHA-256]: Relee el archivo USB y comprueba su hash.");
+    consola_imprimir_linea("  Arriba/Abajo: historial de comandos. Ctrl+Arriba/Abajo: consultar salida anterior.");
         consola_imprimir_color("  entradas / disco", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Lista los discos y memorias USB conectadas ('entradas', 'discos').", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  seleccionar <d>  ", COLOR_EXITO_DEFAULT);
@@ -3364,6 +3554,12 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea_color(": Crea una carpeta o subdirectorio (FAT32, exFAT, ext4).", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  escribir <arch>", COLOR_EXITO_DEFAULT);
         consola_imprimir_linea_color(": Escribe texto en un archivo ('escribir saludo.txt Hola Mundo').", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  mover \"arch\" a <r>", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Mueve un archivo de la carpeta actual a <ruta>.", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  copiar \"arch\" a <r>", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Copia un archivo de la carpeta actual a <ruta>.", COLOR_EXITO_DEFAULT);
+        consola_imprimir_color("  eliminar \"arch\"", COLOR_EXITO_DEFAULT);
+        consola_imprimir_linea_color(": Elimina un archivo de la carpeta actual.", COLOR_EXITO_DEFAULT);
         consola_imprimir_color("  dmesg / log    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Registro completo de arranque en memoria y estado serial COM1.");
         consola_imprimir_color("  audio [opción] ", COLOR_PROMPT_DEFAULT);
@@ -3372,8 +3568,12 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Ajusta el volumen en dB ('volumen subir +10db', 'volumen bajar -10db', 'volumen estado').");
         consola_imprimir_color("  cangrejo       ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Reproduce la animación de Don Cangrejo explotando.");
+        consola_imprimir_color("  bateria        ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Carga, consumo, tensión y salud de la batería, leídos del firmware.");
+        consola_imprimir_color("  especificaciones", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Datos del equipo: modelo, procesador, memoria, gráficos, red y discos.");
         consola_imprimir_color("  h264 [opción]  ", COLOR_PROMPT_DEFAULT);
-        consola_imprimir_linea(": Reproductor H.264 por CPU ('h264 360p', 'h264 1080p', 'h264 prueba').");
+        consola_imprimir_linea(": Reproductor H.264 ('h264 360p', 'h264 1080p', 'h264 prueba', 'h264 motor').");
         consola_imprimir_color("  aac [opción]   ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Auditoría y decodificación de audio AAC ('aac 360p', 'aac 1080p').");
         consola_imprimir_color("  provocar triple fault", COLOR_ERROR_DEFAULT);
@@ -3400,7 +3600,7 @@ static void procesar_comando(const char *linea_cruda) {
         }
         consola_imprimir_color("  limpiar / cls  ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Limpia la pantalla de la terminal.");
-        consola_imprimir_color("  apagar         ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_color("  reboot         : Reiniciar con USB sincronizado.\n  apagar         ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Apaga el ordenador de forma limpia vía ACPI.");
         consola_imprimir_color("  sudo rm -rf /  ", COLOR_ERROR_DEFAULT);
         consola_imprimir_linea_color(": [PELIGRO] Detona Triple Fault de hardware según el modo configurado.", COLOR_ERROR_DEFAULT);
@@ -3607,6 +3807,21 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: bateria (una lectura al escribirlo, nada en segundo plano)
+    if (str_igual(linea, "bateria") || str_igual(linea, "batería")) {
+        bateria_comando();
+        return;
+    }
+    // COMANDO: especificaciones
+    if (str_igual(linea, "especificaciones") || str_igual(linea, "especificaciones sistema")) {
+        equipo_especificaciones();
+        return;
+    }
+    if (str_igual(linea, "acpi") || str_comienza_con(linea, "acpi ")) {
+        acpi_comando(str_igual(linea, "acpi") ? "" : str_saltar_espacios(linea + 5));
+        return;
+    }
+
     // COMANDO: info / sistema
     if (str_igual(linea, "info") || str_igual(linea, "sistema")) {
         consola_imprimir_linea_color("--- INFORMACIÓN DEL SISTEMA ---", COLOR_AVISO_DEFAULT);
@@ -3748,6 +3963,73 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    if(str_igual(linea,"driver") || str_comienza_con(linea,"driver ")){
+        driver_ram_comando(str_igual(linea,"driver")?"":str_saltar_espacios(linea+7));return;
+    }
+    if(str_igual(linea,"raton") || str_comienza_con(linea,"raton ")){
+        puntero_comando(str_igual(linea,"raton")?"":str_saltar_espacios(linea+6));return;
+    }
+    if(str_igual(linea,"archivo") || str_comienza_con(linea,"archivo ")){
+        red_archivos_comando(str_igual(linea,"archivo")?"":linea+8);return;
+    }
+    if (str_igual(linea, "stream") || str_comienza_con(linea, "stream ")) {
+        const char *arg = str_igual(linea,"stream") ? "" : str_saltar_espacios(linea+7);
+        if (str_igual(arg,"detener")) {
+            red_stream_detener();consola_imprimir_linea("Streaming de consola detenido.");
+        } else if (str_comienza_con(arg,"iniciar ")) {
+            char host[40],port[12],extra[8];uint8_t ip[4];
+            const char *p=red_token(arg+8,host,sizeof(host));
+            p=red_token(p,port,sizeof(port));red_token(p,extra,sizeof(extra));
+            uint32_t numero=9153;int valido=!extra[0];
+            if(port[0]) {
+                numero=0;
+                for(int i=0;port[i];++i) {
+                    if(port[i]<'0'||port[i]>'9'||numero>6553){valido=0;break;}
+                    numero=numero*10+(uint32_t)(port[i]-'0');
+                }
+            }
+            if(!valido||!numero||numero>65535||red_texto_a_ip(host,ip)) {
+                consola_imprimir_linea("Uso: stream iniciar <IP-del-PC> [puerto 9153]");return;
+            }
+            red_remoto_detener();red_stream_iniciar(ip,(uint16_t)numero);
+            consola_imprimir_linea("Streaming ACTIVO: salida serial y teclado comparten la consola local.");
+            consola_imprimir_linea("El PC configurado puede escribir comandos. Para cortar: stream detener.");
+        } else {
+            consola_imprimir_linea(!red_stream_activo()?"Streaming DETENIDO":
+                red_stream_conectado()?"Streaming CONECTADO":"Streaming ACTIVO, esperando al PC");
+            consola_imprimir_linea("Uso: stream iniciar <IP-del-PC> [puerto 9153] | stream detener");
+        }
+        return;
+    }
+
+    if (str_igual(linea, "remoto") || str_comienza_con(linea, "remoto ")) {
+        const char *arg = str_igual(linea, "remoto") ? "" : str_saltar_espacios(linea + 7);
+        if (str_igual(arg, "detener")) {
+            red_remoto_detener(); consola_imprimir_linea("Consola remota detenida.");
+        } else if (str_comienza_con(arg, "iniciar ")) {
+            char host[40], port[12], extra[8]; uint8_t ip[4];
+            const char *p = red_token(arg + 8, host, sizeof(host));
+            p = red_token(p, port, sizeof(port)); red_token(p, extra, sizeof(extra));
+            uint32_t numero = 9152; int valido = !extra[0];
+            if (port[0]) {
+                numero = 0;
+                for (int i=0;port[i];++i) {
+                    if(port[i]<'0'||port[i]>'9'||numero>6553){valido=0;break;}
+                    numero=numero*10+(uint32_t)(port[i]-'0');
+                }
+            }
+            if (!valido || !numero || numero>65535 || red_texto_a_ip(host,ip)) {
+                consola_imprimir_linea("Uso: remoto iniciar <IP-del-PC> [puerto 9152]"); return;
+            }
+            red_stream_detener();red_remoto_iniciar(ip,(uint16_t)numero);
+            consola_imprimir_linea("Consola remota de diagnostico activa mientras la terminal espera comandos.");
+        } else {
+            consola_imprimir_linea(red_remoto_activo()?"Consola remota ACTIVA":"Consola remota DETENIDA");
+            consola_imprimir_linea("Uso: remoto iniciar <IP-del-PC> [puerto 9152] | remoto detener");
+        }
+        return;
+    }
+
     // Mensajes cortos entre la terminal TAEK y la terminal Windows.
     if (str_igual(linea, "transmitir") || str_comienza_con(linea, "transmitir ") ||
         str_igual(linea, "recibir") || str_comienza_con(linea, "recibir ")) {
@@ -3816,6 +4098,58 @@ static void procesar_comando(const char *linea_cruda) {
         else if (str_comienza_con(linea, "nic ")) arg = str_saltar_espacios(linea + 4);
         else if (str_comienza_con(linea, "lan ")) arg = str_saltar_espacios(linea + 4);
         ejecutar_comando_red(arg);
+        return;
+    }
+
+    // COMANDO: web / navegador / browser (Navegador web con TLS 1.3 nativo)
+    if (str_igual(linea, "web") || str_comienza_con(linea, "web ") ||
+        str_igual(linea, "navegador") || str_comienza_con(linea, "navegador ") ||
+        str_igual(linea, "browser") || str_comienza_con(linea, "browser ")) {
+        const char *arg = NULL;
+        if (str_comienza_con(linea, "web ")) arg = str_saltar_espacios(linea + 4);
+        else if (str_comienza_con(linea, "navegador ")) arg = str_saltar_espacios(linea + 10);
+        else if (str_comienza_con(linea, "browser ")) arg = str_saltar_espacios(linea + 8);
+        if (!arg || !*arg) {
+            consola_imprimir_linea_color("  Uso: web <url> | navegador https://example.com | web https://1.1.1.1", COLOR_AVISO_DEFAULT);
+            return;
+        }
+        navegador_abrir_url(arg);
+        return;
+    }
+
+    // COMANDO: https <host> [ruta] (Cliente TLS 1.3 nativo)
+    if (str_comienza_con(linea, "https ") || str_igual(linea, "https")) {
+        const char *arg = str_saltar_espacios(linea + 5);
+        if (!arg || !*arg) {
+            consola_imprimir_linea_color("  Uso: https <host> [ruta] (Cliente TLS 1.3 nativo)", COLOR_AVISO_DEFAULT);
+            return;
+        }
+        char host[120], ruta[200];
+        const char *p = red_token(arg, host, sizeof(host));
+        red_token(p, ruta, sizeof(ruta));
+        if (!ruta[0]) { ruta[0] = '/'; ruta[1] = '\0'; }
+        static char respuesta[16384];
+        consola_imprimir_color("  GET https://", COLOR_PROMPT_DEFAULT);
+        consola_imprimir(host);
+        consola_imprimir(ruta);
+        consola_imprimir_linea(" (TLS 1.3)...");
+        int n = red_https_obtener(host, ruta, 443, respuesta, sizeof(respuesta), 15000);
+        if (n > 0) {
+            consola_imprimir_color("  [HTTPS/TLS 1.3] ", COLOR_EXITO_DEFAULT);
+            consola_imprimir_dec((uint64_t)n);
+            consola_imprimir_linea(" bytes recibidos y descifrados:");
+            int mostrar = n < 2000 ? n : 2000;
+            for (int i = 0; i < mostrar; i++) {
+                char c = respuesta[i];
+                if (c == '\r') continue;
+                consola_escribir_caracter((c == '\n' || (c >= 32 && c < 127)) ? c : '.');
+            }
+            consola_imprimir_linea("");
+        } else {
+            consola_imprimir_color("  [!] Error HTTPS (código ", COLOR_ERROR_DEFAULT);
+            consola_imprimir_dec((uint64_t)(-n));
+            consola_imprimir_linea_color(").", COLOR_ERROR_DEFAULT);
+        }
         return;
     }
 
@@ -3987,6 +4321,18 @@ static void procesar_comando(const char *linea_cruda) {
         const char *arg = str_igual(linea, "intel") ? "" : str_saltar_espacios(linea + 5);
         if (str_igual(arg, "probar") || str_igual(arg, "test") || str_igual(arg, "r0") || str_igual(arg, "h1")) {
             intel_diagnostico_ring0_ejecutar();
+        } else if (str_igual(arg,"abi")) {
+            intel_diagnostico_ring0_abi();
+        } else if (str_igual(arg,"simd")) {
+            intel_diagnostico_ring0_simd();
+        } else if (str_igual(arg,"tls")) {
+            intel_diagnostico_ring0_tls();
+        } else if (str_igual(arg,"scheduler")) {
+            intel_diagnostico_ring0_scheduler();
+        } else if (str_igual(arg,"irq")) {
+            intel_diagnostico_ring0_irq();
+        } else if (str_igual(arg,"upstream-mm")) {
+            intel_diagnostico_upstream_mm();
         } else if (str_igual(arg, "estado") || str_igual(arg, "drv")) {
             i915_imprimir_estado();
         } else if (str_igual(arg, "vcs") || str_igual(arg, "trabajo") || str_igual(arg, "batch")) {
@@ -4001,6 +4347,11 @@ static void procesar_comando(const char *linea_cruda) {
             intel_inventario_imprimir_h0();
             consola_imprimir_linea_color("  Comandos disponibles:", COLOR_PROMPT_DEFAULT);
             consola_imprimir_linea("   intel probar  : Autodiagnóstico del runtime en Ring 0.");
+            consola_imprimir_linea("   intel abi     : Cambio de contexto entero; fronteras ASM, sin operaciones GPU.");
+            consola_imprimir_linea("   intel simd    : Estado x87, MXCSR y XMM0..15 por tarea del shim.");
+            consola_imprimir_linea("   intel tls     : TLS estatico ELF y FS por tarea del shim.");
+            consola_imprimir_linea("   intel scheduler: Tareas reales y TLS por CPU registrada, BSP/AP.");
+            consola_imprimir_linea("   intel irq     : IF por tarea e IPI APIC en BSP/AP, sin IRQ GPU.");
             consola_imprimir_linea("   intel estado  : Consulta pasiva del controlador i915 (sin MMIO/BusMaster).");
             consola_imprimir_linea("   intel vcs     : Envío VCS (deshabilitado temporalmente).");
         }
@@ -4279,6 +4630,45 @@ static void procesar_comando(const char *linea_cruda) {
         }
     }
 
+    // COMANDO: mover "archivo" a <ruta>
+    if (str_igual(linea, "mover") || str_comienza_con(linea, "mover ") ||
+        str_igual(linea, "mv") || str_comienza_con(linea, "mv ")) {
+        const char *arg = str_comienza_con(linea, "mover ") ? (linea + 6) :
+                          str_comienza_con(linea, "mv ") ? (linea + 3) : "";
+        ejecutar_comando_mover(arg);
+        return;
+    }
+
+    // COMANDO: copiar "archivo" a <ruta>
+    if(str_igual(linea,"pegar") || str_comienza_con(linea,"pegar ")){
+        ejecutar_comando_pegar(str_comienza_con(linea,"pegar ")?linea+6:"");return;
+    }
+    if (str_igual(linea, "copiar") || str_comienza_con(linea, "copiar ") ||
+        str_igual(linea, "cp") || str_comienza_con(linea, "cp ")) {
+        const char *arg = str_comienza_con(linea, "copiar ") ? (linea + 7) :
+                          str_comienza_con(linea, "cp ") ? (linea + 3) : "";
+        ejecutar_comando_copiar(arg);
+        return;
+    }
+
+    // COMANDO: eliminar "archivo"
+    if (str_igual(linea, "eliminar") || str_comienza_con(linea, "eliminar ") ||
+        str_igual(linea, "borrar") || str_comienza_con(linea, "borrar ")) {
+        const char *arg = str_comienza_con(linea, "eliminar ") ? (linea + 9) :
+                          str_comienza_con(linea, "borrar ") ? (linea + 7) : "";
+        ejecutar_comando_eliminar(arg);
+        return;
+    }
+
+    if(str_igual(linea,"reboot") || str_igual(linea,"reiniciar")){
+        int r=red_archivos_preparar_reinicio();
+        if(r){consola_imprimir_linea("Reinicio detenido: transferencia pendiente o USB no sincronizado. Reintentar/cancelar o revisar el medio.");return;}
+        consola_imprimir_linea("[REBOOT] USB sincronizado; reiniciando equipo...");
+        consola_lote_finalizar();consola_lote_iniciar();
+        uint64_t fin=tiempo_obtener_milisegundos()+500;
+        while(tiempo_obtener_milisegundos()<fin){red_stream_atender();__asm__ volatile("pause");}
+        red_stream_detener();reiniciar_equipo();
+    }
     // COMANDO: apagar
     if (str_igual(linea, "apagar") || str_igual(linea, "poweroff") || str_igual(linea, "shutdown")) {
         consola_imprimir_linea_color("==> Apagando equipo vía ACPI...", COLOR_AVISO_DEFAULT);
@@ -4306,6 +4696,7 @@ static void procesar_comando(const char *linea_cruda) {
 
 void terminal_ejecutar(void) {
     terminal_iniciar();
+    red_remoto_ejecutor(procesar_comando);
 
     // 1. Resumen conciso de silicio GPU al arrancar
     consola_imprimir_color("==> [ SILICIO DETECTADO ] ", COLOR_AVISO_DEFAULT);
@@ -4360,7 +4751,9 @@ void terminal_ejecutar(void) {
         imprimir_prompt();
         int len = consola_leer_linea(buffer, sizeof(buffer));
         if (len > 0) {
+            consola_lote_iniciar();
             procesar_comando(buffer);
+            consola_lote_finalizar();
         }
     }
 }

@@ -30,6 +30,9 @@ void x86_64_fpu_iniciar(void) {
 
     __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
     cr4 |= ((uint64_t)1 << 9) | ((uint64_t)1 << 10); /* OSFXSR, OSXMMEXCPT */
+    /* This kernel admits SSE2 and uses FXSAVE64 in traps/tasks. Do not inherit
+     * an EFI OSXSAVE setting that would enable unpreserved YMM/ZMM state. */
+    cr4 &= ~((uint64_t)1 << 18);
     __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
 
     const uint32_t mxcsr = 0x1F80;

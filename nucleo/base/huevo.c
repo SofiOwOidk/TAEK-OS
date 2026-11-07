@@ -7,8 +7,38 @@
 #include "../base/tiempo.h"
 #include "../arquitectura/x86_64/serial.h"
 #include "../arquitectura/x86_64/idt.h"
+#include "../controladores/red/stream.h"
+#include "paginacion.h"
 
 static huevo_estabilidad_t g_huevo;
+
+/* Sin marcos de pila en los modulos: se listan candidatos a direccion de retorno. El rango
+ * coincide con DRIVER_VA de driver_ram.c; se simboliza con simbolizar_modulo.py. */
+static void huevo_volcar_pila_modulo(uint64_t rip, uint64_t rsp) {
+    const uint64_t base = UINT64_C(0x0000400000000000), limite = base + 24u * 1024u * 1024u;
+    uint64_t actual;
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(actual));
+    if (!rsp) rsp = actual;
+    if (rip < base || rip >= limite) {
+        unsigned hay = 0;
+        for (uint64_t p = rsp & ~UINT64_C(7), i = 0; i < 512; i++, p += 8) {
+            if (!paginacion_obtener_fisica(p)) break;
+            uint64_t v = *(const uint64_t *)p;
+            if (v >= base && v < limite) { hay = 1; break; }
+        }
+        if (!hay) return;
+    }
+    serial_imprimir_linea("  Pila hacia el modulo (candidatos a retorno):");
+    unsigned vistos = 0;
+    for (uint64_t p = rsp & ~UINT64_C(7), i = 0; i < 1536 && vistos < 32; i++, p += 8) {
+        if (!paginacion_obtener_fisica(p)) break;
+        uint64_t v = *(const uint64_t *)p;
+        if (v >= base && v < limite) {
+            serial_imprimir("    [modulo] 0x"); serial_imprimir_hex(v); serial_imprimir_linea("");
+            vistos++;
+        }
+    }
+}
 
 void huevo_iniciar(void) {
     g_huevo.magico = HUEVO_MAGICO;
@@ -131,8 +161,28 @@ static void huevo_autopsia_forense(const char *motivo_fatal, const struct marco_
         serial_imprimir("  RBP: 0x"); serial_imprimir_hex(marco->rbp);
         serial_imprimir("  RFL: 0x"); serial_imprimir_hex(marco->rflags);
         serial_imprimir_linea("");
+        if (marco->num_interrupcion == 14) {
+            uint64_t cr2 = 0;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            serial_imprimir("  CR2: 0x"); serial_imprimir_hex(cr2);
+            serial_imprimir_linea("");
+        }
     }
+    huevo_volcar_pila_modulo(rip, rsp);
     serial_imprimir_linea("==================================================");
+
+    /* Laboratorio remoto: con stream LAN activo nadie esta mirando la pantalla. La evidencia
+     * ya esta en el registro serial que el stream transmite; se envia y se reinicia para poder
+     * seguir iterando. Sin stream se conserva el cierre de siempre. */
+    if (red_stream_activo()) {
+        serial_imprimir_linea("[HUEVO LAN] Evidencia enviada por stream; reinicio automatico en 6 s.");
+        uint64_t fin = tiempo_obtener_milisegundos() + 6000;
+        while (tiempo_obtener_milisegundos() < fin) {
+            red_stream_atender();
+            __asm__ volatile ("pause");
+        }
+        reiniciar_equipo();
+    }
 
     // 2. Pantalla Roja de la Muerte (RSOD) en el Framebuffer Físico
     if (pantalla_obtener_ancho() > 0) {

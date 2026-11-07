@@ -284,6 +284,12 @@ void i915_imprimir_estado(void) {
         consola_imprimir_linea_color("Sin tabla DMAR detectada (1:1 no acreditado)", COLOR_AVISO_DEFAULT);
     }
 
+    if (info.iommu_unidad_identificada) {
+        consola_imprimir("  VT-d dispositivo   : DRHD #"); consola_imprimir_dec(info.iommu_indice_drhd);
+        consola_imprimir(" en "); consola_imprimir_hex(info.iommu_mmio_fisica);
+        consola_imprimir_linea(info.iommu_dma_directo_observado < 0 ? "; TES desconocido" :
+            info.iommu_dma_directo_observado ? "; TES inactivo; buffers DMA pendientes" : "; TES activo; requiere dominio DMA");
+    } else consola_imprimir_linea("  VT-d dispositivo   : Unidad desconocida.");
     consola_imprimir("  Modo de Operación   : ");
     consola_imprimir_linea_color("Solo lectura PCI (init activa bloqueada hasta acreditación)", COLOR_AVISO_DEFAULT);
 

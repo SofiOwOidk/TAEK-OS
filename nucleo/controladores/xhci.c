@@ -1,4 +1,6 @@
 #include "xhci.h"
+#include "teclado.h"
+#include "xhci_bulk_plan.h"
 #include "usb_msc.h"
 #include "consola.h"
 #include "../arquitectura/x86_64/puertos.h"
@@ -8,6 +10,9 @@
 #include "../base/tiempo.h"
 #include "../base/memoria.h"
 #include "../base/huevo.h"
+#ifndef TAEK_XHCI_TRAZA_IO
+#define TAEK_XHCI_TRAZA_IO 0
+#endif
 
 // --- REGISTROS MMIO XHCI ---
 #define REG_CAPLENGTH      0x00
@@ -74,6 +79,7 @@ static inline uint32_t xhci_portsc_neutral(uint32_t val) {
 #define TRB_TIPO_EVAL_CTX      13
 #define TRB_TIPO_RESET_EP      14
 #define TRB_TIPO_STOP_EP       15
+#define TRB_TIPO_SET_DEQUEUE   16
 #define TRB_TIPO_TRANSFER_EVT  32
 #define TRB_TIPO_CMD_COMP_EVT  33
 #define TRB_TIPO_PORT_STATUS   34
@@ -188,7 +194,7 @@ static uint8_t g_cambio_puerto_pendiente;
 
 // --- TELEMETRIA DE TRANSFERENCIAS BULK (sin salida en el camino caliente) ---
 // Captura con marca TSC del primer evento de cada TRB de una transferencia
-// segmentada, para fechar el "primer DATA recibido" sin ambiguedad.
+// segmentada, para fechar la finalizacion del DATA completo.
 #define XHCI_CAPTURA_EVENTOS_MAX 8
 // Longitud maxima por TRB Normal (campo Transfer Length de 17 bits: 131071).
 // Se usa 64 KiB por alineacion y margen; el resto se reparte en varios TRBs.
@@ -201,6 +207,10 @@ struct xhci_captura_bulk {
     uint32_t recibidos;
     uint64_t ciclos[XHCI_CAPTURA_EVENTOS_MAX];
     uint8_t  codigos[XHCI_CAPTURA_EVENTOS_MAX];
+    uint64_t trbs[XHCI_BULK_PLAN_MAX];
+    uint32_t cantidad_trbs;
+    int terminado, fallo;
+    uint64_t trb_error;
 };
 static struct xhci_captura_bulk g_captura_bulk;
 
@@ -225,6 +235,8 @@ struct xhci_ep_teclado {
     uint8_t  iface_num;     // Número de interfaz USB
     uint8_t  es_boot;       // Interfaz HID Boot Keyboard (subclase/protocolo 1/1)
     uint8_t  es_raton;      // Interfaz HID Boot Mouse (subclase/protocolo 1/2)
+    uint8_t  raton_boot_confirmado;
+    uint32_t raton_generacion;
     int      activo;
 
     // Anillo de transferencia DMA (Transfer Ring)
@@ -241,6 +253,42 @@ struct xhci_ep_teclado {
 };
 
 static struct xhci_ep_teclado g_teclado_eps[XHCI_MAX_TECLADO_EPS];
+#define MOUSE_COLA 64
+static struct taek_hid_mouse_reporte g_mouse_cola[MOUSE_COLA];
+static unsigned g_mouse_inicio,g_mouse_total;
+static int g_mouse_propietario,g_mouse_ep=-1;
+static uint32_t g_mouse_generacion,g_mouse_generacion_ep;
+static uint64_t g_mouse_secuencia,g_mouse_perdidos;
+static int mouse_compatible(unsigned e){
+    return g_teclado_eps[e].activo && g_teclado_eps[e].es_raton && g_teclado_eps[e].raton_boot_confirmado;
+}
+static int mouse_buscar(void){
+    for(unsigned e=0;e<XHCI_MAX_TECLADO_EPS;e++)if(mouse_compatible(e)){g_mouse_ep=(int)e;g_mouse_generacion_ep=g_teclado_eps[e].raton_generacion;return 1;}
+    g_mouse_ep=-1;return 0;
+}
+int xhci_hid_mouse_tomar(void){
+    if(g_mouse_propietario)return -1;
+    g_mouse_propietario=1;g_mouse_inicio=g_mouse_total=0;g_mouse_perdidos=0;return mouse_buscar();
+}
+void xhci_hid_mouse_liberar(void){g_mouse_propietario=0;g_mouse_inicio=g_mouse_total=0;g_mouse_ep=-1;}
+uint64_t xhci_hid_mouse_perdidos(void){return g_mouse_perdidos;}
+int xhci_hid_mouse_leer(struct taek_hid_mouse_reporte *out){
+    if(!g_mouse_propietario || !out)return -1;
+    if(g_mouse_ep>=0 && (!mouse_compatible((unsigned)g_mouse_ep) || g_teclado_eps[g_mouse_ep].raton_generacion!=g_mouse_generacion_ep)){
+        g_mouse_inicio=g_mouse_total=0;g_mouse_ep=-1;return -2;
+    }
+    if(g_mouse_ep<0)mouse_buscar();
+    if(!g_mouse_total)return 0;
+    *out=g_mouse_cola[g_mouse_inicio];g_mouse_inicio=(g_mouse_inicio+1)%MOUSE_COLA;g_mouse_total--;return 1;
+}
+static void mouse_encolar(struct xhci_ep_teclado *ep,const uint8_t *data,unsigned n){
+    if(!g_mouse_propietario || !ep->raton_boot_confirmado || n<3 || n>8)return;
+    if(g_mouse_ep<0)mouse_buscar();
+    if(g_mouse_ep<0 || ep!=&g_teclado_eps[g_mouse_ep] || ep->raton_generacion!=g_mouse_generacion_ep)return;
+    if(g_mouse_total==MOUSE_COLA){g_mouse_inicio=(g_mouse_inicio+1)%MOUSE_COLA;g_mouse_total--;g_mouse_perdidos++;}
+    struct taek_hid_mouse_reporte *r=&g_mouse_cola[(g_mouse_inicio+g_mouse_total)%MOUSE_COLA];
+    memset(r,0,sizeof(*r));r->secuencia=++g_mouse_secuencia;r->dispositivo=ep->raton_generacion;r->longitud=(uint8_t)n;memcpy(r->datos,data,n);g_mouse_total++;
+}
 
 static void xhci_recontar_hid(void) {
     uint8_t teclados[XHCI_MAX_SLOTS + 1] = {0};
@@ -357,10 +405,11 @@ static uint32_t g_cmd_ring_wraparounds = 0;
 // Tocar timbre (Doorbell) con instrumentación nuclear de telemetría y mfence
 static inline void xhci_tocar_timbre(uint8_t slot, uint32_t ep_o_cmd) {
     uint64_t t_costo0 = rdtsc();
-    uint64_t tsc = rdtsc();
-    uint64_t ms = tiempo_obtener_milisegundos();
     uint64_t reg_db = g_db_base + ((uint64_t)slot * 4);
     __asm__ volatile ("mfence" ::: "memory");
+#if TAEK_XHCI_TRAZA_IO
+    uint64_t tsc = rdtsc();
+    uint64_t ms = tiempo_obtener_milisegundos();
     serial_imprimir("  [xHCI DB] Ring: Slot=");
     serial_imprimir_dec(slot);
     serial_imprimir(" Target=");
@@ -372,6 +421,7 @@ static inline void xhci_tocar_timbre(uint8_t slot, uint32_t ep_o_cmd) {
     serial_imprimir(" (ms=");
     serial_imprimir_dec((uint32_t)ms);
     serial_imprimir_linea(")");
+#endif
     mmio_escribir32(reg_db, ep_o_cmd);
     __asm__ volatile ("mfence" ::: "memory");
     g_ciclos_timbre += rdtsc() - t_costo0;
@@ -415,7 +465,29 @@ static int xhci_extraer_evento(struct trb_xhci *salida) {
     return 1;
 }
 
+static int xhci_capturar_bulk_evento(const struct trb_xhci *evt) {
+    uint8_t slot=(evt->control>>24)&0xff,dci=(evt->control>>16)&0x1f;
+    if(!g_captura_bulk.activo||g_captura_bulk.slot!=slot||g_captura_bulk.dci!=dci)return 0;
+    int asociado=0;
+    for(uint32_t j=0;j<g_captura_bulk.cantidad_trbs;++j)
+        if(evt->parametro==g_captura_bulk.trbs[j])asociado=1;
+    if(!asociado)return 1; // evento tardio de otro TD: consumir sin atribuirlo al actual
+    uint8_t cc=(evt->estado>>24)&0xff;
+    if(g_captura_bulk.recibidos<XHCI_CAPTURA_EVENTOS_MAX) {
+        uint32_t i=g_captura_bulk.recibidos++;
+        g_captura_bulk.ciclos[i]=rdtsc();g_captura_bulk.codigos[i]=cc;
+    }
+    int fallo=xhci_bulk_resultado_evento(cc,evt->estado&0xffffffU);
+    if(fallo){g_captura_bulk.fallo=fallo;g_captura_bulk.trb_error=evt->parametro;}
+    if(fallo||evt->parametro==g_captura_bulk.trbs[g_captura_bulk.cantidad_trbs-1])
+        g_captura_bulk.terminado=1;
+    return 1;
+}
 static void xhci_bombear_eventos(void) {
+#ifdef TAEK_XHCI_HOST_TEST
+    extern void xhci_prueba_eventos(void);
+    xhci_prueba_eventos();return;
+#endif
     struct trb_xhci evt;
     for (uint32_t i = 0; i < XHCI_TAM_ANILLO && xhci_extraer_evento(&evt); i++) {
         uint8_t tipo = (evt.control >> 10) & 0x3F;
@@ -439,11 +511,7 @@ static void xhci_bombear_eventos(void) {
             }
             if (g_captura_bulk.activo && !es_hid &&
                 g_captura_bulk.slot == slot && g_captura_bulk.dci == dci) {
-                if (g_captura_bulk.recibidos < XHCI_CAPTURA_EVENTOS_MAX) {
-                    g_captura_bulk.ciclos[g_captura_bulk.recibidos] = rdtsc();
-                    g_captura_bulk.codigos[g_captura_bulk.recibidos] = cc;
-                    g_captura_bulk.recibidos++;
-                }
+                xhci_capturar_bulk_evento(&evt);
                 continue;
             }
             if (es_hid) {
@@ -1109,8 +1177,8 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
             } else if (codigo == 1 || codigo == 13) { // 1 = Success, 13 = Short Packet
                 g_estado.reportes_hid_recibidos++;
                 uint32_t residual = evt->estado & 0xFFFFFF;
-                uint32_t tam_recibido = (residual <= ep->ep_max_pkt) ? (ep->ep_max_pkt - residual) : ep->ep_max_pkt;
-                if (tam_recibido == 0) tam_recibido = ep->ep_max_pkt;
+                uint32_t tam_recibido = (residual <= ep->ep_max_pkt) ? (ep->ep_max_pkt - residual) : 0;
+                /* A zero-length completion contains no HID report. */
                 if (tam_recibido > 64) tam_recibido = 64;
 
                 uint8_t *buf = ep->bufer;
@@ -1119,7 +1187,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                 for (uint32_t i = 0; i < tam_recibido && i < sizeof(ep->ultimo_reporte); i++) {
                     if (buf[i] != ep->ultimo_reporte[i]) reporte_cambio = 1;
                 }
-                if (reporte_cambio) {
+                if (TAEK_XHCI_TRAZA_IO && reporte_cambio) {
                     serial_imprimir("[HID] slot=");
                     serial_imprimir_dec(slot_id);
                     serial_imprimir(" dci=");
@@ -1144,7 +1212,8 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
                 // Mouse HID Boot: botones, desplazamiento X/Y con signo y rueda opcional.
                 if (ep->es_raton) {
-                    if (tam_recibido >= 3) {
+                    if(g_mouse_propietario)mouse_encolar(ep,buf,tam_recibido);
+                    else if (ep->raton_boot_confirmado && tam_recibido >= 3) {
                         g_estado.reportes_raton_recibidos++;
                         g_estado.botones_raton = buf[0];
                         g_estado.movimiento_raton_x += (int8_t)buf[1];
@@ -1170,7 +1239,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                         }
 
                         if (!ya_estaba && scancode < 128) {
-                            char c = shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode];
+                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
                             if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
                                 c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
                             }
@@ -1235,7 +1304,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                         }
 
                         if (!ya_estaba && scancode < 128) {
-                            char c = shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode];
+                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
                             if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
                                 c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
                             }
@@ -1271,7 +1340,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                         }
 
                         if (!ya_estaba && scancode < 128) {
-                            char c = shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode];
+                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
                             if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
                                 c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
                             }
@@ -1531,11 +1600,33 @@ static int xhci_transferencia_control(uint8_t slot_id, uint8_t tipo_peticion, ui
 }
 
 // Ejecuta una transferencia síncrona en un endpoint Bulk IN o Bulk OUT
+int xhci_bulk_limpiar_halt(uint8_t slot_id,uint8_t ep_dci){
+    if(!g_estado.inicializado || !slot_id || slot_id>XHCI_MAX_SLOTS || ep_dci<2 || ep_dci>31)return -1;
+    struct xhci_ep_bulk *ep=NULL;
+    for(unsigned i=0;i<XHCI_MAX_BULK_EPS;i++)if(g_bulk_eps[i].activo && g_bulk_eps[i].slot_id==slot_id && g_bulk_eps[i].ep_dci==ep_dci){ep=&g_bulk_eps[i];break;}
+    if(!ep || !ep->ring || ep->idx>=XHCI_TAM_ANILLO-1)return -1;
+    uint32_t target=((uint32_t)slot_id<<24)|((uint32_t)ep_dci<<16);
+    uint16_t addr=(ep_dci/2)|((ep_dci&1)?0x80:0);
+    uint64_t dequeue=ep->ring_fisica+(uint64_t)ep->idx*sizeof(struct trb_xhci);
+    struct trb_xhci evento;
+#ifdef TAEK_XHCI_HOST_TEST
+    extern int xhci_prueba_recuperacion(unsigned,uint64_t,uint32_t);
+    if(xhci_prueba_recuperacion(1,0,target|(TRB_TIPO_RESET_EP<<10)))return -2;
+    if(xhci_prueba_recuperacion(2,addr,slot_id))return -3;
+    if(xhci_prueba_recuperacion(3,dequeue|ep->cycle,target|(TRB_TIPO_SET_DEQUEUE<<10)))return -4;
+    (void)evento;
+#else
+    if(xhci_enviar_comando(0,0,target|(TRB_TIPO_RESET_EP<<10),&evento))return -2;
+    if(xhci_transferencia_control(slot_id,0x02,1,0,addr,0,NULL,0))return -3;
+    if(xhci_enviar_comando(dequeue|ep->cycle,0,target|(TRB_TIPO_SET_DEQUEUE<<10),&evento))return -4;
+#endif
+    g_eventos_transfer[slot_id][ep_dci].listo=0;return 0;
+}
 int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms) {
     if (!g_estado.inicializado || slot_id == 0 || ep_dci == 0) return -1;
 
     // Fuera del alcance de un unico TRB (17 bits): repartir en varios.
-    if (longitud > XHCI_BULK_TRAMO_MAX) {
+    if (longitud > XHCI_BULK_TRAMO_MAX || longitud > 65536U-(uint32_t)(buffer_fisica&65535U)) {
         return xhci_transferencia_bulk_segmentada(slot_id, ep_dci, buffer,
                                                   buffer_fisica, longitud, es_in,
                                                   0, timeout_ms, NULL, NULL);
@@ -1615,30 +1706,27 @@ int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint6
 // Encola un TRB Normal en el anillo del endpoint Bulk, gestionando el enlace
 // de fin de anillo. Factoriza el mismo patron que usa la ruta no segmentada.
 static void xhci_encolar_bulk_trb(struct xhci_ep_bulk *bep, uint64_t phys,
-                                  uint32_t longitud, int es_in) {
+                                  uint32_t estado, uint32_t control) {
     volatile struct trb_xhci *trb = &bep->ring[bep->idx];
     trb->parametro = phys;
-    trb->estado    = longitud;
-    uint32_t ctrl  = (TRB_TIPO_NORMAL << 10) | (1U << 5) /* IOC */ | (bep->cycle ? 1 : 0);
-    if (es_in) ctrl |= (1U << 2); // ISP: Interrupt on Short Packet
-    trb->control   = ctrl;
+    trb->estado    = estado;
+    trb->control   = control | (bep->cycle ? 1 : 0);
 
     bep->idx++;
     if (bep->idx >= XHCI_TAM_ANILLO - 1) {
         volatile struct trb_xhci *link = &bep->ring[XHCI_TAM_ANILLO - 1];
         link->parametro = bep->ring_fisica;
         link->estado    = 0;
-        link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ | (bep->cycle ? 1 : 0);
+        link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ |
+            (control & (1U << 4)) /* TD continua tras el Link */ | (bep->cycle ? 1 : 0);
         dma_sincronizar_cpu_a_dispositivo((const void *)link, sizeof(*link));
         bep->idx = 0;
         bep->cycle = !bep->cycle;
     }
 }
 
-// Transferencia Bulk segmentada: parte la fase de datos en un primer tramo con
-// su propio IOC (lo que fecha el "primer DATA recibido") y el resto. Encola
-// ambos TRBs y toca el timbre una sola vez, evitando burbujas entre tramos.
-// Los instantes de cada evento se entregan en ciclos TSC.
+// Transferencia Bulk segmentada dentro de un unico TD y con IOC solo final.
+// La finalizacion fecha el DATA completo; no mide el primer byte/paquete.
 int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
                                        void *buffer, uint64_t buffer_fisica,
                                        uint32_t longitud, int es_in,
@@ -1665,22 +1753,15 @@ int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
         dma_sincronizar_cpu_a_dispositivo(buffer, longitud);
     }
 
-    // Reparte la transferencia en TRBs: el primer tramo opcional fecha el
-    // primer DATA; el resto va en bloques de a lo sumo XHCI_BULK_TRAMO_MAX.
-    uint32_t trbs = 0;
-    uint32_t resta = longitud;
-    if (primer_tramo > 0 && primer_tramo < longitud) {
-        xhci_encolar_bulk_trb(bep, buffer_fisica, primer_tramo, es_in);
-        trbs++;
-        resta -= primer_tramo;
+    struct xhci_bulk_tramo plan[XHCI_BULK_PLAN_MAX];
+    int cuenta=xhci_bulk_planificar(buffer_fisica,longitud,primer_tramo,bep->ep_max_pkt,es_in,plan);
+    if(cuenta<0)return cuenta; // validar antes de modificar el anillo
+    uint32_t trbs=(uint32_t)cuenta,eventos=0;
+    for(uint32_t i=0;i<trbs;++i) {
+        g_captura_bulk.trbs[i]=bep->ring_fisica+(uint64_t)bep->idx*sizeof(struct trb_xhci);
+        if(plan[i].control&(1U<<5))++eventos;
+        xhci_encolar_bulk_trb(bep,plan[i].fisica,plan[i].estado,plan[i].control);
     }
-    while (resta > 0) {
-        uint32_t len = (resta > XHCI_BULK_TRAMO_MAX) ? XHCI_BULK_TRAMO_MAX : resta;
-        xhci_encolar_bulk_trb(bep, buffer_fisica + (longitud - resta), len, es_in);
-        trbs++;
-        resta -= len;
-    }
-    if (trbs == 0 || trbs > XHCI_CAPTURA_EVENTOS_MAX) return -3;
 
     dma_sincronizar_cpu_a_dispositivo((const void *)bep->ring, XHCI_TAM_ANILLO * sizeof(struct trb_xhci));
     __asm__ volatile ("mfence" ::: "memory");
@@ -1689,17 +1770,18 @@ int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
     g_captura_bulk.activo = 1;
     g_captura_bulk.slot = slot_id;
     g_captura_bulk.dci = ep_dci;
-    g_captura_bulk.esperados = trbs;
+    g_captura_bulk.esperados = eventos;
     g_captura_bulk.recibidos = 0;
+    g_captura_bulk.cantidad_trbs=trbs;g_captura_bulk.terminado=0;g_captura_bulk.fallo=0;
 
     xhci_tocar_timbre(slot_id, ep_dci);
 
     int timeout = (timeout_ms > 0) ? timeout_ms : 2000;
-    while (timeout > 0 && g_captura_bulk.recibidos < trbs) {
+    while (timeout > 0 && !g_captura_bulk.terminado) {
         uint64_t t_sondeo = rdtsc();
         xhci_bombear_eventos();
         g_bulk_ciclos_sondeo += rdtsc() - t_sondeo;
-        if (g_captura_bulk.recibidos >= trbs) break;
+        if (g_captura_bulk.terminado) break;
         uint64_t t_espera = rdtsc();
         esperar_milisegundos(1);
         g_bulk_ciclos_espera += rdtsc() - t_espera;
@@ -1707,18 +1789,26 @@ int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
     }
 
     int resultado = 0;
-    if (g_captura_bulk.recibidos < trbs) {
+    if (!g_captura_bulk.terminado) {
         serial_imprimir_linea("  [xHCI AVISO] Timeout en transferencia Bulk segmentada");
         g_captura_bulk.activo = 0;
         return -99;
     }
 
     if (ciclos_primer_evento) *ciclos_primer_evento = g_captura_bulk.ciclos[0];
-    if (ciclos_fin_evento) *ciclos_fin_evento = g_captura_bulk.ciclos[trbs - 1];
+    if (ciclos_fin_evento) *ciclos_fin_evento = g_captura_bulk.ciclos[g_captura_bulk.recibidos - 1];
 
-    for (uint32_t i = 0; i < trbs; i++) {
+    for (uint32_t i = 0; i < g_captura_bulk.recibidos; i++) {
         uint8_t cc = g_captura_bulk.codigos[i];
         if (cc != 1 && cc != 13) { resultado = -(int)cc; break; }
+    }
+    if(g_captura_bulk.fallo) {
+        resultado=g_captura_bulk.fallo;
+        serial_imprimir("[XHCI_BULK_ERROR] SLOT=");serial_imprimir_dec(slot_id);
+        serial_imprimir(" DCI=");serial_imprimir_dec(ep_dci);
+        serial_imprimir(" CC=");serial_imprimir_dec((uint64_t)(-resultado));
+        serial_imprimir(" TRB=");serial_imprimir_hex(g_captura_bulk.trb_error);
+        serial_imprimir_linea("");
     }
     if (resultado == 0 && es_in && buffer && longitud > 0) {
         dma_sincronizar_dispositivo_a_cpu(buffer, longitud);
@@ -2164,6 +2254,9 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
                         ep->iface_num = (uint8_t)iface_actual_num;
                         ep->es_boot = iface_actual_es_boot;
                         ep->es_raton = iface_actual_es_raton;
+                        ep->raton_boot_confirmado=0;
+                        if(++g_mouse_generacion==0)g_mouse_generacion++;
+                        ep->raton_generacion=g_mouse_generacion;
                         ep->activo = 0;
                         ep->idx = 0;
                         ep->cycle = 1;
@@ -2509,6 +2602,8 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
                     // En caso de STALL o rechazo, limpiar la característica ENDPOINT_HALT en EP0
                     xhci_transferencia_control(slot_id, 0x02, 0x01, 0x0000, 0x0000, 0, NULL, 0);
                 }
+                if(!res_p)for(int m=0;m<num_eps_este_dispositivo;m++)
+                    if(eps_este_dispositivo[m]->iface_num==iface && eps_este_dispositivo[m]->es_raton)eps_este_dispositivo[m]->raton_boot_confirmado=1;
             }
             // SET_IDLE(0)
             int res_i = xhci_transferencia_control(slot_id, 0x21, 0x0A, 0x0000, (uint16_t)iface, 0, NULL, 0);

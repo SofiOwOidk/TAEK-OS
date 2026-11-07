@@ -52,6 +52,7 @@ uint64_t memoria_obtener_hhdm_offset(void);
 
 // Primitivas de Asignación Físicamente Contigua (DMA Real / GPU / GSP)
 uint64_t memoria_obtener_dma_arena(uint64_t *tamano_out);
+uint64_t memoria_obtener_gpu_arena(uint64_t *tamano_out);
 uint64_t pmm_asignar_bloque_contiguo(uint32_t num_paginas, uint64_t alineacion);
 void     pmm_liberar_bloque_contiguo(uint64_t dir_fisica, uint32_t num_paginas);
 

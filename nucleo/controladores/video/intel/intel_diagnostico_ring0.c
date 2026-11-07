@@ -43,77 +43,106 @@ static int prueba_ring0_irq_spinlock(void) {
 // ----------------------------------------------------------------------------
 // 2. PRUEBA DE PLANIFICADOR Y CAMBIO DE CONTEXTO REAL (i915_cambiar_contexto)
 // ----------------------------------------------------------------------------
-extern uint32_t i915_abi_probar_conmutacion_asm(void (*conmutar)(void *), void *ctx, uint32_t mascara_omitir);
+#include "compatibilidad/linux_i915/abi_contexto.h"
+#include "compatibilidad/linux_i915/abi_simd.h"
+#include "compatibilidad/linux_i915/abi_tls.h"
+#include "compatibilidad/linux_i915/scheduler_prueba.h"
+#include "compatibilidad/linux_i915/abi_irq.h"
+#include "arquitectura/x86_64/fpu.h"
 
-static volatile int g_ring0_task_flag = 0;
-static volatile int g_ring0_stack_align_ok = 0;
-
-static void tarea_ring0_test_fn(void *data) {
-    volatile int *flag = (volatile int *)data;
-
-    // Verificar alineación estricta de 16 bytes de la pila en System V ABI:
-    // En el cuerpo de la función tras el prólogo, rsp debe ser múltiplo de 16
-    // garantizando alineación de 16 bytes antes de cualquier llamada subsequente
-    uintptr_t sp;
-    __asm__ volatile ("movq %%rsp, %0" : "=r"(sp));
-    g_ring0_stack_align_ok = (int)(sp & 0xF);
-
-    if (flag) *flag = 42;
-
-    // Destruir deliberadamente todos los registros callee-saved (incluyendo rbp)
-    // para certificar que el cambio de contexto restaure los del padre
-    __asm__ volatile (
-        "movq $0xDEADBEEF00000001, %%rbx\n\t"
-        "movq $0xDEADBEEF00000002, %%rbp\n\t"
-        "movq $0xDEADBEEF00000003, %%r12\n\t"
-        "movq $0xDEADBEEF00000004, %%r13\n\t"
-        "movq $0xDEADBEEF00000005, %%r14\n\t"
-        "movq $0xDEADBEEF00000006, %%r15\n\t"
-        ::: "rbx", "rbp", "r12", "r13", "r14", "r15"
-    );
-
-    i915_tarea_ceder();
+int intel_diagnostico_ring0_irq(void) {
+    struct i915_irq_resultado r={0};int code=i915_irq_contexto_probar(&r);
+    consola_imprimir("[INTEL_IRQ] RESULTADO=");consola_imprimir(code?"FAIL":"OK");
+    consola_imprimir(" cpus=");consola_imprimir_dec(r.cpus);
+    consola_imprimir(" entradas=");consola_imprimir_hex(r.entradas);
+    consola_imprimir(" mask=");consola_imprimir_hex(r.fallos);
+    consola_imprimir(" heap=");consola_imprimir_dec(r.heap_limpio);
+    consola_imprimir(" admision=");consola_imprimir_hex(r.admision);
+    consola_imprimir(" IF=");consola_imprimir_dec(r.if_antes);
+    consola_imprimir("/");consola_imprimir_dec(r.if_despues);consola_imprimir_linea("");
+    for(unsigned i=0;i<r.cpus && i<I915_MAX_CPU;i++){
+        consola_imprimir("[INTEL_IRQ] CPU=");consola_imprimir_dec(i);
+        consola_imprimir(" ciclos=");consola_imprimir_dec(r.cpu[i].ciclos);
+        consola_imprimir(" iniciales=");consola_imprimir_dec(r.cpu[i].iniciales);
+        consola_imprimir(" ipi=");consola_imprimir_dec(r.cpu[i].recibidos);
+        consola_imprimir("/");consola_imprimir_dec(r.cpu[i].emitidos);
+        consola_imprimir(" en_contexto=");consola_imprimir_dec(r.cpu[i].en_contexto);
+        consola_imprimir(" mask=");consola_imprimir_hex(r.cpu[i].fallos);consola_imprimir_linea("");
+    }
+    consola_imprimir_linea("[INTEL_IRQ] IF por contexto, IPI APIC real y TLS coherente en handler; IRQ GPU/NMI/idle pendientes.");
+    return code;
+}
+int intel_diagnostico_ring0_scheduler(void) {
+    struct i915_smp_resultado r={0};int code=i915_scheduler_smp_probar(&r);
+    consola_imprimir("[INTEL_SCHED] RESULTADO=");consola_imprimir(code?"FAIL":"OK");
+    consola_imprimir(" cpus=");consola_imprimir_dec(r.cpus);
+    consola_imprimir(" entradas=");consola_imprimir_hex(r.entradas);
+    consola_imprimir(" mask=");consola_imprimir_hex(r.fallos);
+    consola_imprimir(" heap=");consola_imprimir_dec(r.heap_limpio);consola_imprimir_linea("");
+    for(unsigned i=0;i<r.cpus && i<I915_MAX_CPU;i++){
+        consola_imprimir("[INTEL_SCHED] CPU=");consola_imprimir_dec(i);
+        consola_imprimir(" ciclos=");consola_imprimir_dec(r.cpu[i].ciclos);
+        consola_imprimir(" hijos=");consola_imprimir_dec(r.cpu[i].hijos);
+        consola_imprimir(" iniciales=");consola_imprimir_dec(r.cpu[i].iniciales);
+        consola_imprimir(" mask=");consola_imprimir_hex(r.cpu[i].fallos);
+        consola_imprimir(" FS_RAIZ=");consola_imprimir_hex(r.cpu[i].fs_raiz);consola_imprimir_linea("");
+    }
+    consola_imprimir_linea("[INTEL_SCHED] Tareas reales BSP/AP; asignacion/liberacion desde BSP. IRQ, refs, idle/SMP completo y GPU pendientes.");
+    return code;
+}
+int intel_diagnostico_ring0_tls(void) {
+    struct i915_tls_resultado r={0};int code=i915_tls_contexto_probar(&r);
+    consola_imprimir("[INTEL_TLS] CONTEXT_SWITCH=");consola_imprimir(code?"FAIL":"OK");
+    consola_imprimir(" ciclos=");consola_imprimir_dec(r.ciclos);
+    consola_imprimir(" mask=");consola_imprimir_hex(r.fallos);
+    consola_imprimir(" hijos=");consola_imprimir_dec(r.hijo_ciclos[0]);
+    consola_imprimir("/");consola_imprimir_dec(r.hijo_ciclos[1]);
+    consola_imprimir(" iniciales=");consola_imprimir_dec(r.iniciales);
+    consola_imprimir(" privados=");consola_imprimir_dec(r.privados);
+    consola_imprimir(" heap=");consola_imprimir_dec(r.heap_limpio);
+    consola_imprimir(" imagen=");consola_imprimir_dec(r.imagen_bytes);consola_imprimir_linea("");
+    consola_imprimir_linea("[INTEL_TLS] TLS estatico ELF por tarea BSP; modulos TLS, glibc, SMP y GPU pendientes.");
+    return code;
+}
+int intel_diagnostico_ring0_simd(void) {
+    struct i915_simd_resultado r = {0};
+    int code = i915_simd_contexto_probar(&r);
+    consola_imprimir("[INTEL_SIMD] CONTEXT_SWITCH=");
+    consola_imprimir(code ? "FAIL" : "OK");
+    consola_imprimir(" ciclos="); consola_imprimir_dec(r.ciclos);
+    consola_imprimir(" mask="); consola_imprimir_hex(r.fallos);
+    consola_imprimir(" inicial="); consola_imprimir_dec(r.inicial_limpio);
+    consola_imprimir(" SSE2="); consola_imprimir_dec(r.sse2);
+    consola_imprimir(" YMM="); consola_imprimir_dec(x86_64_fpu_capacidades_cpu().ymm_habilitado);
+    consola_imprimir_linea("");
+    consola_imprimir_linea("[INTEL_SIMD] Prueba x87, MXCSR y XMM0..15; YMM/TLS/SMP y GPU pendientes.");
+    return code;
 }
 
-static void conmutar_wrapper_r0(void *ctx) {
-    (void)ctx;
-    i915_tarea_ceder();
+int intel_diagnostico_ring0_abi(void) {
+    struct i915_abi_resultado r = {0};
+    int code = i915_abi_contexto_probar(&r);
+    consola_imprimir("[INTEL_ABI] CONTEXT_SWITCH=");
+    consola_imprimir(code ? "FAIL" : "OK");
+    consola_imprimir(" ciclos="); consola_imprimir_dec(r.ciclos);
+    consola_imprimir(" mask="); consola_imprimir_hex(r.fallos);
+    consola_imprimir_linea("");
+    consola_imprimir("[INTEL_ABI] RSP_MOD16 PADRE_ENTRADA="); consola_imprimir_dec(r.padre_entrada & 15);
+    consola_imprimir(" LLAMADA="); consola_imprimir_dec(r.padre_llamada & 15);
+    consola_imprimir(" TRAMPOLIN="); consola_imprimir_dec(r.hijo_entrada & 15);
+    consola_imprimir(" FUNCION="); consola_imprimir_dec(r.funcion_entrada & 15);
+    consola_imprimir_linea("");
+    consola_imprimir("[INTEL_ABI] SWITCH PADRE_ENTRADA="); consola_imprimir_dec(r.padre.entrada_rsp & 15);
+    consola_imprimir(" PADRE_RETORNO="); consola_imprimir_dec(r.padre.salida_rsp & 15);
+    consola_imprimir(" HIJO_ENTRADA="); consola_imprimir_dec(r.hijo.entrada_rsp & 15);
+    consola_imprimir(" HIJO_RETORNO="); consola_imprimir_dec(r.hijo.salida_rsp & 15);
+    consola_imprimir_linea("");
+    consola_imprimir_linea("[INTEL_ABI] Registros enteros; prueba x87/XMM con intel simd. YMM/TLS/SMP pendientes.");
+    return code;
 }
-
 static int prueba_ring0_scheduler_contexto(void) {
-    i915_tareas_iniciar();
-    g_ring0_task_flag = 0;
-    g_ring0_stack_align_ok = 0;
-
-    struct task_struct *t = i915_tarea_crear(tarea_ring0_test_fn,
-                                             (void *)&g_ring0_task_flag,
-                                             "i915_r0_test", 0);
-    if (!t) {
-        serial_imprimir_linea("[INTEL_RING0] 2_SCHEDULER_CONTEXT=FAIL_CREAR");
-        return -1;
-    }
-
-    // Ejecutar el arnés controlado en ensamblador con canarios vivos (rbx, rbp, r12-r15)
-    uint32_t fallos_reg = i915_abi_probar_conmutacion_asm(conmutar_wrapper_r0, NULL, 0);
-
-    int align_ok = (g_ring0_stack_align_ok == 8 || g_ring0_stack_align_ok == 0);
-    int ok = (fallos_reg == 0 && g_ring0_task_flag == 42 && align_ok);
-    i915_tarea_destruir(t);
-
-    if (ok) {
-        serial_imprimir_linea("[INTEL_RING0] 2_SCHEDULER_CONTEXT_SWITCH=OK (ABI 16B & Regs rbp/rbx/r12-r15 OK)");
-        return 0;
-    }
-    serial_imprimir("[INTEL_RING0] 2_SCHEDULER_CONTEXT_SWITCH=FAIL (Regs mask: 0x");
-    serial_imprimir_hex(fallos_reg);
-    serial_imprimir(" flag=");
-    serial_imprimir_dec(g_ring0_task_flag);
-    serial_imprimir(" align=");
-    serial_imprimir_dec(g_ring0_stack_align_ok);
-    serial_imprimir_linea(")");
-    return -1;
+    return intel_diagnostico_ring0_abi();
 }
-
 // ----------------------------------------------------------------------------
 // 3. PRUEBA DE WORKQUEUE CON REENCOLADO EN VUELO EN RING 0
 // ----------------------------------------------------------------------------

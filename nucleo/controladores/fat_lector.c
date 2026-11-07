@@ -10,7 +10,7 @@ static uint32_t u32(const uint8_t *p){return u16(p)|((uint32_t)u16(p+2)<<16);}
 static uint64_t u64(const uint8_t *p){return u32(p)|((uint64_t)u32(p+4)<<32);}
 static int valido(const struct fat_lector_volumen *v,uint32_t c){return c>=2 && (uint64_t)c<v->clusters+UINT64_C(2);}
 static uint32_t rotar(uint32_t n,uint8_t b){return ((n>>1)|(n<<31))+b;}
-static uint16_t checksum16(uint16_t n,uint8_t b){return (uint16_t)(((n>>1)|(n<<15))+b);}
+static uint16_t checksum16(uint16_t n,uint8_t b){return (uint16_t)(((n>>1)|((uint32_t)n<<15))+b);}
 void fat_lector_desmontar(struct fat_lector_volumen *v){if(v->upcase)liberar_memoria(v->upcase);memset(v,0,sizeof(*v));}
 static int siguiente_cluster(struct fat_lector_volumen *v,uint32_t c,uint32_t *salida,const volatile uint8_t *cancel){
     if(!valido(v,c))return VOLUMEN_CORRUPTO;
@@ -55,6 +55,11 @@ static int asignado(struct fat_lector_volumen *v,uint32_t cluster,const volatile
         v->bitmap_pagina=pagina;
     }
     return (v->bitmap_cache[byte%512]&(1u<<((cluster-2)%8)))?0:VOLUMEN_CORRUPTO;
+}
+int fat_lector_sector(struct fat_lector_volumen *v,struct fat_lector_cursor *c,uint64_t off,uint64_t *lba){
+    if(!v || !c || !lba || !v->bytes_cluster || off>=c->nodo.longitud)return VOLUMEN_CORRUPTO;
+    int r=localizar(v,c,(uint32_t)(off/v->bytes_cluster),0);if(r)return r;
+    *lba=v->datos+(uint64_t)(c->cluster-2)*v->sectores_cluster+(off%v->bytes_cluster)/512;return 0;
 }
 int64_t fat_lector_leer(struct fat_lector_volumen *v,struct fat_lector_cursor *c,uint64_t off,void *buf,size_t cantidad,const volatile uint8_t *cancel){
     if(!v || !buf || !c || !v->bytes_cluster)return VOLUMEN_CORRUPTO;
@@ -169,6 +174,7 @@ static int siguiente_exfat(struct fat_lector_volumen *v,struct fat_lector_iterad
         unsigned secundarias=e[1],nombres=0;uint16_t sum=0,esperado=u16(e+2);if(secundarias<2)return VOLUMEN_CORRUPTO;
         for(unsigned j=0;j<32;j++)if(j!=2 && j!=3)sum=checksum16(sum,e[j]);
         memset(n,0,sizeof(*n));n->directorio=!!(u16(e+4)&16);
+        n->entrada_posicion=it->posicion-32;n->entrada_cantidad=(uint16_t)(secundarias+1);
         for(unsigned i=0;i<secundarias;i++){
             r=entrada_raw(v,it,e,cancel);if(r!=1)return r<0?r:VOLUMEN_CORRUPTO;
             for(unsigned j=0;j<32;j++)sum=checksum16(sum,e[j]);
@@ -199,6 +205,8 @@ static int siguiente_fat32(struct fat_lector_volumen *v,struct fat_lector_iterad
         memset(n,0,sizeof(*n));n->cluster=((uint32_t)u16(e+20)<<16)|u16(e+26);n->directorio=!!(e[11]&16);n->longitud=n->valida=n->directorio?(uint64_t)v->clusters*v->bytes_cluster:u32(e+28);
         if(it->lfn_total){if(it->lfn_esperado || checksum83(e)!=it->lfn_checksum)return VOLUMEN_CORRUPTO;unsigned lim=it->lfn_total*13;while(n->unidades<lim && it->lfn[n->unidades] && it->lfn[n->unidades]!=0xffff){if(n->unidades==255)return VOLUMEN_CORRUPTO;n->nombre16[n->unidades]=it->lfn[n->unidades];n->unidades++;}if(n->unidades<lim && it->lfn[n->unidades])return VOLUMEN_CORRUPTO;for(unsigned j=n->unidades+1;j<lim;j++)if(it->lfn[j]!=0xffff)return VOLUMEN_CORRUPTO;}
         else {for(unsigned j=0;j<8 && e[j]!=' ';j++){uint8_t c=e[j];if(!j && c==5)c=0xe5;n->nombre16[n->unidades++]=nombre_corto(c,e[12]&8);}if(e[8]!=' '){n->nombre16[n->unidades++]='.';for(unsigned j=8;j<11 && e[j]!=' ';j++){uint8_t c=e[j];n->nombre16[n->unidades++]=nombre_corto(c,e[12]&16);}}}
+        n->entrada_cantidad=(uint16_t)(it->lfn_total+1);
+        n->entrada_posicion=it->posicion-(uint64_t)n->entrada_cantidad*32;
         it->lfn_total=it->lfn_esperado=0;
         if((n->unidades==1 && n->nombre16[0]=='.') || (n->unidades==2 && n->nombre16[0]=='.' && n->nombre16[1]=='.'))continue;
         r=nodo_valido(v,n);if(r)return r;return utf8(n->nombre16,n->unidades,n->nombre)?VOLUMEN_CORRUPTO:1;
@@ -278,6 +286,10 @@ static uint16_t mayuscula(struct fat_lector_volumen *v,uint16_t c){
     if((c>='a' && c<='z') || (c>=0xe0 && c<=0xf6) || (c>=0xf8 && c<=0xfe))return c-32;
     if(c==0xff)return 0x178;
     return c;
+}
+int fat_lector_nombre_utf16(const char *s,size_t bytes,uint16_t *out,unsigned *n){
+    if(!s || !out || !n)return VOLUMEN_CORRUPTO;
+    return decodificar_nombre(s,bytes,out,n);
 }
 int fat_lector_resolver(struct fat_lector_volumen *v,const char *ruta,struct fat_lector_nodo *out,const volatile uint8_t *cancel){
     if(!v->montado)return VOLUMEN_NO_ENCONTRADO;

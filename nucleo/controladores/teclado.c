@@ -7,6 +7,7 @@
 static int g_shift = 0;
 static int g_bloq_mayus = 0;
 static int g_ctrl = 0;
+static int g_extendido;
 
 // Tabla Scancode Set 1 normal
 static const char g_mapa_normal[128] = {
@@ -141,6 +142,10 @@ char teclado_leer_caracter(void) {
     }
 
     uint8_t scancode = leer_puerto_b(PUERTO_DATOS_TECLADO);
+    if(scancode==0xe0){g_extendido=1;return 0;}
+    int extendido=g_extendido;g_extendido=0;
+    if(extendido && (scancode==0x48 || scancode==0x50))
+        return scancode==0x48?(g_ctrl?TECLA_CTRL_ARRIBA:TECLA_ARRIBA):(g_ctrl?TECLA_CTRL_ABAJO:TECLA_ABAJO);
 
     // Liberación de tecla
     if (scancode & 0x80) {

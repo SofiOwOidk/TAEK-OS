@@ -7,7 +7,7 @@
 #define TAEK_VERSION_MENOR       1
 #define TAEK_VERSION_PARCHE      0
 #define TAEK_VERSION_STRING      "v0.1.0"
-#define TAEK_HITO_ACTUAL         "Hito 67"
+#define TAEK_HITO_ACTUAL         "Hito 132 (experimental: reproductor H.264 por GPU en i7-8650U con respaldo por software; bateria y especificaciones)"
 
 #ifndef COMPILACION_FECHA
 #define COMPILACION_FECHA __DATE__

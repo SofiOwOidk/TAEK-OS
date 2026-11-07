@@ -26,7 +26,7 @@
 #include "controladores/video/intel/intel_info.h"
 #include "controladores/video/intel/intel_diagnostico_ring0.h"
 #include "controladores/video/intel/i915_drv.h"
-#include "controladores/video/intel/i915_va.h"
+#include "video_gpu.h"
 
 #ifndef TAEK_REVISION_CODIGO
 #define TAEK_REVISION_CODIGO "sin identificar"
@@ -49,7 +49,7 @@ static volatile struct limine_module_request peticion_video = {
 static unsigned muestras_funcionales;
 static unsigned diagnostico_cpu=4;
 static int diagnostico_coordinador;
-static unsigned diagnostico_lectura_kib=4;
+static unsigned diagnostico_lectura_kib=64;
 
 // Modos de ejecución soportados definidos en reproductor.h
 
@@ -148,8 +148,17 @@ typedef struct {
     traza_video *pausa;
     uint64_t pausa_inicio,pausa_fin;
     uint64_t heap_inicial;
-    i915_va_sesion_t *va_sesion;
-    int usando_intel_va;
+    /* Motor por GPU: mientras gpu no sea NULL, las muestras van al modulo. */
+    struct taek_video_peticion *gpu;
+    uint8_t *gpu_planos;
+    int gpu_uso, gpu_a_soft;
+    uint32_t gpu_ultimo_idr, gpu_muestra_fallo;
+    uint64_t gpu_cuadros, gpu_decod, gpu_cortes, gpu_ns, gpu_ns_copia;
+    char motor_motivo[96];
+    /* Tras pasar a software se repite desde un IDR: lo que ya salio no se vuelve a presentar. */
+    int hay_pts_salida;
+    int64_t pts_salida;
+    mp4_contenedor video_inicio;
 } reproductor;
 
 typedef struct {
@@ -599,6 +608,9 @@ static int presentar(void *usuario, const h264_imagen *im) {
     reproductor *p = (reproductor *)usuario;
     if (atender(p)) return 1;
 
+    if (p->gpu_a_soft && p->hay_pts_salida && im->marca_tiempo <= p->pts_salida) return 0;
+    p->pts_salida = im->marca_tiempo; p->hay_pts_salida = 1;
+
     if (!p->cuadros) {
         p->primer_pts = im->marca_tiempo;
         p->inicio = tiempo_obtener_milisegundos();
@@ -708,7 +720,7 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     p->telem.ciclos_intra = ht.ciclos_intra;
     p->telem.ciclos_desbloqueo = ht.ciclos_desbloqueo;
     p->telem.max_ciclos_desbloqueo = ht.max_ciclos_desbloqueo;
-    p->telem.cuadros_decodificados = (uint32_t)ht.cuadros_decodificados;
+    p->telem.cuadros_decodificados = p->gpu_uso ? p->cuadros : (uint32_t)ht.cuadros_decodificados;
     if(ht.perfil==66)perfil_nombre="Baseline";
     else if(ht.perfil==77)perfil_nombre="Main";
     else if(ht.perfil==88)perfil_nombre="Extended";
@@ -1311,6 +1323,181 @@ static void imprimir_informe_benchmark(reproductor *p, h264_decodificador *dec, 
     serial_imprimir_linea("");
 }
 
+/* ------------------------------------------------------------------ motor por GPU */
+static struct limine_file *modulo_arranque(const char *nombre) {
+    struct limine_module_response *r = peticion_video.response;
+    if (r) for (uint64_t i = 0; i < r->module_count; i++)
+        if (iguales(r->modules[i]->cmdline, nombre)) return r->modules[i];
+    return NULL;
+}
+static void motivo_motor(reproductor *p, const char *m) {
+    unsigned i = 0;
+    while (m && m[i] && i + 1 < sizeof(p->motor_motivo)) { p->motor_motivo[i] = m[i]; i++; }
+    p->motor_motivo[i] = 0;
+}
+static void gpu_cerrar(reproductor *p) {
+    if (!p->gpu) return;
+    video_gpu_orden(p->gpu, TAEK_VIDEO_CERRAR);
+    p->gpu_decod += p->gpu->decodificados; p->gpu_cortes += p->gpu->cortes;
+    p->gpu_ns += p->gpu->ns_gpu; p->gpu_ns_copia += p->gpu->ns_copia;
+    soltar(p, p->gpu_planos); soltar(p, p->gpu);
+    p->gpu_planos = NULL; p->gpu = NULL;
+}
+static void gpu_abrir(reproductor *p, mp4_contenedor *mp4) {
+    const char *m = NULL;
+    struct limine_file *f = modulo_arranque("taek:i915");
+    if (video_gpu_preparar(f ? f->address : NULL, f ? (size_t)f->size : 0, &m)) { motivo_motor(p, m); return; }
+    struct taek_video_peticion *r = reservar(p, sizeof(*r));
+    if (!r) { motivo_motor(p, "sin memoria para la GPU"); return; }
+    memset(r, 0, sizeof(*r));
+    r->datos = mp4->avcc; r->n = mp4->avcc_bytes; r->longitud_nal = mp4->v_longitud_nal;
+    video_gpu_inyeccion(r);
+    if (video_gpu_orden(r, TAEK_VIDEO_ABRIR)) {
+        motivo_motor(p, r->motivo[0] ? r->motivo : "el cliente H.264 rechazo el video");
+        video_gpu_orden(r, TAEK_VIDEO_CERRAR);
+        soltar(p, r);
+        return;
+    }
+    /* Holgura en filas y bytes: la conversion a RGB por SSE2 puede leer un bloque de mas. */
+    r->paso_y = (r->ancho + 63) & ~63u; r->paso_c = (r->ancho / 2 + 63) & ~63u;
+    size_t ty = (size_t)r->paso_y * (r->alto + 2), tc = (size_t)r->paso_c * (r->alto / 2 + 2);
+    p->gpu_planos = reservar(p, ty + 2 * tc);
+    if (!p->gpu_planos) {
+        motivo_motor(p, "sin memoria para los planos de la GPU");
+        video_gpu_orden(r, TAEK_VIDEO_CERRAR);
+        soltar(p, r);
+        return;
+    }
+    r->y = p->gpu_planos; r->u = r->y + ty; r->v = r->u + tc;
+    p->gpu = r; p->gpu_uso = 1;
+}
+/* Saca n fotogramas de la GPU hacia el mismo presentar del software. 1: cancelado; negativo: fallo de la GPU. */
+static int gpu_sacar(reproductor *p, unsigned n) {
+    struct taek_video_peticion *r = p->gpu;
+    while (n--) {
+        int rc = video_gpu_orden(r, TAEK_VIDEO_TOMAR);
+        if (rc) return rc < 0 ? rc : TAEK_VIDEO_FALLO;
+        h264_imagen im = {r->y, r->u, r->v, r->ancho, r->alto, r->paso_y, r->paso_c, r->poc, r->pts_salida, r->rango_completo, r->matriz_color};
+        p->gpu_cuadros++;
+        if (presentar(p, &im)) return 1;
+    }
+    return 0;
+}
+static int muestra_con_idr(const uint8_t *d, size_t n, unsigned lng) {
+    size_t o = 0;
+    while (n - o >= lng && o < n) {
+        size_t l = 0;
+        for (unsigned i = 0; i < lng; i++) l = l << 8 | d[o++];
+        if (!l || l > n - o) return 0;
+        if ((d[o] & 31) == 5) return 1;
+        o += l;
+    }
+    return 0;
+}
+static int gpu_muestra(reproductor *p, const uint8_t *d, size_t n, int64_t pts) {
+    struct taek_video_peticion *r = p->gpu;
+    int idr = muestra_con_idr(d, n, p->mp4->v_longitud_nal);
+    for (;;) {
+        r->datos = d; r->n = n; r->pts = pts; r->longitud_nal = p->mp4->v_longitud_nal;
+        int rc = video_gpu_orden(r, TAEK_VIDEO_MUESTRA);
+        if (rc < 0) return rc;
+        int s = gpu_sacar(p, r->listos);
+        if (s) return s;
+        if (rc != TAEK_VIDEO_OTRA_VEZ) break;
+    }
+    /* Todo lo anterior a este IDR ya salio: desde aqui se puede retomar sin perder nada. */
+    if (idr) p->gpu_ultimo_idr = p->muestra_actual;
+    return 0;
+}
+static int gpu_drenar(reproductor *p) {
+    int rc = video_gpu_orden(p->gpu, TAEK_VIDEO_DRENAR);
+    if (rc) return rc < 0 ? rc : TAEK_VIDEO_FALLO;
+    return gpu_sacar(p, p->gpu->listos);
+}
+static int rebobinar_video(reproductor *p, uint32_t muestra) {
+    cola_muestras *q = p->video_comprimido;
+    cola_muestras_iniciar(q, &p->video_inicio, MP4_FUENTE_VIDEO, q->datos, q->capacidad);
+    q->observar_indice = observar_indice; q->usuario_observador = p;
+    mp4_contenedor c = p->video_inicio;
+    c.solo_indice = 1;
+    for (uint32_t i = 0; i < muestra; i++) {
+        const uint8_t *d; size_t b; int64_t t; uint32_t du = 0;
+        if (mp4_siguiente_video(&c, &d, &b, &t, &du) <= 0) return -1;
+    }
+    c.solo_indice = 0;
+    q->cursor = c;
+    p->mp4->v_indice = muestra;
+    return 0;
+}
+/* El decodificador por software no tiene las referencias de la GPU: se retoma desde el ultimo IDR con todo lo anterior ya presentado. */
+static h264_resultado gpu_a_software(reproductor *p, h264_resultado avcc_sw) {
+    motivo_motor(p, p->gpu->motivo[0] ? p->gpu->motivo : "fallo de la GPU");
+    p->gpu_muestra_fallo = p->muestra_actual;
+    p->gpu_a_soft = 1;
+    gpu_cerrar(p);
+    consola_imprimir("[VIDEO] La GPU fallo (");
+    consola_imprimir(p->motor_motivo);
+    consola_imprimir("); se sigue por software desde la muestra ");
+    consola_imprimir_dec(p->gpu_ultimo_idr);
+    consola_imprimir_linea("");
+    if (avcc_sw) return avcc_sw;
+    return rebobinar_video(p, p->gpu_ultimo_idr) ? H264_DATOS_INVALIDOS : H264_OK;
+}
+static void informe_motor(const reproductor *p) {
+    consola_imprimir("Motor de video: ");
+    if (p->gpu_a_soft) {
+        consola_imprimir("GPU Intel y luego software (");
+        consola_imprimir(p->motor_motivo);
+        consola_imprimir_linea(")");
+    } else if (p->gpu_uso) consola_imprimir_linea("GPU Intel, shim i915 experimental");
+    else {
+        consola_imprimir("software (");
+        consola_imprimir(p->motor_motivo[0] ? p->motor_motivo : "sin motivo");
+        consola_imprimir_linea(")");
+    }
+}
+/* La ultima linea de la sesion: el informe de trazas es tan largo que lo anterior puede salirse de la ventana del stream. */
+/* El informe largo se pierde si el stream va lleno: estas dos lineas finales son lo que siempre llega. */
+static void informe_tiempos(const reproductor *p, int resultado) {
+    uint64_t c = tiempo_ciclos_por_ms();
+    if (!c) c = 2500000;
+    int64_t e = p->mp4->ultimo_error_lectura;
+    consola_imprimir("[VIDEO_T] LECTURA_MS="); consola_imprimir_dec(p->ciclos_lectura / c);
+    consola_imprimir(" LECTURA_KB="); consola_imprimir_dec(p->bytes_lectura / 1024);
+    consola_imprimir(" AAC_MS="); consola_imprimir_dec(p->telem.ciclos_aac / c);
+    consola_imprimir(" RGB_MS="); consola_imprimir_dec(p->telem.ciclos_yuv_rgb / c);
+    consola_imprimir(" FB_MS="); consola_imprimir_dec(p->telem.ciclos_copia_fb / c);
+    consola_imprimir(" FB_MAX_MS="); consola_imprimir_dec(p->telem.max_ciclos_copia_fb / c);
+    consola_imprimir(" PTS_MS="); consola_imprimir_dec(p->telem.ciclos_espera_pts / c);
+    consola_imprimir(" SERVICIO_MS="); consola_imprimir_dec(p->telem.ciclos_hda_usb / c);
+    consola_imprimir(" MISS_V="); consola_imprimir_dec(p->video_comprimido ? p->video_comprimido->faltantes : 0);
+    consola_imprimir(" MISS_A="); consola_imprimir_dec(p->audio_comprimido ? p->audio_comprimido->faltantes : 0);
+    consola_imprimir(" RING_FALLOS="); consola_imprimir_dec(p->anillo ? p->anillo->fallos : 0);
+    consola_imprimir(" RING_SEEKS="); consola_imprimir_dec(p->anillo ? p->anillo->reposiciones : 0);
+    consola_imprimir(" ERROR="); consola_imprimir_dec((uint64_t)p->error);
+    consola_imprimir(" CANCELADO="); consola_imprimir_dec((uint64_t)p->cancelado);
+    consola_imprimir(" RESULTADO="); consola_imprimir(resultado < 0 ? "-" : ""); consola_imprimir_dec((uint64_t)(resultado < 0 ? -(int64_t)resultado : resultado));
+    consola_imprimir(" ERR_LECTURA="); consola_imprimir(e < 0 ? "-" : ""); consola_imprimir_dec((uint64_t)(e < 0 ? -e : e));
+    consola_imprimir_linea("");
+}
+static void informe_motor_final(const reproductor *p, uint64_t duracion_ms) {
+    uint64_t gpu_ms = p->gpu_ns / 1000000, copia_ms = p->gpu_ns_copia / 1000000;
+    consola_imprimir("[VIDEO] MS="); consola_imprimir_dec(duracion_ms);
+    consola_imprimir(" TARDIOS="); consola_imprimir_dec(p->cuadros_tardios);
+    consola_imprimir(" MOTOR=");
+    consola_imprimir(p->gpu_a_soft ? "GPU+SOFTWARE" : p->gpu_uso ? "GPU" : "SOFTWARE");
+    consola_imprimir(" CUADROS_GPU="); consola_imprimir_dec(p->gpu_cuadros);
+    consola_imprimir(" DECOD_GPU="); consola_imprimir_dec(p->gpu_decod);
+    consola_imprimir(" CORTES="); consola_imprimir_dec(p->gpu_cortes);
+    consola_imprimir(" GPU_MS="); consola_imprimir_dec(gpu_ms);
+    consola_imprimir(" COPIA_MS="); consola_imprimir_dec(copia_ms);
+    consola_imprimir(" MUESTRA_FALLO="); consola_imprimir_dec(p->gpu_muestra_fallo);
+    consola_imprimir(" RETOMA="); consola_imprimir_dec(p->gpu_ultimo_idr);
+    consola_imprimir(" MOSTRADOS="); consola_imprimir_dec(p->cuadros);
+    consola_imprimir(" HUELLA="); consola_imprimir_hex(p->huella);
+    consola_imprimir(" MOTIVO="); consola_imprimir_linea(p->motor_motivo[0] ? p->motor_motivo : "-");
+}
+
 static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum modo_reproduccion modo,
                                 int descriptor_vfs_video, int descriptor_vfs_audio) {
     if (!mp4 || !nombre) return -1;
@@ -1374,6 +1561,7 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
             mp4->leer_fuente=anillo_leer;mp4->fuente_contexto=p.anillo;
         } else {mp4->leer_fuente=leer_medido;mp4->fuente_contexto=&p;}
     }
+    p.video_inicio=*mp4;
     usb_msc_obtener_lecturas(&p.usb_comandos_inicio,&p.usb_bytes_inicio);
     usb_msc_telemetria_reiniciar();
     p.video_comprimido=reservar(&p,sizeof(cola_muestras));
@@ -1387,6 +1575,9 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     if(p.audio_comprimido){p.audio_comprimido->observar_indice=observar_indice;p.audio_comprimido->usuario_observador=&p;}
     /* También con una CPU: misma ruta de sintaxis/reconstrucción SSE2. */
     h264_configurar_trabajadores(dec,ejecutar_lote,&p,trabajos_cpu_activas(),servir_coordinador);
+
+    /* Antes de cebar el audio: iniciar la GPU la primera vez tarda, y el audio ya no se puede parar. */
+    if (!p.error) gpu_abrir(&p, mp4);
 
     // Prebuffer inicial de audio para cebar el pipeline DMA (128 KiB = ambos bloques DMA de 64 KiB + margen)
     if (dec_aac && mp4->tiene_audio && modo == MODO_INTERACTIVO) {
@@ -1447,31 +1638,17 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     }
 
     serial_imprimir("[MULTIMEDIA] INICIO "); serial_imprimir_linea(nombre);
-    h264_resultado resultado = h264_configurar_avcc(dec, mp4->avcc, mp4->avcc_bytes);
-
-    i915_va_sesion_t *va_ses = NULL;
-#ifdef TAEK_I915_HW
-    // [EXPERIMENTAL / NO VALIDADO] Decodificacion VA-API por GPU. Excluida del
-    // build estable: no hay evidencia de M16/M19 (ver plan maestro, M17-M22).
-    if (i915_va_disponible()) {
-        uint32_t w = 1920;
-        uint32_t h = 1080;
-        if (i915_va_crear_sesion(w, h, &va_ses) == 0) {
-            p.va_sesion = va_ses;
-            p.usando_intel_va = 1;
-            serial_imprimir_linea("[MULTIMEDIA] Acelerador Intel VA-API activado con exito.");
-            consola_imprimir_linea_color(" [ACELERACION INTEL VA-API GPU ACTIVA]", COLOR_EXITO_DEFAULT);
-        } else {
-            serial_imprimir_linea("[MULTIMEDIA] Intel VA-API no pudo inicializar sesion; usando software.");
-        }
-    }
-#else
-    (void)va_ses;
-#endif
+    /* Lo que el software no admite no impide usar la GPU: el error solo cuenta si hay que pasar a software. */
+    h264_resultado avcc_sw = h264_configurar_avcc(dec, mp4->avcc, mp4->avcc_bytes);
+    h264_resultado resultado = p.gpu ? H264_OK : avcc_sw;
+    consola_imprimir("Motor de video: ");
+    if (p.gpu) consola_imprimir_linea_color("GPU Intel (shim i915 experimental)", COLOR_EXITO_DEFAULT);
+    else { consola_imprimir("software ("); consola_imprimir(p.motor_motivo[0] ? p.motor_motivo : "sin motivo"); consola_imprimir_linea(")"); }
 
     uint64_t t_inicio_reproduccion = tiempo_obtener_milisegundos();
     uint64_t t_inicio_sesion_ciclos=rdtsc();
 
+decodificar_video:
     while (!resultado) {
         if(muestras_funcionales && mp4->v_indice>=muestras_funcionales)break;
         const uint8_t *datos_v;
@@ -1505,34 +1682,30 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
 
         // 3. Decodificación de muestra H.264
         uint64_t t_decode=rdtsc();
-#ifdef TAEK_I915_HW
-        if (p.va_sesion) {
-            int ret_va = i915_va_decodificar_cuadro(p.va_sesion, datos_v, bytes_v, pts_v);
-            if (ret_va == 0) {
-                h264_imagen im;
-                if (i915_va_obtener_imagen(p.va_sesion, &im) == 0) {
-                    presentar(&p, &im);
-                    resultado = H264_OK;
-                } else {
-                    resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
-                }
-            } else {
-                resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
-            }
-        } else
-#endif
-        {
+        if (p.gpu) {
+            int rg = gpu_muestra(&p, datos_v, bytes_v, pts_v);
+            if (rg > 0) resultado = H264_CANCELADO;
+            else if (rg < 0) resultado = gpu_a_software(&p, avcc_sw);
+        } else {
             resultado = h264_decodificar_muestra_avcc(dec, mp4->v_longitud_nal, datos_v, bytes_v, pts_v);
         }
         registrar(&p,TR_DECODIFICAR,t_decode,rdtsc(),bytes_v);
         guardar_pausa(&p,t_decode,rdtsc());
     }
-    if (!resultado) resultado = h264_finalizar(dec);
+    if (!resultado && p.gpu) {
+        int rg = gpu_drenar(&p);
+        if (rg > 0) resultado = H264_CANCELADO;
+        else if (rg < 0) {
+            resultado = gpu_a_software(&p, avcc_sw);
+            if (!resultado) goto decodificar_video;
+        }
+    } else if (!resultado) resultado = h264_finalizar(dec);
     while(!resultado && !p.cancelado && p.presentaciones_pendientes)
         if(presentar_pendiente(&p,1))resultado=H264_CANCELADO;
 
     uint64_t duracion_real_ms = tiempo_obtener_milisegundos() - t_inicio_reproduccion;
     p.telem.ciclos_pared_sesion=rdtsc()-t_inicio_sesion_ciclos;
+    gpu_cerrar(&p);
 
     if (dec_aac && !p.cancelado && !p.error) {
         audio_ac97_drenar();
@@ -1568,6 +1741,7 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     if(p.mp4->ultimo_error_lectura){int64_t e=p.mp4->ultimo_error_lectura;consola_imprimir(e<=-20 && e>=-30?volumen_error((int)e):"Lectura MP4 incompleta");}
     else if (resultado && !p.cancelado) consola_imprimir(h264_error(dec));
     consola_imprimir_linea("");
+    informe_motor(&p);
 
     // Generar e imprimir informe integral de telemetría y benchmark
     imprimir_informe_benchmark(&p, dec, duracion_real_ms);
@@ -1637,12 +1811,6 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
         }
     }
 
-#ifdef TAEK_I915_HW
-    if (p.va_sesion) {
-        i915_va_destruir_sesion(p.va_sesion);
-        p.va_sesion = NULL;
-    }
-#endif
     h264_destruir(dec);
     if (p.rgb) soltar(&p, p.rgb);
     if (p.telem.tiempos_cuadro_us) soltar(&p, p.telem.tiempos_cuadro_us);
@@ -1660,6 +1828,8 @@ static int reproductor_ejecutar(mp4_contenedor *mp4, const char *nombre, enum mo
     serial_imprimir_dec((uint64_t)(despues.heap_bytes_en_uso >= antes.heap_bytes_en_uso ?
                         despues.heap_bytes_en_uso - antes.heap_bytes_en_uso : 0));
     serial_imprimir_linea("");
+    informe_tiempos(&p, (int)resultado);
+    informe_motor_final(&p, duracion_real_ms);
 
     if(p.mp4->ultimo_error_lectura)return (int)p.mp4->ultimo_error_lectura;
     return p.cancelado ? 1 : resultado || p.error ? -1 : 0;
@@ -1882,6 +2052,7 @@ void audio_aac_comando(const char *arg) {
 }
 
 void video_h264_comando(const char *arg) {
+    if(video_gpu_comando(arg))return;
     if(iguales(arg,"io 4") || iguales(arg,"io 16") || iguales(arg,"io 32") || iguales(arg,"io 64") ||
        iguales(arg,"io 128") || iguales(arg,"io 256")) {
         unsigned n=0;for(const char *c=arg+3;*c;c++)n=n*10+(unsigned)(*c-'0');
@@ -1931,6 +2102,7 @@ void video_h264_comando(const char *arg) {
         audio_aac_probar("h264:360p");
     } else {
         consola_imprimir_linea_color("--- REPRODUCTOR MULTIMEDIA H.264 & AAC (TELEMETRÍA) ---", COLOR_AVISO_DEFAULT);
+        consola_imprimir_linea("  h264 motor [auto|software]: decodificar por GPU si está probada o por CPU.");
         consola_imprimir_linea("  h264 cpu 1|2|4; h264 bsp coordinador|calcula: comparación de distribución.");
         consola_imprimir_linea("  reproducir [ram|usb] [bench|prueba] archivo.mp4: diagnóstico de la misma fuente.");
         consola_imprimir_color("  h264 360p          ", COLOR_PROMPT_DEFAULT);

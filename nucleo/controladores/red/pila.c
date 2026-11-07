@@ -1,4 +1,7 @@
 #include "red.h"
+#include "stream.h"
+#include "http_respuesta.h"
+#include "tls_port/taek_tls_port.h"
 #include "../consola.h"
 #include "../../arquitectura/x86_64/serial.h"
 #include "../../base/memoria.h"
@@ -152,8 +155,32 @@ struct arp_entrada {
     uint8_t ip[4];
     uint8_t mac[6];
     int     valida;
+    uint64_t ultimo_uso;
 };
 static struct arp_entrada g_arp[8];
+
+static void red_arp_aprender(const struct red_arp *arp) {
+    if (red_ip_cero(arp->emisor_ip)) return; // una sonda DHCP no es un vecino 0.0.0.0
+    int elegido = -1, libre = -1, antiguo = 0;
+    for (int i = 0; i < 8; i++) {
+        if (g_arp[i].valida && red_ip_igual(g_arp[i].ip, arp->emisor_ip)) {
+            elegido = i;
+            break;
+        }
+        if (!g_arp[i].valida && libre < 0) libre = i;
+        if (g_arp[i].ultimo_uso < g_arp[antiguo].ultimo_uso) antiguo = i;
+    }
+    // RFC 826: actualizar vecinos conocidos; incorporar nuevos solo si somos
+    // el objetivo. Broadcasts entre terceros no deben llenar nuestra cache.
+    if (elegido < 0) {
+        if (!g_cfg.configurada || !red_ip_igual(arp->objetivo_ip, g_cfg.ip)) return;
+        elegido = libre >= 0 ? libre : antiguo;
+    }
+    memcpy(g_arp[elegido].ip, arp->emisor_ip, 4);
+    memcpy(g_arp[elegido].mac, arp->emisor_mac, 6);
+    g_arp[elegido].valida = 1;
+    g_arp[elegido].ultimo_uso = tiempo_obtener_milisegundos();
+}
 
 static uint16_t g_ip_id = 1;
 
@@ -208,6 +235,8 @@ struct red_tcp_conexion {
 };
 static struct red_tcp_conexion g_tcp;
 static unsigned char g_tcp_ocupada;
+static int g_tcp_flujo;
+static char g_tcp_flujo_rx[32768];
 
 // Búferes de trabajo (reutilizados; operación sincrónica)
 static uint8_t g_trama[RED_MAX_TRAMA];
@@ -263,16 +292,10 @@ void red_pila_sondeo(void) {
         if (tipo == RED_ETH_ARP) {
             if (len < sizeof(struct red_eth) + sizeof(struct red_arp)) continue;
             struct red_arp *arp = (struct red_arp *)(trama + sizeof(struct red_eth));
-            if (red_be16(arp->tipo_proto) == RED_ETH_IPV4 && arp->largo_hw == 6 && arp->largo_proto == 4) {
-                for (int i = 0; i < 8; i++) {
-                    if (!g_arp[i].valida || red_ip_igual(g_arp[i].ip, arp->emisor_ip)) {
-                        memcpy(g_arp[i].ip, arp->emisor_ip, 4);
-                        memcpy(g_arp[i].mac, arp->emisor_mac, 6);
-                        g_arp[i].valida = 1;
-                        break;
-                    }
-                }
-            }
+            uint16_t operacion=red_be16(arp->operacion);
+            if(red_be16(arp->tipo_hw)!=1||red_be16(arp->tipo_proto)!=RED_ETH_IPV4||
+               arp->largo_hw!=6||arp->largo_proto!=4||(operacion!=1&&operacion!=2))continue;
+            red_arp_aprender(arp);
             if (red_be16(arp->operacion) == 1 && g_cfg.configurada &&
                 red_ip_igual(arp->objetivo_ip, g_cfg.ip)) {
                 struct red_eth *resp_eth = (struct red_eth *)g_trama;
@@ -400,6 +423,7 @@ static int red_enviar_ipv4(const uint8_t destino_ip[4], uint8_t protocolo,
 int red_arp_resolver(const uint8_t ip[4], uint8_t mac_salida[6], int timeout_ms) {
     for (int i = 0; i < 8; i++) {
         if (g_arp[i].valida && red_ip_igual(g_arp[i].ip, ip)) {
+            g_arp[i].ultimo_uso=tiempo_obtener_milisegundos();
             memcpy(mac_salida, g_arp[i].mac, 6);
             return 0;
         }
@@ -430,6 +454,7 @@ int red_arp_resolver(const uint8_t ip[4], uint8_t mac_salida[6], int timeout_ms)
         red_pila_sondeo();
         for (int i = 0; i < 8; i++) {
             if (g_arp[i].valida && red_ip_igual(g_arp[i].ip, ip)) {
+                g_arp[i].ultimo_uso=tiempo_obtener_milisegundos();
                 memcpy(mac_salida, g_arp[i].mac, 6);
                 return 0;
             }
@@ -457,10 +482,14 @@ static void red_icmp_responder(const uint8_t *rx, uint32_t carga_len) {
     memcpy(tmp, ip->origen, 4);
     memcpy(ip->origen, ip->destino, 4);
     memcpy(ip->destino, tmp, 4);
+    /* La respuesta no replica opciones IP: cabecera fija de 20 bytes. */
+    ip->ver_ihl = 0x45;
+    ip->longitud_total = red_be16((uint16_t)(20 + carga_len));
     ip->checksum = 0;
-    ip->checksum = red_checksum(ip, 20);
+    /* red_checksum devuelve orden de host; el campo viaja en orden de red. */
+    ip->checksum = red_be16(red_checksum(ip, 20));
 
-    uint8_t *icmp = g_trama + sizeof(struct red_eth) + ihl;
+    uint8_t *icmp = g_trama + sizeof(struct red_eth) + 20;
     memcpy(icmp, rx + sizeof(struct red_eth) + ihl, carga_len);
     icmp[0] = 0;   // Eco reply
     icmp[2] = 0;
@@ -469,7 +498,7 @@ static void red_icmp_responder(const uint8_t *rx, uint32_t carga_len) {
     icmp[2] = (uint8_t)(ck >> 8);
     icmp[3] = (uint8_t)(ck & 0xFF);
 
-    red_enviar_trama(g_trama, sizeof(struct red_eth) + ihl + carga_len);
+    red_enviar_trama(g_trama, sizeof(struct red_eth) + 20 + carga_len);
 }
 
 int red_ping(const uint8_t ip[4], int intentos, int timeout_ms) {
@@ -791,7 +820,7 @@ static int red_tcp_enviar_segmento_seq(const uint8_t *datos, uint32_t longitud, 
     tcp->acuse = red_be32(g_tcp.ack);
     tcp->offset_reservado = 0x50; // 5 * 4 = 20 bytes, sin opciones
     tcp->banderas = banderas;
-    tcp->ventana = red_be16(64240);
+    tcp->ventana = red_be16(g_tcp_flujo ? g_tcp.rx_capacidad - g_tcp.rx_longitud : 64240);
     tcp->urgente = 0;
     if (longitud) memcpy(g_payload + sizeof(struct red_tcp), datos, longitud);
 
@@ -866,12 +895,14 @@ static void red_procesar_tcp(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t c
         if (seq == g_tcp.ack) {
             uint32_t espacio = g_tcp.rx_capacidad - g_tcp.rx_longitud;
             uint32_t copiar = datos_len < espacio ? datos_len : espacio;
-            if (copiar < datos_len) g_tcp.rx_desbordado = 1;
+            if (copiar < datos_len && !g_tcp_flujo) g_tcp.rx_desbordado = 1;
             if (copiar && g_tcp.rx_destino) {
                 memcpy(g_tcp.rx_destino + g_tcp.rx_longitud, datos, copiar);
                 g_tcp.rx_longitud += copiar;
             }
-            g_tcp.ack += datos_len;
+            // Flujo: confirmar solo bytes retenidos. Una ventana llena no debe
+            // ACKear y perder la cola de una descarga binaria grande.
+            g_tcp.ack += g_tcp_flujo ? copiar : datos_len;
         }
         red_tcp_enviar_segmento(NULL, 0, RED_TCP_ACK);
     }
@@ -966,27 +997,21 @@ static void red_tcp_temporizador(void) {
 // -------------------------------------------------------------------- HTTP
 static int red_http_obtener_interno(const char *host, const char *ruta, uint16_t puerto,
                      char *salida, uint32_t capacidad, int timeout_ms) {
+    if(!host || !*host || !salida || capacidad<64)return -4;
+    if(!ruta || !*ruta)ruta="/";
+    if(ruta[0]!='/')return -4;
+    unsigned h=0,p=0;
+    for(const char *c=host;*c;c++)if(++h>253 || !((*c>='a' && *c<='z') || (*c>='A' && *c<='Z') || (*c>='0' && *c<='9') || *c=='.' || *c=='-'))return -4;
+    for(const char *c=ruta;*c;c++)if(++p>2048 || (unsigned char)*c<=32 || (unsigned char)*c==127 || *c=='#')return -4;
+    if(!puerto)puerto=80;
+    salida[0]=0;
     uint8_t ip[4];
     if (red_resolver_nombre(host, ip, timeout_ms) != 0) return -1;
     if (red_tcp_conectar(ip, puerto, timeout_ms) != 0) return -2;
 
-    char peticion[512];
-    int n = 0;
-    const char *metodo = "GET ";
-    while (*metodo) peticion[n++] = *metodo++;
-    if (!ruta || !ruta[0]) { peticion[n++] = '/'; }
-    else { for (const char *p = ruta; *p && n < 400; p++) peticion[n++] = *p; }
-    peticion[n++] = ' ';
-    peticion[n++] = 'H'; peticion[n++] = 'T'; peticion[n++] = 'T';
-    peticion[n++] = 'P'; peticion[n++] = '/'; peticion[n++] = '1';
-    peticion[n++] = '.'; peticion[n++] = '1'; peticion[n++] = '\r';
-    peticion[n++] = '\n';
-    const char *host_hdr = "Host: ";
-    while (*host_hdr) peticion[n++] = *host_hdr++;
-    for (const char *p = host; *p && n < 480; p++) peticion[n++] = *p;
-    peticion[n++] = '\r'; peticion[n++] = '\n';
-    const char *ua = "User-Agent: TAEK-OS/1.0\r\nConnection: close\r\n\r\n";
-    while (*ua && n < 510) peticion[n++] = *ua++;
+    char peticion[3072];
+    int n=taek_tls_snprintf(peticion,sizeof(peticion),"GET %s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: TAEK-OS/1.0\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",ruta,host,(unsigned)puerto);
+    if(n<0 || (unsigned)n>=sizeof(peticion)){red_tcp_cerrar();return -4;}
 
     // Preparar el búfer de recepción ANTES de enviar, por si la respuesta
     // llega en la misma ventana que el ACK de la petición.
@@ -996,29 +1021,95 @@ static int red_http_obtener_interno(const char *host, const char *ruta, uint16_t
     g_tcp.rx_longitud = 0;
     g_tcp.rx_completo = 0;
 
-    if (red_tcp_enviar(peticion, (uint32_t)n, timeout_ms) != 0) {
-        red_tcp_cerrar();
-        return -3;
+    for(int pos=0;pos<n;){
+        unsigned segmento=(unsigned)(n-pos)>RED_TCP_MAX_SEGMENTO?RED_TCP_MAX_SEGMENTO:(unsigned)(n-pos);
+        if(red_tcp_enviar(peticion+pos,segmento,timeout_ms)){red_tcp_cerrar();return -3;}
+        pos+=(int)segmento;
     }
 
-    red_tcp_esperar(red_tcp_cond_cerrado, timeout_ms);
+    int timeout=red_tcp_esperar(red_tcp_cond_cerrado, timeout_ms);
+    int cerrado=g_tcp.estado==4;
+    int desbordado=g_tcp.rx_desbordado;
     red_tcp_cerrar();
 
     if (salida && capacidad > 0) salida[g_tcp.rx_longitud < capacidad ? g_tcp.rx_longitud : capacidad - 1] = '\0';
+    struct http_respuesta r;
+    if(desbordado || http_respuesta_validar(salida,g_tcp.rx_longitud,!timeout && cerrado,&r)!=1){memset(salida,0,g_tcp.rx_longitud+1);return -5;}
     return (int)g_tcp.rx_longitud;
 }
 
 int red_http_obtener(const char *host, const char *ruta, uint16_t puerto,
                      char *salida, uint32_t capacidad, int timeout_ms) {
     if (__atomic_test_and_set(&g_tcp_ocupada, __ATOMIC_ACQUIRE)) return -16;
+    red_stream_pausar(1);
     int resultado = red_http_obtener_interno(host, ruta, puerto, salida, capacidad, timeout_ms);
     __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
+    red_stream_pausar(0);
     return resultado;
 }
 
 static int red_tcp_tiempo_restante(uint64_t inicio, int timeout_ms) {
     uint64_t transcurrido = tiempo_obtener_milisegundos() - inicio;
     return transcurrido >= (uint64_t)timeout_ms ? 0 : timeout_ms - (int)transcurrido;
+}
+
+int red_tcp_flujo_abrir_timeout(const uint8_t ip[4], uint16_t puerto, int timeout_ms) {
+    if (!ip || !puerto || !g_cfg.configurada) return -2;
+    if (__atomic_test_and_set(&g_tcp_ocupada, __ATOMIC_ACQUIRE)) return -16;
+    uint8_t mac[6];
+    uint64_t inicio = tiempo_obtener_milisegundos();
+    const uint8_t *siguiente = red_misma_subred(ip) ? ip : g_cfg.puerta;
+    int arp_timeout = timeout_ms / 2;
+    if (arp_timeout < 200) arp_timeout = 200;
+    if (arp_timeout > 2000) arp_timeout = 2000;
+    if (red_arp_resolver(siguiente, mac, arp_timeout) != 0) goto fallo;
+    int restante = red_tcp_tiempo_restante(inicio, timeout_ms);
+    if (!restante || red_tcp_conectar(ip, puerto, restante) != 0) goto fallo;
+    g_tcp.rx_destino = g_tcp_flujo_rx;
+    g_tcp.rx_capacidad = sizeof(g_tcp_flujo_rx);
+    g_tcp.rx_longitud = 0;
+    g_tcp.rx_desbordado = 0;
+    g_tcp_flujo = 1;
+    return 0;
+fallo:
+    g_tcp.activa = 0; g_tcp.estado = 0;
+    __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
+    return -3;
+}
+
+int red_tcp_flujo_abrir(const uint8_t ip[4], uint16_t puerto) {
+    return red_tcp_flujo_abrir_timeout(ip, puerto, 1500);
+}
+
+int red_tcp_flujo_enviar(const void *datos, uint32_t longitud) {
+    if (!g_tcp_flujo || !g_tcp.activa || g_tcp.estado != 2 ||
+        !datos || !longitud || longitud > RED_TCP_MAX_SEGMENTO) return -1;
+    if (!g_tcp.ack_de_datos) return 1;
+    red_tcp_guardar_ultimo(datos, longitud, RED_TCP_ACK | RED_TCP_PSH);
+    g_tcp.seq += longitud;
+    return red_tcp_enviar_segmento_seq(datos, longitud, RED_TCP_ACK | RED_TCP_PSH, g_tcp.seq_ultimo);
+}
+
+int red_tcp_flujo_recibir(void *datos, uint32_t capacidad) {
+    if (!g_tcp_flujo || !datos || !capacidad) return -1;
+    red_pila_sondeo();
+    uint32_t n = g_tcp.rx_longitud < capacidad ? g_tcp.rx_longitud : capacidad;
+    if (n) {
+        memcpy(datos, g_tcp_flujo_rx, n);
+        for (uint32_t i = n; i < g_tcp.rx_longitud; ++i) g_tcp_flujo_rx[i-n] = g_tcp_flujo_rx[i];
+        g_tcp.rx_longitud -= n;
+        if (g_tcp.activa && g_tcp.estado == 2) red_tcp_enviar_segmento(NULL, 0, RED_TCP_ACK);
+        return (int)n;
+    }
+    if (!g_tcp.activa || g_tcp.estado != 2 || g_tcp.rx_desbordado) return -1;
+    return 0;
+}
+
+void red_tcp_flujo_cerrar(void) {
+    if (!g_tcp_flujo) return;
+    if (g_tcp.activa && g_tcp.estado == 2) red_tcp_enviar_segmento(NULL, 0, RED_TCP_RST | RED_TCP_ACK);
+    g_tcp.activa = 0; g_tcp.estado = 0; g_tcp_flujo = 0;
+    __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
 }
 
 static int red_tcp_cond_respuesta(void) {

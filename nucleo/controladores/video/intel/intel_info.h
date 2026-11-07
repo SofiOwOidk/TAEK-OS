@@ -48,6 +48,10 @@ struct intel_gpu_info {
     int      iommu_traduccion_activa;
     uint32_t iommu_modo;
     uint32_t conteo_rmrr;
+    int iommu_unidad_identificada;
+    int iommu_dma_directo_observado; // -1 desconocido; 0 TES=1; 1 TES=0; no valida buffers
+    uint32_t iommu_indice_drhd;
+    uint64_t iommu_mmio_fisica;
 };
 
 // Funciones del módulo de inventario Intel H0

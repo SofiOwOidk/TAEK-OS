@@ -13,9 +13,7 @@ extern const uint8_t _binary_cangrejo_audio_bin_end[];
 void animacion_don_cangrejo_explotar(int bucles) {
     serial_imprimir_linea("");
     serial_imprimir_linea("==============================================================");
-    serial_imprimir_linea("  [ HIPERVISOR RING -1 ] ¡INTERCEPCIÓN DE TRIPLE FAULT ACTIVA! ");
-    serial_imprimir_linea("  [ HIPERVISOR RING -1 ] Tomando control del Framebuffer...    ");
-    serial_imprimir_linea("  [ HIPERVISOR RING -1 ] Ejecutando protocolo Don Cangrejo...  ");
+    serial_imprimir_linea("  [ HUEVO ] Animacion de cierre tras el colapso (sin hipervisor).");
     serial_imprimir_linea("==============================================================");
 
     const uint32_t *frames = (const uint32_t *)_binary_cangrejo_video_bin_start;
@@ -46,7 +44,6 @@ void animacion_don_cangrejo_explotar(int bucles) {
     }
 
     serial_imprimir_linea("==============================================================");
-    serial_imprimir_linea("  [ HIPERVISOR RING -1 ] Secuencia de explosión concluida.     ");
-    serial_imprimir_linea("  [ HIPERVISOR RING -1 ] Apagando equipo ahora. ¡Adiós!        ");
+    serial_imprimir_linea("  [ HUEVO ] Animacion concluida; se detiene el equipo.");
     serial_imprimir_linea("==============================================================");
 }

@@ -5,6 +5,8 @@
 #define FAT_LECTOR_NOMBRE 1024
 #define FAT_LECTOR_PUNTOS 32
 struct fat_lector_nodo {
+    uint64_t entrada_posicion;
+    uint16_t entrada_cantidad;
     uint64_t longitud, valida;
     uint32_t cluster;
     uint8_t contiguo, directorio;
@@ -46,6 +48,8 @@ extern struct fat_lector_volumen fat_lector_fat32, fat_lector_exfat;
 int fat_lector_montar(struct fat_lector_volumen *,const struct particion *);
 void fat_lector_desmontar(struct fat_lector_volumen *);
 int fat_lector_resolver(struct fat_lector_volumen *,const char *,struct fat_lector_nodo *,const volatile uint8_t *);
+int fat_lector_nombre_utf16(const char *,size_t,uint16_t *,unsigned *);
+int fat_lector_sector(struct fat_lector_volumen *,struct fat_lector_cursor *,uint64_t,uint64_t *);
 int fat_lector_iterar(struct fat_lector_volumen *,const struct fat_lector_nodo *,struct fat_lector_iterador *);
 int fat_lector_siguiente(struct fat_lector_volumen *,struct fat_lector_iterador *,struct fat_lector_nodo *,const volatile uint8_t *);
 void fat_lector_cursor_iniciar(struct fat_lector_cursor *,const struct fat_lector_nodo *);

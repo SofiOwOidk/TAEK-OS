@@ -120,6 +120,13 @@ int red_tcp_intercambiar(const uint8_t ip[4], uint16_t puerto,
                         const void *cabecera, uint32_t cabecera_len,
                         const void *datos, uint32_t longitud,
                         void *respuesta, uint32_t respuesta_len, int timeout_ms);
+// Un flujo persistente ocupa el unico cliente TCP hasta cerrarlo. Solo BSP,
+// desde puntos cooperativos de consola, nunca IRQ/serial. Abrir acotado a 300 ms.
+int red_tcp_flujo_abrir(const uint8_t ip[4], uint16_t puerto);
+int red_tcp_flujo_abrir_timeout(const uint8_t ip[4], uint16_t puerto, int timeout_ms);
+int red_tcp_flujo_enviar(const void *datos, uint32_t longitud); // 0 aceptado, 1 ocupado
+int red_tcp_flujo_recibir(void *datos, uint32_t capacidad); // bytes, negativo desconectado
+void red_tcp_flujo_cerrar(void);
 // Snapshot de log + metadatos; solo retorna 0 si el receptor confirma persistencia.
 int red_telemetria_enviar(const uint8_t ip[4], uint16_t puerto,
                          uint32_t *bytes_enviados, uint64_t *bytes_perdidos);

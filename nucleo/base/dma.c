@@ -3,7 +3,7 @@
 #include "huevo.h"
 #include "../arquitectura/x86_64/serial.h"
 
-#define MAX_PALABRAS_BITMAP 128 // 128 * 64 bits = 8,192 páginas (32 MiB @ 4 KiB)
+#define MAX_PALABRAS_BITMAP 1024 // 1024 * 64 bits = 65,536 páginas (256 MiB @ 4 KiB): TAMANO_ARENA_DMA_MAX
 #define MAX_PAGINAS_DMA (MAX_PALABRAS_BITMAP * 64)
 
 static uint64_t g_dma_base_fisica = 0;
@@ -208,6 +208,69 @@ void dma_sincronizar_dispositivo_a_cpu(const void *dir_virtual, uint64_t bytes) 
 
     // Barrera completa de memoria: asegura que las lecturas lean de DRAM físico
     __asm__ volatile ("mfence" ::: "memory");
+}
+
+// ---------------------------------------------------------------- arena de objetos de la GPU
+#define GPU_PAGINAS_MAX 65536u
+static uint64_t g_gpu_base, g_gpu_tamano;
+static uint32_t g_gpu_total, g_gpu_uso, g_gpu_pico, g_gpu_activas;
+static int g_gpu_iniciada;
+static uint64_t g_gpu_bitmap[GPU_PAGINAS_MAX / 64];
+static uint32_t g_gpu_bloque[GPU_PAGINAS_MAX];   // Páginas de cada bloque, en su primera página.
+
+static void gpu_iniciar(void) {
+    if (g_gpu_iniciada) return;
+    g_gpu_iniciada = 1;
+    g_gpu_base = memoria_obtener_gpu_arena(&g_gpu_tamano);
+    g_gpu_total = (uint32_t)(g_gpu_tamano / TAMANO_PAGINA);
+    if (g_gpu_total > GPU_PAGINAS_MAX) g_gpu_total = GPU_PAGINAS_MAX;
+}
+static inline int gpu_ocupada(uint32_t p) { return (g_gpu_bitmap[p / 64] >> (p % 64)) & 1; }
+
+uint64_t dma_gpu_asignar(uint32_t paginas) {
+    gpu_iniciar();
+    if (!paginas || paginas > g_gpu_total) return 0;
+    for (uint32_t i = 0; i + paginas <= g_gpu_total; i++) {
+        uint32_t j = 0;
+        while (j < paginas && !gpu_ocupada(i + j)) j++;
+        if (j < paginas) { i += j; continue; }   // El bucle salta la página ocupada.
+        for (j = 0; j < paginas; j++) g_gpu_bitmap[(i + j) / 64] |= 1ULL << ((i + j) % 64);
+        g_gpu_bloque[i] = paginas;
+        g_gpu_uso += paginas;
+        g_gpu_activas++;
+        if (g_gpu_uso > g_gpu_pico) g_gpu_pico = g_gpu_uso;
+        return g_gpu_base + (uint64_t)i * TAMANO_PAGINA;
+    }
+    return 0;
+}
+
+int dma_gpu_es_suya(uint64_t f) {
+    gpu_iniciar();
+    return g_gpu_total && f >= g_gpu_base && f < g_gpu_base + (uint64_t)g_gpu_total * TAMANO_PAGINA;
+}
+
+int dma_gpu_liberar(uint64_t f, uint32_t paginas) {
+    if (!dma_gpu_es_suya(f) || (f - g_gpu_base) % TAMANO_PAGINA) return -1;
+    uint32_t i = (uint32_t)((f - g_gpu_base) / TAMANO_PAGINA);
+    if (!paginas || g_gpu_bloque[i] != paginas) {
+        serial_imprimir_linea("[DMA FATAL] Liberación incorrecta en la arena de la GPU.");
+        return -1;
+    }
+    g_gpu_bloque[i] = 0;
+    for (uint32_t j = 0; j < paginas; j++) g_gpu_bitmap[(i + j) / 64] &= ~(1ULL << ((i + j) % 64));
+    g_gpu_uso -= paginas;
+    g_gpu_activas--;
+    return 0;
+}
+
+void dma_gpu_obtener_estadisticas(dma_gpu_estadisticas_t *est) {
+    if (!est) return;
+    gpu_iniciar();
+    est->base = g_gpu_base;
+    est->tamano_bytes = (uint64_t)g_gpu_total * TAMANO_PAGINA;
+    est->paginas_en_uso = g_gpu_uso;
+    est->paginas_pico = g_gpu_pico;
+    est->asignaciones_activas = g_gpu_activas;
 }
 
 void dma_obtener_estadisticas(dma_estadisticas_t *est) {

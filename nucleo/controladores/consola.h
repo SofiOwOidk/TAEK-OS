@@ -13,6 +13,12 @@
 
 void consola_iniciar(void);
 void consola_limpiar(void);
+void consola_lote_iniciar(void);
+void consola_lote_finalizar(void);
+void consola_desplazar(int lineas);
+void consola_puntero_presentar(void);
+void consola_obtener_posicion(int *col,uint64_t *linea);
+uint64_t consola_linea_visible(unsigned fila);
 
 void consola_establecer_color_texto(uint32_t fg);
 void consola_establecer_color_fondo(uint32_t bg);

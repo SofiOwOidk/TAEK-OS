@@ -3973,3 +3973,188 @@ Inventario exacto de archivos tocados, por hito. Nótese que el árbol de trabaj
 * **SIGUIENTE:** continuar desde esta base en `OS_experimental`: consola remota
   y retorno de diagnósticos; después definir ABI/lifecycle para cargar drivers en
   RAM. La comunicación LAN no acredita ejecución GPU ni cierra M12–M25 de i915.
+
+---
+
+### Hitos 97–113 — Continuidad experimental: consola, transferencia LAN y módulos RAM (2026-10-02 a 2026-10-07)
+
+* **Registro reconstruido:** estos hitos se desarrollaron en `OS_experimental/i915/` y no fueron promociones de la entrega estable H96. Se incorporan aquí como registro cronológico; los artefactos, fuentes y evidencias conservan su ubicación experimental original.
+
+* **H97–H100:** consola remota saliente, streaming de diagnósticos y diagnóstico/corrección del almacenamiento USB. La campaña física H98/H99 se limitó al i7-8650U / 8086:5917. El diagnóstico documentó el módulo H.264 ausente en la configuración y el fallo Bulk xHCI observado; no se afirmó reproducción iGPU.
+
+* **H101–H106:** transferencia de archivos por LAN hacia RAM/Ventoy, con hashes, readback y recuperación de errores; H103 corrigió el tratamiento de caché SCSI y H104 validó recepción/arranque de una ISO recibida. Evidencias en `OS_experimental/i915/docs/ARCHIVOS_LAN_H101.md` a `ARCHIVOS_LAN_H106.md` y `planes/PLAN_TRANSFERENCIA_ARCHIVOS_LAN.md`.
+
+* **H107:** copiar, mover y eliminar archivos en FAT32/exFAT, con comprobación del destino antes de borrar el origen. Host, QEMU y operaciones físicas exFAT PASS. No se acreditó escritura NTFS/ext4 ni atomicidad ante corte de energía.
+
+* **H108:** HTTPS/TLS 1.3 con validación de cadena, nombre, vigencia y firma; casos negativos validados. El navegador siguió siendo de texto, sin JavaScript/CSS.
+
+* **H109:** cargador ELF64 `.chad` en Ring 0 con ABI de servicios, carga/descarga/recarga sin reinicio del módulo de bloques RAM, validado en host, QEMU e i7. No habilita reemplazo de drivers de hardware ni entrega PCI/MMIO/DMA/IRQ a i915.
+
+* **H110–H112:** transferencia entre discos, navegación de texto y módulo mouse `.chad`. PASS host/QEMU; la validación física del mouse quedaba pendiente. ISO H112: `taek-h112-344be6fad024fb67.iso`, SHA-256 `201d76fab7d374aa13b1f34c420f9751824a2fea1f864f8d3954677406c0f8ca`.
+
+* **H113:** corrección operativa del empaquetado para recuperar LAN automática en la entrada experimental; no habilita i915 ni cambia el alcance de los módulos RAM.
+
+* **Evidencia:** `OS_experimental/i915/docs/VALIDACION_H107_H109.md`, `docs/VALIDACION_H110_H112.md`, `planes/PLAN_CONTROL_REMOTO.md`, `planes/PLAN_CARGA_DRIVERS_RAM.md` y `planes/PLAN_H110_H112.md`.
+
+---
+
+### Hito 114 — DMAR y base de inventario GPU, sin activación (2026-10-07)
+
+* Parser de DMAR con scopes DRHD/RMRR, selección por ruta PCI y lectura pasiva de estado VT-d. Host y QEMU PASS; la ISO no activa la GPU, no acredita DMA ni submission. Artefacto/evidencia: `OS_experimental/i915/docs/intel/H114_DMAR_Y_BASE_GPU.md`.
+
+### Hito 115 — Lifecycle seguro de módulos RAM (2026-10-07)
+
+* Se retiene código y recursos si la parada falla tras un inicio parcial; validado con ELF reales en QEMU. No acredita descarga segura de un motor GPU. Evidencia: `OS_experimental/i915/docs/intel/H115_CARGA_RAM_Y_PARADA.md`.
+
+### Hitos 116–120 — Base de contexto para componentes originales (2026-10-07/08)
+
+* **H116:** mecanismo de contexto y ABI. **H117:** estado x87/SSE2 por tarea. **H118:** TLS estático. **H119:** registro/tareas BSP/AP. **H120:** IF por contexto e IPI APIC; H120 fue arrancado físicamente en el i7, con regresiones de IRQ/IPI, scheduler, TLS/ABI/FX y baseline de heap/páginas/DMA registrados. Ninguno de estos hitos activa i915. Evidencias: `OS_experimental/i915/docs/intel/M06_ABI_CONTEXTO_H116.md`, `M06_X87_SSE2_H117.md`, `M06_TLS_ESTATICO_H118.md`, `M07_TAREAS_BSP_AP_H119.md`, `M07_IF_IPI_H120.md` y `H120_FISICO_I7_20261008.md`.
+
+### Hito 121 — i915 de referencia y DRM MM en RAM (2026-10-08)
+
+* Se compiló la referencia i915/DRM y se ejecutó `drm_mm`/rbtree original como módulo RAM. Carga/descarga física acreditada sobre H112, sin reinicio; rangos sintéticos, sin GPU activa. Evidencia: `OS_experimental/i915/docs/intel/M04_I915_COMPLETO_Y_DRM_MM_H121.md` y `DRM_MM_RAM_FISICO_H121.md`.
+
+### Hitos 122–123 — Fibras, tareas y mutex originales adaptados (2026-10-08)
+
+* **H122:** fibras privadas, TLS por propietario y retención ante tareas bloqueadas. **H123:** accesores `current`/PID/estado, mutex fastpath y observer RAM. Validaciones host/QEMU; no son `copy_process`, `kthread`, scheduler Linux ni probe i915. Evidencias en `OS_experimental/i915/docs/intel/I915_EARLY_GRAPH_FIBRAS_20261008.md` e `I915_CURRENT_MUTEX_RAM_20261008.md`.
+
+### Hito 124 — Tareas, mutex bloqueante, completion/swait y preparación LAN (2026-10-08)
+
+* `task_struct` adaptado, mutex/wake_q/refcount originales, completion/swait y timers por RAM pasan las campañas indicadas en host/QEMU. La ISO H124 LAN fue copiada a Ventoy y verificada por SHA-256: `445306619699ea6a42eff40210df06e0e68a0a3f2e0f65b2a83015d5da5b1258`.
+
+* **Límite obligatorio:** la copia USB no es arranque físico. H124 quedó pendiente de arranque manual en el i7-8650U / 8086:5917; la GPU permanecía sin iniciar y no hay decode/3D ni servicios PCI/MMIO/DMA/IRQ para el módulo i915.
+
+* **Evidencia:** `OS_experimental/i915/build/h124-20261008-195441/`, `h124-kernel/`, `h124-lan-20261008-203221/`, `docs/intel/I915_TASKS_MUTEX_RAM_20261008.md` e `I915_COMPLETION_RAM_20261008.md`.
+
+---
+
+### Hitos 125 a 127 - Ping corregido, actualización por LAN y `early_probe` original de i915 en el i7 (2026-11-06)
+
+*Registrado por Claude. Los hitos 101 a 124 no están en este archivo. Detalle y hashes en
+`../planes/ESTADO_PLAN_I915.md`. Todo lo marcado físico se ejecutó en i7-8650U / 8086:5917 por LAN.*
+
+* **H125:** checksum IPv4 de la respuesta ICMP en orden de red: de 9/3000 pings a 3000/3000 (físico).
+  Contratos del runtime nativo reparados; el código anterior falla 10 comprobaciones de la regresión.
+* **Actualización por LAN:** `herramientas/intel/actualizar_taek.py` publica la ISO, verifica SHA-256,
+  cambia la predeterminada de Ventoy guardando copia y reinicia. H124 a H127 sin tocar la laptop, unos
+  42 s de reinicio. Sin vuelta atrás automática si un kernel no llega a conectar.
+* **H126:** `workqueue` original de Linux en módulo RAM: 147 comprobaciones, 3 ejecuciones físicas, heap
+  estable. Sin sus hooks se cuelga tras 22 comprobaciones (QEMU).
+* **H127:** `i915_driver_early_probe` original devuelve 0 en físico con identidad real, Kaby Lake y PCH
+  Sunrise Point-LP leído por PCI; `late_release` termina limpio; tres rondas con heap estable. Fallos de
+  memoria inyectados propagados sin colapso. **No se accede a ningún registro de la GPU, ni hay forcewake,
+  GGTT, DMA, firmware o IRQ: `intel estado` sigue NO INICIADO y no se decodifica nada.** Lo no alcanzado
+  son 141 trampas fatales con nombre, nunca un éxito simulado.
+* **Colapso con evidencia:** con stream activo el Huevo envía la evidencia y reinicia en lugar de apagar
+  (físico: colapso pedido y #PF real, vuelve solo en unos 49 s). Un cuelgue sin excepción no se cubre.
+* **Mensaje corregido:** el Huevo ya no afirma "HIPERVISOR RING -1 / INTERCEPCIÓN DE TRIPLE FAULT": no
+  había ninguna intercepción, solo la animación de cierre.
+* **Defecto de Linux hallado:** `drm_minor_alloc` de 6.6.78 pasa `ERR_PTR` a `put_device` si falla una
+  asignación concreta; en Linux sería un oops. La frontera lo avisa y continúa.
+* **Pendiente:** `i915_driver_mmio_probe`, primer contacto real con la GPU; incluye un reset de motores.
+  `github/` no cambia: conserva el fallo del ping y no se promueve nada de esto como estable.
+
+### Hito 128 - Registros reales y forcewake original de i915 en el i7 (2026-11-06)
+
+*Registrado por Claude, con el visto bueno del usuario para tocar la GPU. Físico en i7-8650U / 8086:5917
+por LAN. Detalle y hashes en `../planes/ESTADO_PLAN_I915.md`.*
+
+* **Lectura:** BAR0 mapeado sin permiso de escritura; la pantalla del firmware se lee 1920×1080 en GGTT 0.
+* **Forcewake:** primera escritura a la GPU desde código original de Linux. Render, GT y media acusan, el GT
+  despierta y responde, y al soltar por hrtimer los acuses vuelven a 0.
+* **Fusibles:** RCS0, BCS0, VCS0 y VECS0; 24 EU; reloj GT 12 MHz. Coherente con una UHD 620 GT2.
+* **Se corta antes de `sanitize_gpu`:** sin reset, GGTT, DMA, firmware, IRQ ni submission; no se decodifica
+  nada. Los registros de pantalla no cambian; la imagen física no se ha mirado.
+* **Ampliación, reset:** con otro visto bueno del usuario, `__intel_gt_reset(ALL_ENGINES)` original devuelve
+  0 en unos 99 µs. Una marca en `HWSTAM` de VCS0 se borra, lo que demuestra el efecto; el display sigue a 60 Hz
+  según su contador de fotogramas. Sin submission ni decodificación.
+* **Ampliación, GGTT (solo lectura):** 32 MiB robados en `0xcd800000`; pantalla en las entradas 0-2024. El
+  resto de la tabla tiene aspecto de memoria sin inicializar (inferencia): no es de fiar.
+
+### Hito 129 - Contenido de `i915_driver_hw_probe` en el i7, GGTT sin escribir (2026-11-06)
+
+*Registrado por Claude. Físico en i7-8650U / 8086:5917 por LAN. Detalle en `../planes/ESTADO_PLAN_I915.md`.*
+
+* **Probe:** `i915_ggtt_probe_hw`, `i915_ggtt_init_hw`, memoria robada, pcode y DRAM, en el orden original.
+  Tabla y apertura sin permiso de escritura; la huella de toda la GGTT no cambia.
+* **Pantalla:** la consola escribe por la apertura y la GGTT hasta la memoria robada: la entrada 0 sostiene
+  la imagen. Sigue a 60 Hz según su contador. La imagen física no se ha mirado.
+* **DMA:** solo con VT-d inactivo releído para la GPU; si no, error. La GPU aún no ha hecho ningún DMA.
+* **Corrección:** se dijo que `i915_ggtt_init_hw` era la primera escritura a la GGTT; es `init_ggtt`, que usaría
+  la dirección 0 si no se reserva antes. Hay que reservar la pantalla en la GGTT y en la memoria robada.
+* **Sin hacer:** escribir PTE, firmware, IRQ, submission, decodificación.
+* **Ampliación, primeras PTE:** con visto bueno del usuario, `i915_init_ggtt` original con la pantalla reservada
+  en la GGTT y en la memoria robada. Cambian 2 de 1 048 576 entradas, ninguna de la pantalla; sigue a 60 Hz según
+  su contador; al terminar se restauran y la huella vuelve a la original. La GPU aún no ha ejecutado nada.
+* **Correcciones:** Linux no limpia el resto de la GGTT en Gen8+, como yo había dicho, y `disable_display` no
+  deja el display fuera por sí solo.
+* **Ampliación, la GPU ejecuta:** con visto bueno del usuario, `i915_gem_init` original termina con `rc=0` en 120 ms
+  y los 4 motores (rcs0, bcs0, vcs0, vecs0) escriben en memoria un valor que la CPU verifica; primer DMA real. El
+  control negativo los detecta a todos. 20 000 trabajos verificados, sin crecimiento de memoria tras quedar ociosa.
+  Display fuera del driver; pantalla a 60 Hz según su contador. Imagen física no observada.
+* **Esto no es decodificar:** faltan batch buffers, recuperación de cuelgues, comandos de vídeo y la pila de usuario.
+  Es el i7-8650U / 5917, IRQ por sondeo, sin desmontaje, experimental: `github/` no cambia.
+* **Ampliación, batch y cuelgues:** batch en contexto propio con PPGTT correcto en los 4 motores. Un bucle infinito en
+  cada motor lo detecta y resetea el heartbeat original en unos 7 s, sin dejar la GPU inservible; después siguen
+  funcionando. M16 no se declara cerrado: falta desmontar el dispositivo.
+* **Medición:** Media Driver 3,39 M líneas frente a un núcleo H.264 de unas 5700 en `intel-vaapi-driver`, que declara 5917.
+  Falta decidir; ese núcleo no incluye todas sus dependencias y no se ha compilado.
+* **Decisión del usuario:** se sigue el plan (Media Driver, GmmLib y libva); `intel-vaapi-driver` queda descartado.
+* **Medición M17 en el PC, no en TAEK:** con solo KBL + AVC, `iHD_drv_video.so` enlaza: 601 unidades, 2,41 MB sin símbolos,
+  registra 5917. Pide 227 externos, sobre todo libc y libstdc++, y usa RTTI real. Evidencia `build/m17-medicion-20261106-113001/`.
+* **Ampliación, cierre y reapertura:** el dispositivo se desmonta en el orden original y vuelve a iniciarse, 3 ciclos con 2 cuelgues,
+  sin avisos de Linux. Tras cerrar: 0 páginas, 0 mapeos, pantalla intacta; memoria estable en 64 bloques. Guardas corregidas y con
+  control negativo (`gt-guarda`, 4 de 4). Las pruebas de M16 quedan superadas solo en el i7-8650U / 5917; IRQ por sondeo, sin
+  display en el driver y sin decodificar. Límites y correcciones en el Avance (10) del estado.
+* **Corrección:** el "+1 bloque tras los cuelgues" estaba mal atribuido: ya aparece antes de cualquier cuelgue y no crece.
+
+### Hito 130 - Decodificación H.264 por hardware con Media Driver real, en el i7 (2026-11-06)
+
+*Registrado por Claude. Físico en i7-8650U / 8086:5917 por LAN. Detalle y hashes en el Avance (11) de `../planes/ESTADO_PLAN_I915.md`. Experimental: `github/` no cambia.*
+
+* **Resultado:** los primeros 300 fotogramas del video de 1080p decodificados en el motor de video por `iHD_drv_video` 24.3.4 real, sobre i915 de Linux 6.6.78: 300 de 300 iguales bit a bit a FFmpeg por software, comparando un hash de cada fotograma. Unos 320-410 fps de GPU.
+* **Control negativo:** con un byte cambiado, el hardware informa `DECODING_ERROR` y el hash no coincide.
+* **Pantalla:** los 300 en orden a 24 fps, sin retrasos en la versión final. RGB por CPU. El usuario lo vio en la laptop: fluido y, en sus palabras, "se ve perfecto".
+* **Cómo:** Media Driver y GmmLib como objeto aislado en el módulo RAM, con ABI C++ real de libstdc++, libc mínima y trampas con nombre. Los `ioctl` entran por `drm_ioctl` original; la memoria del driver se ve como memoria de usuario gracias a un alias en la mitad baja, único cambio de kernel de H130.
+* **No hecho:** el video completo, audio, libva como tal, descarga del módulo sin reiniciar, cierre con el DRM abierto, regresión QEMU. Solo este equipo y este video.
+* **Errores míos corregidos en el camino:** dos errores en la autoprueba, tabla `vtable_prot` y `vaCreateSurfaces2` ausentes, y búferes VA sin destruir. Atribuí los reinicios fallidos al firmware; en el segundo la laptop estaba arrancada y solo faltaba el stream.
+
+### Hitos 131 y 132 - Reproductor H.264 por GPU desde archivo, batería y especificaciones (2026-11-06/07)
+
+*Registrado por Claude. Físico solo en i7-8650U / 8086:5917 (Dell Latitude 5490) por LAN. Detalle en el Avance (12) de `../planes/ESTADO_PLAN_I915.md`. Experimental: `github/` no cambia. Nada confirmado aún.*
+
+* **Qué hace ahora:** al abrir un H.264 en esta laptop lo decodifica la GPU. Cualquier otro equipo o GPU no probada usa el decodificador por software. Si la GPU falla a mitad, se retoma por software desde el último IDR.
+* **Comandos nuevos:** `reproducir <archivo>` y `abrir <número>` para ver un video; `reproducir prueba <archivo>` lo decodifica lo más rápido posible, sin esperar a su tiempo, y da motor y huella; `h264 motor auto` o `h264 motor software` eligen el motor; `dma` muestra la reserva de memoria; `bateria` y `especificaciones` dan los datos del equipo; `h264 gpu fallo preparar`, `h264 gpu fallo <n>` y `h264 gpu bloqueo <n>` provocan fallos de prueba.
+* **Medido por GPU desde archivo, huella igual a la de FFmpeg:** `c1080cortes` (288 cuadros, 4 cortes por cuadro), `d1080p60` (721), `a720main` (288), `b480base` (288), 360p (4350). Sin colapsos en esas pasadas.
+* **Videos reales del usuario, por GPU, solo lectura desde su USB de 116 GiB (`build/videos-generic-20261107-093114/`):** 7 de 7 sin fallos, sin alertas de memoria y sin caer a software.
+  * `Video 360p.mp4`: 4350 cuadros. `Video 1080p.mp4`: 4637 cuadros completos en 121 s. Ambos con huella igual a FFmpeg.
+  * Grabación de Genshin de 940 MB: 16001 cuadros en 1055 s. Es el archivo más grande probado hasta ahora.
+  * `cangrejo.mp4` (49), dos videos más de 720p y 1080p (1509 y 4189), `All Eyes On Me` (5535): completos, pero sin referencia de FFmpeg con la que comparar su huella.
+  * **Límite observado:** la grabación de 940 MB fue a unos 15 cuadros por segundo, 0,89 MB/s. La GPU y la copia solo suman 164 de esos 1055 s; la mayor parte del resto parece ser la lectura del USB, aunque también incluye el cálculo de huella. A esa velocidad no llegaría a tiempo real si la grabación es de 30 o 60 fps. Sin probar en reproducción normal.
+* **Respaldo:** con fallo inyectado al preparar, 360p por software con la misma huella. Fallo real de memoria en `c1080cortes`: siguió por software con la huella correcta.
+* **Batería, lectura real:** cargando, 29 %, 7,97 V, 27,6 W, salud 76 %. Para leerla, el firmware Dell exige escribir en dos registros del controlador embebido; solo se permite durante esas consultas. Falta comprobar el cambio al desconectar el cargador.
+* **Campaña completa PASS (`build/video-fisico-20261107-095630/`, kernel de las 03:48:25, arena de 128 MiB):**
+  * 9 videos de prueba y `v1080` entero por GPU, todos con huella igual a FFmpeg.
+  * `h264 motor software` da la misma huella que la GPU en `a720main` y `c1080cortes`: dos decodificadores independientes coinciden.
+  * Fallo inyectado en la muestra 100 de `a720main` y en la 500 de `d1080p60`: sigue por software y la huella del video completo es la de FFmpeg.
+  * GPU sin responder (`h264 gpu bloqueo 50`): sigue por software con la huella correcta y la GPU queda fuera hasta reiniciar, avisándolo. Tras los fallos inyectados la GPU sigue viva.
+  * Rechazados con motivo, sin colapso: entrelazado en GPU, y CAVLC en software.
+* **Reserva de 256 MiB para la GPU, a petición del usuario:** en esta laptop no hay un bloque contiguo de 256 MiB bajo 4 GiB, así que se añadió una segunda reserva por encima de 4 GiB solo para los objetos GEM (superficies y búferes del driver). Lo demás sigue en la reserva baja, que quedó en 128 MiB. Si un equipo no tiene RAM ahí, como QEMU, todo usa la baja. Campaña completa repetida con ella: PASS, mismas huellas (`build/video-fisico-20261107-101318/`). `dma` la muestra: pico de 37 MiB de 256 en esa campaña. ISO `build/h132-20261107-100706/taek-h132-bea25a76.iso`.
+* **La reproducción normal no daba tiempo real, y no era por la GPU (`build/normal-20261107-103612/`, `build/probar-io-20261107-104657/`):** el modo prueba no lo detectaba porque no espera al reloj ni al audio.
+  * Con lecturas USB de 4 KiB por comando, `Video 1080p.mp4` normal: 320 s para 193 s de video y 3114 cuadros tardíos. 273 de esos 320 s eran lectura, a 1,3 MB/s.
+  * Con `h264 io 128`: 193 s, 1 cuadro tardío. Lectura del archivo de 940 MB a 30 MB/s, y la misma huella en sus 16001 cuadros que con 4 KiB.
+  * El valor 4 estaba puesto como referencia de comparación y nunca se cambió. Ahora el valor por defecto es 64 KiB, por prudencia con memorias USB antiguas.
+  * La grabación de 940 MB normal, a 128 KiB: 16001 cuadros en 353 s y 3219 tardíos, unos 45 cuadros por segundo. El reparto: lectura 81 s, color 107 s, copia desde la GPU 88 s, GPU 46 s. No mantiene tiempo real a esa resolución y frecuencia; la GPU no es el límite.
+  * **Sin corregir:** una sola ventana de 1 MiB para video y audio hace leer unas 4 veces de más (376 MB para un archivo de 85 MB, 520 saltos). Ya no impide el tiempo real a 1080p.
+  * **Sin explicar:** tres reproducciones normales con 4 KiB acabaron en "No se pudo completar", una de ellas por software, y no se pudo ver el motivo porque el informe se perdió en el stream. Añadí la línea `[VIDEO_T]` para verlo. No se ha repetido en las pruebas posteriores.
+* **Validación final con lecturas de 64 KiB (`build/final-20261107-110751/`, `build/video-fisico-20261107-110944/`):** campaña completa PASS. `Video 1080p.mp4` normal: 193 s y 3 cuadros tardíos. `All Eyes On Me` normal: 184 s y 2 tardíos. La grabación de 940 MB no se repitió a 64 KiB. ISO `build/h132-20261107-110513/taek-h132-217946f5.iso`, SHA-256 `4738d811ba03c0196086ac5854037b86a4d0d2c16f1d8365c742e5b23c6833f4`.
+* **Comprobado por el usuario en la laptop:** vio la reproducción normal y dijo que "ya se vio bien". Las dos reproducciones canceladas a los 5 s fueron cosa suya, con el teclado, no un fallo. No dijo nada del audio.
+* **Sin hacer:** regresión de vectores con el cliente nuevo. Una película de más de unos 70 minutos podría exceder el búfer de índice de 2 MiB; es una estimación, sin probar.
+* **Errores míos:**
+  * Sugerí un cuelgue de la GPU en reposo: era que se acabó la batería.
+  * Dije que 1080p por GPU estaba sin probar: en H130 ya se habían decodificado 300 fotogramas.
+  * Atribuí el fallo de 1080p solo a una reserva pequeña: 1080p cabe en 32 MiB si es lo primero que se reproduce. La causa probable es que los búferes del video anterior siguen ocupando memoria hasta que empieza el siguiente.
+  * Dejé este registro para el final; el usuario tuvo que preguntar por él.
+* **Reinicio con la ISO anterior:** el primer reinicio tras instalar arrancó la ISO de las 03:35. El usuario indicó que fue cosa suya, así que no se investigó más.
+* **Limpieza con permiso del usuario:** el disco `C:` del PC se llenó. Se borraron 17 carpetas intermedias de compilación, con inventario en `build/borrado-compilaciones-20261107.txt`. Del USB Kingston se borraron ISOs intermedias de esta noche que tenían copia en el PC, aunque la copia de algunas (como `h131-3f81…`) se borró después con esas carpetas.
+* **Error antiguo sin corregir:** `exfat_transfer.c` usa `<nombre>.part` durante la subida y no sabe seguir en otro sector del directorio, de ahí el código 21. Se evitó con un nombre de ISO más corto (`taek-h132-21cf02a9.iso`).

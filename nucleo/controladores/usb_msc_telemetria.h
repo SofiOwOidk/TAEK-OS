@@ -13,8 +13,8 @@
 // y la suma de las fases 0..4 es exactamente la fase TOTAL.
 enum usb_msc_fase {
     USB_MSC_FASE_CBW = 0,       // submit CBW -> CBW completado
-    USB_MSC_FASE_DATA_INICIO,   // CBW completado -> primer DATA recibido
-    USB_MSC_FASE_DATA_RESTO,    // primer DATA -> DATA completado (incluye copia)
+    USB_MSC_FASE_DATA_INICIO,   // CBW completado -> TD DATA completo (H99)
+    USB_MSC_FASE_DATA_RESTO,    // TD completo -> copia de datos terminada (H99)
     USB_MSC_FASE_CSW,           // DATA completado -> CSW recibido
     USB_MSC_FASE_RETORNO,       // CSW recibido -> retorno al caller (validacion)
     USB_MSC_FASE_TOTAL,         // submit CBW -> retorno al caller

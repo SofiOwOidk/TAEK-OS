@@ -2,6 +2,7 @@
 #define LINUX_I915_TAREAS_H
 
 #include "linux_types.h"
+#include "cpu_runtime.h"
 
 // ----------------------------------------------------------------------------
 // ESTADOS DE TAREA (semántica Linux: RUNNING = ejecutable o ejecutándose)
@@ -10,9 +11,33 @@
 #define TASK_INTERRUPTIBLE    1
 #define TASK_UNINTERRUPTIBLE  2
 #define TASK_DEAD             3
+#define TASK_RESERVADA        4
 
-#define I915_MAX_CPU          4
 #define TASK_STACK_SIZE_BYTES (64 * 1024) // 64 KiB de pila real por tarea
+
+/* Exact assembly boundaries, before any C prologue/epilogue. An optional
+ * trace belongs to the saved frame, so it resumes on the same CPU stack.
+ * FXSAVE64 covers x87/MMX, MXCSR and XMM0..15. Native FS base is saved;
+ * static ELF TLS only, no dynamic-module TLS or YMM/ZMM claim. */
+struct i915_contexto_traza {
+    uint64_t entrada_rsp, salida_rsp;
+    uint64_t rbp, rbx, r12, r13, r14, r15;
+};
+struct i915_contexto_marco {
+    uint8_t fpu[512] __attribute__((aligned(16)));
+    void *registros_rsp;
+    uint64_t fs_base;
+    uint64_t irq_flags,reservado;
+    struct i915_contexto_traza *traza;
+    uint64_t r15,r14,r13,r12,rbx,rbp;
+    void (*entrada)(void);
+};
+/* irq_flags=0 toma IF hardware; el scheduler pasa el estado previo al
+ * cerrojo, manteniendo IRQ deshabilitadas hasta el retorno del destino. */
+void i915_cambiar_contexto(void **desde,void *hacia,struct i915_contexto_traza *traza,uint64_t irq_flags);
+struct i915_contexto_marco *i915_contexto_preparar(void *stack,size_t bytes,
+                                                void (*entrada)(void),uint64_t r12);
+int i915_contexto_sse2_listo(void);
 
 struct task_struct {
     int                 id;
@@ -20,6 +45,7 @@ struct task_struct {
     void               *stack_base;
     size_t              stack_size;
     void               *rsp;        /* contexto guardado (sólo el planificador) */
+    void               *tls_base;   /* TCB propio nativo; NULL en pruebas host */
     void              (*fn)(void *);
     void               *data;
     const char         *name;
@@ -38,7 +64,6 @@ struct i915_cpu {
 // ----------------------------------------------------------------------------
 // PLANIFICADOR COOPERATIVO CON CAMBIO DE CONTEXTO REAL
 // ----------------------------------------------------------------------------
-void                i915_tareas_iniciar(void);
 struct task_struct *i915_tarea_actual(void);
 struct task_struct *i915_tarea_crear(void (*fn)(void *), void *data,
                                      const char *name, unsigned cpu);
@@ -49,12 +74,8 @@ void                i915_tarea_ceder(void);
 void                i915_schedule(void);
 void                i915_tarea_terminar(void);
 
-/* Selección de CPU lógica para el planificador que llama (BSP/AP o test). */
-void                i915_scheduler_cpu(unsigned cpu);
-unsigned            i915_scheduler_cpu_actual(void);
-/* Núcleo: asocia un slot lógico (0..3) a un APIC id para que cada CPU tenga su
- * propio estado; en host es no-op (el selector es TLS por hilo). */
-void                i915_scheduler_registrar_cpu(unsigned slot, unsigned apic_id);
+/* Registro/seleccion en cpu_runtime.h: nativo rechaza CPU desconocida,
+ * cambios de slot y IDs duplicados. Host selecciona CPU logica por hilo. */
 struct task_struct *i915_cpu_actual(unsigned cpu);
 struct i915_cpu   *i915_cpu_estado(unsigned cpu);
 
@@ -101,29 +122,35 @@ typedef struct wait_queue_head {
 #define DECLARE_WAIT_QUEUE_HEAD(name) \
     wait_queue_head_t name = { SPIN_LOCK_UNLOCKED, { &(name).head, &(name).head } }
 
+/* Contrato Linux: wake_up despierta a todos los no exclusivos y a un exclusivo. */
+#define WQ_FLAG_EXCLUSIVE 0x01
+
 #define init_waitqueue_head i915_init_waitqueue_head
 #define prepare_to_wait     i915_prepare_to_wait
+#define prepare_to_wait_exclusive i915_prepare_to_wait_exclusive
 #define finish_wait         i915_finish_wait
 #define wake_up             i915_wake_up
 #define wake_up_all         i915_wake_up_all
 
 void i915_init_waitqueue_head(wait_queue_head_t *q);
 void i915_prepare_to_wait(wait_queue_head_t *q, wait_queue_entry_t *entry, int state);
+void i915_prepare_to_wait_exclusive(wait_queue_head_t *q, wait_queue_entry_t *entry, int state);
 void i915_finish_wait(wait_queue_head_t *q, wait_queue_entry_t *entry);
 void i915_wake_up(wait_queue_head_t *q);
 void i915_wake_up_all(wait_queue_head_t *q);
 
 /* ------------------------------------------------------------------------- */
-/* WORKQUEUES (ciclo de vida PENDING/RUNNING, cancelación y flush)           */
+/* WORKQUEUES (ciclo de vida, cancelación y flush). Como en Linux, el callback  */
+/* puede liberar su propio trabajo: tras llamarlo, el worker no lo desreferencia.*/
 /* ------------------------------------------------------------------------- */
-#define WORK_STRUCT_PENDING_BIT 0
-#define WORK_STRUCT_RUNNING_BIT 1
+#define WORK_STRUCT_PENDING_BIT   0
+#define WORK_STRUCT_CANCELING_BIT 1  /* cancel_work_sync en curso: rechaza encolar */
 
 struct work_struct;
 typedef void (*work_func_t)(struct work_struct *work);
 
 struct work_struct {
-    atomic_t                 data;   /* bit 0 PENDING, bit 1 RUNNING */
+    atomic_t                 data;   /* bit 0 PENDING, bit 1 CANCELING */
     struct list_head         entry;
     work_func_t              func;
     struct workqueue_struct *wq;
@@ -141,6 +168,7 @@ struct workqueue_struct {
     spinlock_t          lock;
     struct list_head    work_list;
     struct task_struct *worker_task;
+    struct work_struct *current_work;  /* en ejecucion; solo se compara, nunca se desreferencia */
     wait_queue_head_t   wait_idle;
     atomic_t            active_jobs;   /* en cola o ejecutándose */
     atomic_t            pending;       /* encolados sin ejecutar */

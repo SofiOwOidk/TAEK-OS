@@ -1,8 +1,12 @@
 #include "fat_lector.h"
+#include "fat_operaciones.h"
+#include "fat32_transfer.h"
+#include "exfat_transfer.h"
 #include "teclado.h"
 #include "xhci.h"
 #include "audio_ac97.h"
 #include "vfs.h"
+#include "archivo_comando.h"
 #include "fat32.h"
 #include "exfat.h"
 #include "ntfs.h"
@@ -24,6 +28,7 @@ static struct particiones g_particiones;
 static struct particion g_particion_activa;
 static int g_error_volumen,g_desconectado;
 static char g_ruta_catalogo[4096];
+static struct {struct particion origen;char ruta[4096];int valido;} g_portapapeles;
 static struct vfs_catalogo g_catalogo_vfs = {0};
 
 // --- TABLA DE DESCRIPTORES DE ARCHIVO (Hito 68) ---
@@ -44,6 +49,7 @@ static uint32_t vfs_generacion_siguiente(uint32_t actual) {
 }
 
 void vfs_iniciar(void) {
+    g_portapapeles.valido=0;
     g_tipo_activo = VFS_FS_NINGUNO;
     g_catalogo_vfs.total = 0;
     fat32_iniciar();
@@ -461,6 +467,90 @@ int vfs_crear_archivo(const char *nombre, const char *contenido) {
 int vfs_crear_directorio(const char *nombre) {
     (void)nombre;return VOLUMEN_SOLO_LECTURA;
 }
+static int vfs_operar_archivo(const char *origen,const char *destino,enum fat_operacion op){
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    if(fat32_transfer_activo() || exfat_transfer_activo())return VOLUMEN_OCUPADO;
+    for(unsigned i=0;i<VFS_MAX_FDS;i++)if(g_descriptores[i].en_uso)return VOLUMEN_OCUPADO;
+    g_cancelacion_lectura=0;
+    int r=fat_operar_archivo(&g_particion_activa,origen,destino,op);
+    struct fat_lector_volumen *v=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:g_tipo_activo==VFS_FS_EXFAT?&fat_lector_exfat:0;
+    if(v){memset(v->fat_valido,0,sizeof(v->fat_valido));v->bitmap_pagina=UINT64_MAX;v->bitmap.parcial_valido=0;}
+    if(!r)vfs_limpiar_catalogo();g_error_volumen=r;return r;
+}
+int vfs_mover_archivo(const char *origen,const char *destino){return vfs_operar_archivo(origen,destino,FAT_OPERACION_MOVER);}
+int vfs_copiar_archivo(const char *origen,const char *destino){return vfs_operar_archivo(origen,destino,FAT_OPERACION_COPIAR);}
+int vfs_eliminar_archivo(const char *ruta){return vfs_operar_archivo(ruta,0,FAT_OPERACION_ELIMINAR);}
+int vfs_copiar_portapapeles(const char *ruta){
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    if(g_tipo_activo!=VFS_FS_FAT32 && g_tipo_activo!=VFS_FS_EXFAT)return VOLUMEN_SOLO_LECTURA;
+    enum vfs_tipo_nodo tipo;int r=vfs_consultar_ruta(ruta,&tipo);if(r)return r;
+    if(tipo!=VFS_NODO_ARCHIVO)return VOLUMEN_NO_SOPORTADO;
+    size_t n=0;while(ruta[n])n++;if(n>=sizeof(g_portapapeles.ruta))return VOLUMEN_NOMBRE_INVALIDO;
+    g_portapapeles.origen=g_particion_activa;memcpy(g_portapapeles.ruta,ruta,n+1);g_portapapeles.valido=1;return 0;
+}
+int vfs_pegar_portapapeles(const char *destino){
+    if(!g_portapapeles.valido)return VOLUMEN_NO_ENCONTRADO;
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    if(fat32_transfer_activo() || exfat_transfer_activo())return VOLUMEN_OCUPADO;
+    for(unsigned i=0;i<VFS_MAX_FDS;i++)if(g_descriptores[i].en_uso)return VOLUMEN_OCUPADO;
+    if(g_tipo_activo!=VFS_FS_FAT32 && g_tipo_activo!=VFS_FS_EXFAT)return VOLUMEN_SOLO_LECTURA;
+    char *ruta=asignar_memoria(4096),*final=asignar_memoria(4096);int r=VOLUMEN_SIN_MEMORIA;
+    if(!ruta || !final)goto fin;
+    if(archivo_ruta(vfs_obtener_ruta_catalogo(),destino && *destino?destino:".",ruta,4096)){r=VOLUMEN_NOMBRE_INVALIDO;goto fin;}
+    enum vfs_tipo_nodo tipo;r=vfs_consultar_ruta(ruta,&tipo);
+    if(r && r!=VOLUMEN_NO_ENCONTRADO)goto fin;
+    size_t len=0;while(ruta[len])len++;
+    if((!r && tipo==VFS_NODO_DIRECTORIO) || (len && (ruta[len-1]=='/' || ruta[len-1]=='\\'))){
+        if(r){r=VOLUMEN_NO_ENCONTRADO;goto fin;}
+        const char *name=g_portapapeles.ruta;for(const char *p=name;*p;p++)if(*p=='/' || *p=='\\')name=p+1;
+        if(archivo_ruta(ruta,name,final,4096)){r=VOLUMEN_NOMBRE_INVALIDO;goto fin;}
+    }else memcpy(final,ruta,len+1);
+    r=fat_operar_entre(&g_portapapeles.origen,g_portapapeles.ruta,&g_particion_activa,final,0);
+    struct fat_lector_volumen *v=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:&fat_lector_exfat;
+    memset(v->fat_valido,0,sizeof(v->fat_valido));v->bitmap_pagina=UINT64_MAX;v->bitmap.parcial_valido=0;
+    if(!r)vfs_limpiar_catalogo();
+fin:
+    if(ruta)liberar_memoria(ruta);if(final)liberar_memoria(final);g_error_volumen=r;return r;
+}
+int vfs_operar_entre_discos(const char *origen,const char *destino,int mover){
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    if(fat32_transfer_activo() || exfat_transfer_activo())return VOLUMEN_OCUPADO;
+    for(unsigned i=0;i<VFS_MAX_FDS;i++)if(g_descriptores[i].en_uso)return VOLUMEN_OCUPADO;
+    uint8_t unidad;unsigned numero;const char *ruta;
+    if(archivo_disco(destino,&unidad,&numero,&ruta)!=1)return VOLUMEN_NOMBRE_INVALIDO;
+    struct particiones *tabla=asignar_memoria(sizeof(*tabla));
+    struct fat_lector_volumen *vol=asignar_memoria_cero(sizeof(*vol));
+    struct fat_lector_nodo *nodo=asignar_memoria(sizeof(*nodo));
+    char *final=asignar_memoria(4096);int r=VOLUMEN_SIN_MEMORIA;
+    if(!tabla || !vol || !nodo || !final)goto fin;
+    r=particiones_descubrir(unidad,tabla);if(r)goto fin;
+    const struct particion *dest=0;
+    for(unsigned i=0;i<tabla->total;i++)if(tabla->entradas[i].numero==numero){dest=&tabla->entradas[i];break;}
+    if(!dest){r=VOLUMEN_NO_ENCONTRADO;goto fin;}
+    if(dest->resultado){r=dest->resultado;goto fin;}
+    if(dest->formato!=VOLUMEN_FAT32 && dest->formato!=VOLUMEN_EXFAT){r=VOLUMEN_SOLO_LECTURA;goto fin;}
+    r=fat_lector_montar(vol,dest);if(r)goto fin;
+    r=fat_lector_resolver(vol,ruta,nodo,0);
+    if(r && r!=VOLUMEN_NO_ENCONTRADO)goto fin;
+    size_t len=0;while(ruta[len])len++;
+    if((!r && nodo->directorio) || (len && (ruta[len-1]=='/' || ruta[len-1]=='\\'))){
+        if(r){r=VOLUMEN_NO_ENCONTRADO;goto fin;}
+        const char *nombre=origen;for(const char *p=origen;*p;p++)if(*p=='/' || *p=='\\')nombre=p+1;
+        if(archivo_ruta(ruta,nombre,final,4096)){r=VOLUMEN_NOMBRE_INVALIDO;goto fin;}
+    }else{
+        if(len>=4096){r=VOLUMEN_NOMBRE_INVALIDO;goto fin;}memcpy(final,ruta,len+1);
+    }
+    g_cancelacion_lectura=0;
+    r=fat_operar_entre(&g_particion_activa,origen,dest,final,mover);
+    if(!r || r==VOLUMEN_COPIA_CONSERVADA){
+        struct fat_lector_volumen *actual=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:g_tipo_activo==VFS_FS_EXFAT?&fat_lector_exfat:0;
+        if(actual){memset(actual->fat_valido,0,sizeof(actual->fat_valido));actual->bitmap_pagina=UINT64_MAX;actual->bitmap.parcial_valido=0;}
+        vfs_limpiar_catalogo();
+    }
+fin:
+    if(vol){fat_lector_desmontar(vol);liberar_memoria(vol);}if(nodo)liberar_memoria(nodo);if(tabla)liberar_memoria(tabla);if(final)liberar_memoria(final);
+    g_error_volumen=r;return r;
+}
 const struct particiones *vfs_obtener_particiones(void){return &g_particiones;}
 unsigned vfs_obtener_particion_activa(void){return g_particion_activa.numero;}
 int vfs_ultimo_error(void){return g_error_volumen;}
@@ -500,7 +590,8 @@ int vfs_montar_particion(uint8_t unidad,unsigned numero){
     }
     p->resultado=g_error_volumen;if(g_error_volumen)goto fallo;
     g_particion_activa=*p;g_tipo_activo=(enum vfs_tipo_fs)p->formato;g_desconectado=0;
-    consola_imprimir("USB ");consola_imprimir_dec(unidad);consola_imprimir(" · Particion ");consola_imprimir_dec(p->numero);consola_imprimir(" · ");consola_imprimir(vfs_obtener_nombre_fs());consola_imprimir_linea(" · Solo lectura");
+    consola_imprimir("USB ");consola_imprimir_dec(unidad);consola_imprimir(" · Particion ");consola_imprimir_dec(p->numero);consola_imprimir(" · ");consola_imprimir(vfs_obtener_nombre_fs());
+    consola_imprimir_linea(p->formato==VOLUMEN_FAT32 || p->formato==VOLUMEN_EXFAT?" · Archivos: mover/copiar/eliminar":" · Solo lectura");
     if(p->formato==VOLUMEN_EXFAT && fat_lector_exfat.respaldo)consola_imprimir_linea(fat_lector_exfat.respaldo==1?"Recuperacion de lectura: se usa el arranque de respaldo; disco sin reparar.":"Arranque principal valido; respaldo invalido, sin reparacion.");
     return 0;
 fallo:

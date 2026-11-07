@@ -6,6 +6,9 @@ static char g_kernel_log[KERNEL_LOG_TAMANO];
 static uint32_t g_log_cursor = 0;
 static uint64_t g_log_total_bytes = 0;
 static unsigned char g_log_lock;
+static char g_uart_cola[65536];
+static uint32_t g_uart_inicio,g_uart_total;
+static uint64_t g_uart_perdidos;
 
 static uint64_t serial_log_bloquear(void) {
     uint64_t flags = 0;
@@ -56,6 +59,15 @@ int serial_esta_activo(void) {
 static inline int serial_transmisor_vacio(void) {
     return leer_puerto_b(PUERTO_COM1 + 5) & 0x20;
 }
+// FIFO 16550 habilitada por serial_iniciar: vaciar hasta 16 bytes sin espera.
+// El log RAM conserva toda la salida aun cuando una UART lenta pierda bytes.
+static void uart_atender_bloqueado(void){
+    if(!g_serial_listo || !g_uart_total || !serial_transmisor_vacio())return;
+    unsigned n=g_uart_total>16?16:g_uart_total;
+    while(n--){escribir_puerto_b(PUERTO_COM1,(uint8_t)g_uart_cola[g_uart_inicio]);g_uart_inicio=(g_uart_inicio+1)%sizeof(g_uart_cola);g_uart_total--;}
+}
+void serial_atender(void){uint64_t flags=serial_log_bloquear();uart_atender_bloqueado();serial_log_desbloquear(flags);}
+uint64_t serial_uart_perdidos(void){uint64_t flags=serial_log_bloquear();uint64_t n=g_uart_perdidos;serial_log_desbloquear(flags);return n;}
 
 int serial_hay_datos(void) {
     if (!g_serial_listo) return 0;
@@ -76,17 +88,13 @@ void serial_escribir_caracter(char c) {
     g_log_total_bytes++;
     // No escribir un terminador sobre bytes retenidos cuando el anillo esta lleno.
     if (g_log_total_bytes < KERNEL_LOG_TAMANO - 1) g_kernel_log[g_log_cursor] = '\0';
-    serial_log_desbloquear(flags);
-
-    // Si no hay chip UART físico activo (modo dmesg en RAM), no perder ciclos sondeando puertos I/O
-    if (!g_serial_listo) return;
-
-    // 2. Transmisión física por UART COM1 con límite de tiempo para no colgar el CPU en placas sin chip serial
-    uint32_t timeout = 50000;
-    while ((serial_transmisor_vacio() == 0) && (--timeout > 0));
-    if (timeout > 0) {
-        escribir_puerto_b(PUERTO_COM1, (uint8_t)c);
+    uart_atender_bloqueado();
+    if(g_serial_listo){
+        if(g_uart_total<sizeof(g_uart_cola)){g_uart_cola[(g_uart_inicio+g_uart_total)%sizeof(g_uart_cola)]=c;g_uart_total++;}
+        else g_uart_perdidos++;
+        uart_atender_bloqueado();
     }
+    serial_log_desbloquear(flags);
 }
 
 void serial_imprimir(const char *texto) {
@@ -133,6 +141,31 @@ const char *serial_obtener_log_buffer(uint32_t *tamano_out, uint32_t *cursor_out
     if (tamano_out) *tamano_out = g_log_total_bytes >= KERNEL_LOG_TAMANO - 1 ? KERNEL_LOG_TAMANO - 1 : (uint32_t)g_log_total_bytes;
     if (cursor_out) *cursor_out = g_log_cursor;
     return g_kernel_log;
+}
+
+uint64_t serial_log_posicion(void) {
+    uint64_t flags = serial_log_bloquear();
+    uint64_t total = g_log_total_bytes;
+    serial_log_desbloquear(flags);
+    return total;
+}
+
+uint32_t serial_leer_desde(uint64_t *cursor, void *salida, uint32_t capacidad, uint64_t *perdidos) {
+    if (!cursor || !salida || !capacidad) return 0;
+    uint64_t flags = serial_log_bloquear();
+    uint64_t primero = g_log_total_bytes > KERNEL_LOG_TAMANO - 1 ?
+        g_log_total_bytes - (KERNEL_LOG_TAMANO - 1) : 0;
+    uint64_t perdido = *cursor < primero ? primero - *cursor : 0;
+    if (*cursor < primero) *cursor = primero;
+    if (*cursor > g_log_total_bytes) *cursor = g_log_total_bytes;
+    uint64_t disponibles = g_log_total_bytes - *cursor;
+    uint32_t n = disponibles < capacidad ? (uint32_t)disponibles : capacidad;
+    for (uint32_t i = 0; i < n; ++i)
+        ((char *)salida)[i] = g_kernel_log[(*cursor + i) % (KERNEL_LOG_TAMANO - 1)];
+    *cursor += n;
+    if (perdidos) *perdidos = perdido;
+    serial_log_desbloquear(flags);
+    return n;
 }
 
 int serial_copiar_log(char *salida, uint32_t capacidad, uint64_t *total, uint64_t *perdidos) {

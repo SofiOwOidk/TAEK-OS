@@ -83,7 +83,7 @@ static void emitir_2dec(uint64_t valor_x100, int serial) {
 }
 
 static const char *g_nombres_fase[USB_MSC_FASE_CANTIDAD] = {
-    "CBW", "DATA_INICIO", "DATA_RESTO", "CSW", "RETORNO", "TOTAL"
+    "CBW", "DATA_TD", "COPIA", "CSW", "RETORNO", "TOTAL"
 };
 
 static void emitir_informe(int serial) {

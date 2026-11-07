@@ -23,7 +23,7 @@ struct page {
     void       *bloque;     /* base real de la asignación (sólo en la cabeza) */
 };
 
-static inline void get_page(struct page *page) { if (page && page->estado) atomic_inc(&page->refcount); }
+void get_page(struct page *page);
 void put_page(struct page *page);
 
 int  i915_page_pin(struct page *page);

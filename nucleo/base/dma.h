@@ -41,4 +41,20 @@ void  dma_obtener_estadisticas(dma_estadisticas_t *est);
 // Autodiagnóstico riguroso de continuidad física, sincronización de caché y canarios de memoria
 int   dma_ejecutar_autodiagnostico(void);
 
+// --- ARENA DE OBJETOS DE LA GPU ---
+// Opcional, por encima de 4 GiB: solo para quien admita direcciones de más de 32 bits. No hay página
+// asociada ni limpieza: el dueño decide. Sin arena, o sin hueco, asignar devuelve 0.
+typedef struct {
+    uint64_t base;
+    uint64_t tamano_bytes;
+    uint32_t paginas_en_uso;
+    uint32_t paginas_pico;
+    uint32_t asignaciones_activas;
+} dma_gpu_estadisticas_t;
+
+uint64_t dma_gpu_asignar(uint32_t paginas);
+int      dma_gpu_es_suya(uint64_t dir_fisica);
+int      dma_gpu_liberar(uint64_t dir_fisica, uint32_t paginas);
+void     dma_gpu_obtener_estadisticas(dma_gpu_estadisticas_t *est);
+
 #endif // BASE_DMA_H

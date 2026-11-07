@@ -27,6 +27,7 @@ int intel_inventario_detectar(struct intel_gpu_info *salida, int max_dispositivo
         }
 
         info->detectado       = 1;
+        info->iommu_dma_directo_observado = -1;
         info->bus             = dev->bus;
         info->ranura          = dev->ranura;
         info->funcion         = dev->funcion;
@@ -99,6 +100,19 @@ int intel_inventario_detectar(struct intel_gpu_info *salida, int max_dispositivo
             info->iommu_modo              = (uint32_t)iommu->modo_operacion;
             info->iommu_traduccion_activa = (iommu->modo_operacion == IOMMU_MODO_VT_D_TRADUCCION_ACTIVA);
             info->conteo_rmrr             = iommu->conteo_rmrr;
+            /* PCI actual enumera segmento 0. Bus 0 es raiz conocida; no
+             * inventar una ruta de un solo salto para dispositivos tras puentes. */
+            if (dev->bus == 0) {
+                iommu_ruta_pci_t ruta = {.segmento = 0, .bus_raiz = 0, .conteo_pasos = 1,
+                    .pasos = {{dev->ranura, dev->funcion}}};
+                uint32_t idx;
+                if (!iommu_drhd_por_ruta(iommu, &ruta, &idx)) {
+                    info->iommu_unidad_identificada = 1;
+                    info->iommu_indice_drhd = idx;
+                    info->iommu_mmio_fisica = iommu->drhd[idx].mmio_fisica;
+                    info->iommu_dma_directo_observado = iommu_dma_directo_observado(iommu, &ruta, &idx);
+                }
+            }
         }
 
         encontrados++;
@@ -213,6 +227,17 @@ void intel_inventario_imprimir_h0(void) {
         serial_imprimir(" RMRR_REGIONES=");
         serial_imprimir_dec(g->conteo_rmrr);
         serial_imprimir_linea("");
+
+        serial_imprimir("[INTEL_H0] DRHD_DISPOSITIVO=");
+        serial_imprimir_dec(g->iommu_unidad_identificada);
+        if (g->iommu_unidad_identificada) {
+            serial_imprimir(" INDICE="); serial_imprimir_dec(g->iommu_indice_drhd);
+            serial_imprimir(" MMIO="); serial_imprimir_hex(g->iommu_mmio_fisica);
+            serial_imprimir(" TES_ESTADO=");
+            serial_imprimir(g->iommu_dma_directo_observado < 0 ? "DESCONOCIDO" :
+                g->iommu_dma_directo_observado ? "INACTIVO" : "ACTIVO");
+        }
+        serial_imprimir_linea(" DMA_BUFFERS_ACREDITADOS=0");
 
         serial_imprimir_linea("[INTEL_H0] BACKEND_READY=0 STAGE=H0");
 

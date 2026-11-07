@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "../../base/huevo.h"
 #include "serial.h"
+#include "../../compatibilidad/linux_i915/cpu_runtime.h"
 
 extern void *tabla_trampas[256];
 extern void apic_despachar_irq(struct marco_interrupcion *marco);
@@ -41,6 +42,11 @@ void idt_cargar_cpu(void) {
     __asm__ volatile("lidt %0"::"m"(g_puntero_idt):"memory");
 }
 static manejador_irq_fn   g_manejadores_irq[256];
+static unsigned g_profundidad_irq[I915_MAX_CPU];
+int idt_en_interrupcion(void){
+    unsigned cpu=i915_scheduler_cpu_actual();
+    return cpu>=I915_MAX_CPU || __atomic_load_n(&g_profundidad_irq[cpu],__ATOMIC_RELAXED)!=0;
+}
 
 static void idt_configurar_puerta(int num, uint64_t dir_manejador) {
     g_idt[num].manejador_bajo  = (uint16_t)(dir_manejador & 0xFFFF);
@@ -65,24 +71,36 @@ void idt_iniciar(void) {
 }
 
 void idt_registrar_manejador(uint8_t vector, manejador_irq_fn manejador) {
-    g_manejadores_irq[vector] = manejador;
+    __atomic_store_n(&g_manejadores_irq[vector],manejador,__ATOMIC_RELEASE);
+}
+int idt_reservar_manejador(uint8_t vector,manejador_irq_fn manejador){
+    if(vector<32 || !manejador)return -1;
+    manejador_irq_fn expected=0;
+    return __atomic_compare_exchange_n(&g_manejadores_irq[vector],&expected,manejador,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)?0:-1;
+}
+int idt_liberar_manejador(uint8_t vector,manejador_irq_fn manejador){
+    if(vector<32 || !manejador)return -1;
+    return __atomic_compare_exchange_n(&g_manejadores_irq[vector],&manejador,0,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)?0:-1;
 }
 
 void despachador_interrupciones(struct marco_interrupcion *marco) {
+    unsigned cpu=i915_scheduler_cpu_actual();
+    if(cpu<I915_MAX_CPU)__atomic_fetch_add(&g_profundidad_irq[cpu],1,__ATOMIC_RELAXED);
     if (marco->num_interrupcion < 32) {
         // Excepción de CPU: invocar autopsia forense de El Huevo
         const char *nombre = g_nombres_excepciones[marco->num_interrupcion];
         huevo_quebrar_con_marco(nombre, marco);
+        if(cpu<I915_MAX_CPU)__atomic_fetch_sub(&g_profundidad_irq[cpu],1,__ATOMIC_RELAXED);
         return;
     }
 
     // Interrupción de hardware o APIC (vector >= 32)
-    if (g_manejadores_irq[marco->num_interrupcion]) {
-        g_manejadores_irq[marco->num_interrupcion](marco);
-    }
+    manejador_irq_fn handler=__atomic_load_n(&g_manejadores_irq[marco->num_interrupcion],__ATOMIC_ACQUIRE);
+    if(handler)handler(marco);
 
     // Notificar al subsistema APIC para estadísticas y EOI
     apic_despachar_irq(marco);
+    if(cpu<I915_MAX_CPU)__atomic_fetch_sub(&g_profundidad_irq[cpu],1,__ATOMIC_RELAXED);
 }
 
 void idt_corromper_para_harakiri(void) {

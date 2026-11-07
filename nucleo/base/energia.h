@@ -5,5 +5,6 @@
 
 void apagar_equipo(void) __attribute__((noreturn));
 void detener_cpu(void) __attribute__((noreturn));
+void reiniciar_equipo(void) __attribute__((noreturn));
 
 #endif // BASE_ENERGIA_H
