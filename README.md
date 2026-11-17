@@ -20,10 +20,12 @@
 | **Programas de Anillo 3** | Compositor, escritorio y menú; apps cargadas del USB sin reiniciar (`ejecutar /app.elf`) | Probado en el i7 |
 | **Apps incluidas** | Navegador (HTTPS/TLS 1.3), NekoTube (video), explorador de archivos, imágenes, música, videos, terminal, ventanas Aero y menú rápido estilo cyberpunk | Probado en el i7 |
 | **Video** | H.264/MP4 por **software** (SSE2, multinúcleo) y por **GPU Intel** con el `i915` de Linux 6.6.78 + Media Driver (cae a software si falla) | GPU: **experimental** |
-| **Gráficos 3D** | Mesa Iris corriendo en TAEK, composición por GPU | **Experimental** |
+| **Gráficos 3D** | Iris (Mesa 25.2.3) corre en TAEK y pinta en la GPU: triángulo con shaders propios, texturas, la pantalla escanea lo que dibuja la GPU sin copia de la CPU, el video decodificado llega a Iris sin copia y se presenta por Iris (también NekoTube con su capa OSD) | **Experimental** |
 | **Audio** | Intel HDA y AC97, mezcla PCM, MP3/AAC | Probado en el i7 |
 | **USB** | xHCI 2.0/3.x, varios teclados a la vez, hubs, mouse; trackpad I2C-HID y PS/2 | Probado en el i7 |
-| **Red** | Ethernet Intel I219-LM, WiFi Realtek RTL8822CE con WPA3, TCP/IP, DHCP, DNS, ICMP, HTTP/HTTPS | Probado en el i7 |
+| **Red cableada** | Ethernet Intel I219-LM, TCP/IP, DHCP, DNS, ICMP, HTTP/HTTPS (TLS 1.3), sockets TCP/TLS para apps (`SYS_RED`), SACK y reensamblado | Probado en el i7 |
+| **WiFi** | Driver propio para Realtek RTL8822CE (no es un port de Linux): escaneo, WPA2-PSK y **WPA3-SAE con PMF**, 802.11ac a 80 MHz, Block Ack, CCMP por hardware, DHCP, arranque y actualización del OS sin cable. ~**400 Mbit/s** de bajada medidos de PC a laptop | Probado en el i7; sin 2.4 GHz de subida |
+| **YouTube (NekoTube)** | App `youtube.elf`: búsqueda, miniaturas, 360p/720p/1080p por HLS en flujo (`SYS_FLUJO`, memoria fija sin importar la duración), Shorts, suscripciones, perfil; interfaz QuickMenu estilo Persona | Probado en el i7 |
 | **Consola remota** | Espejo de consola por LAN (9153), diagnóstico (9152), mensajes (9151), copia de archivos con hash | Probado en el i7 |
 | **Almacenamiento** | FAT32 y exFAT (lectura y escritura), NTFS y ext4 (lectura), papelera, zona protegida `/ventoy` e `.iso` | Escritura exFAT con un error conocido (código 21) |
 | **Módulos** | `.chad` cargables en Ring 0 | Probado |
@@ -71,6 +73,20 @@ También nuevo desde H132: programas en Anillo 3 con compositor y escritorio (H1
 del USB sin reiniciar (`ejecutar /app.elf`), WiFi Realtek RTL8822CE con WPA3, composición por GPU con Iris (Mesa) y
 NekoTube, un cliente de video con interfaz propia. El plan del gestor de hilos está en la bitácora (H204–H215) con
 cada medición y cada corrección.
+
+---
+
+## 📡 Hitos 153–203 en resumen (noviembre de 2026)
+
+Todo experimental y medido solo en el i7-8650U. Cada cifra sale de la [bitácora](BITACORA.md).
+
+* **WiFi con driver propio (H153–H182).** Encendido de la MAC y efuse, firmware, calibración de la radio, escaneo pasivo (35 redes vistas en H160) y primera transmisión al aire (H162). La red de prueba es WPA3-only, así que se implementó **SAE** (P-256, verificado contra el vector del IEEE 802.11-2020) y **PMF** (H164). Luego datos IPv4 con CCMP, DHCP y arranque por WiFi (H165–H173), 802.11ac a 80 MHz con Block Ack (H176), TCP con ventana escalada y ACK estirado (H177–H178) y CCMP de recepción por hardware (H179). Resultado: de 25 a **~400 Mbit/s**. El ISO completo viaja por WiFi para actualizar el OS.
+* **Red para apps (H183–H184).** Tabla de 8 conexiones TCP y 4 sesiones TLS 1.3; las apps abren sockets con `SYS_RED` sin pausar la consola. TCP con SACK y reensamblado: de ~90 KB/s a 29 Mbit/s desde internet y 419 Mbit/s en la LAN.
+* **YouTube nativo (H185–H189, H197–H203).** `youtube.elf` busca y reproduce: 360p por MP4, 720p/1080p por HLS remuxeado en la app y, desde H187, **video en flujo** (`SYS_FLUJO`: el núcleo decodifica por GPU lo que la app le empuja; 1080p de 207 s con ~14 MiB en el núcleo). H189 arregló congelamientos de ~1 s cuando el receptor de la consola estaba caído. Desde H197 la app tiene la interfaz QuickMenu: menú lateral, cursor Persona, transiciones, Suscripciones, Perfil con radar, video en marco por Iris y Shorts verticales. H203 evita que el flujo se trabe si el audio se detiene.
+* **GPU 3D con Iris (H190–H196).** El driver 3D de Mesa corre dentro del módulo `.chad` con un runtime propio (hilos verdes, libm, libdrm mínima). Primer triángulo con shaders propios, texturas, animación en pantalla real, escaneo directo de lo que dibuja la GPU, y el cuadro decodificado por Media Driver llega a Iris sin copia (convertido a RGB por la GPU). El reproductor y NekoTube presentan por Iris.
+* **Interfaz (H150–H152).** Sensores reales (temperatura, carga por CPU) y la «cabina» MAGI de Configuración; la interfaz completa del prototipo v1 con órdenes reales y sonidos sintetizados.
+
+**Límites de este tramo:** el WiFi no transmite aún en 2.4 GHz (falta el coex con Bluetooth), la subida va a 54 Mbit/s (sin control de tasa) y el CCMP de transmisión es por software; el techo medido es ~400 Mbit/s y no se ha encontrado aún qué lo limita. NekoTube aún tiene fallos abiertos (tardíos en Shorts, Esc doble).
 
 ---
 
