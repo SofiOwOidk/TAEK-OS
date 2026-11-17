@@ -12,8 +12,8 @@
 ## 🧵 Versión actual: Hito 215 — Gestor de hilos multinúcleo (EXPERIMENTAL) (2026-11-17)
 
 > [!WARNING]
-> **El gestor de hilos (H204–H215) es EXPERIMENTAL.** H204–H214 pasan sus pruebas en un solo equipo (Dell Latitude
-> 5490, i7-8650U, GPU `8086:5917`); **H215 (medición de carga real) solo se probó en QEMU**. No se presenta como estable.
+> **El gestor de hilos (H204–H215) es EXPERIMENTAL.** Pasa sus pruebas en un solo equipo (Dell Latitude 5490,
+> i7-8650U, GPU `8086:5917`) y no se presenta como estable.
 >
 > **Intel Thread Director está CONGELADO:** el código va compilado y apagado por defecto, sin desarrollo hasta tener
 > un equipo híbrido para probarlo. La i7-8650U no lo tiene (solo se detecta y dice «no disponible»).
@@ -29,7 +29,7 @@ ratón se «moría» cuando la CPU 0 quedaba ocupada. El gestor de hilos reparte
 | Pila de red, WiFi y consola por LAN | CPU 3 | mayor hueco: **1123 ms → 3 ms** |
 | Hilos de las aplicaciones (`SYS_HILO`, `SYS_FUTEX`, TLS) | CPU 1–3 | 3 hilos: **×3,0** sobre 1; 18/18 pruebas |
 | Cerrojos por subsistema, invalidación de TLB entre CPU | todas | `cerrojos prueba` y `hilos prueba` PASS |
-| Carga real por CPU (`latencia`, panel de Configuración) | todas | separa el trabajo de CPU 0 de su espera activa |
+| Carga real por CPU (`latencia`, panel de Configuración) | todas | con video: CPU 0 **38,9 % trabajo + 61,1 % espera activa**; CPU 1–3 ≈ 1 % |
 | Intel Thread Director / HFI (`thread director`) | — | **CONGELADO**: sin probar en hardware, apagado por defecto |
 
 **Límites conocidos:**

@@ -7110,8 +7110,21 @@ El usuario pidió dejar todo listo para el siguiente paso, una app nativa de You
 * **Resultado en QEMU:** `thread director` → «no disponible» con el motivo (`CPUID.06H:EAX[19] = 0`);
   `thread director prueba` PASS; `prueba_hilos.elf` PASS; `cerrojos prueba` PASS; «Carga real» durante
   `prueba_hilos`: CPU 0 49,4 % trabajo + 50,6 % espera activa, CPU 1-3 entre 37 y 43 %.
-* **Qué no acredita: H215 no se probó en la i7.** Al ir a publicarlo, la laptop tenía NekoTube abierto con actividad
-  del usuario y estaba desconectada del receptor; no se interrumpió. La i7 sigue con H214.
+* **Al ir a publicarlo** la laptop tenía NekoTube abierto con actividad del usuario y no se interrumpió; se publicó en
+  GitHub como «solo QEMU». Después el usuario dio la laptop («úsalo con confianza») y se probó:
+* **Resultado en la i7** (`actualizar_taek.py … --hito "Hito 215"`, 61,3 s; evidencias `build/h215-pruebas/i7-…`):
+  * `thread director`: no híbrido, sin HFI ni Thread Director, `CPUID` máx. 0x16; las cuatro CPU contestaron desde
+    su hilo; `thread director prueba` PASS;
+  * **carga real en reposo** (21,7 s en la consola): CPU 0 **31,9 % «trabajo» + 68,1 % espera activa**, CPU 1-3
+    0,0 / 0,0 / 0,6 % (duermen de verdad en `hlt`). Ese 32 % de CPU 0 no es trabajo útil: es el resto del bucle de la
+    consola (audio, cursor, consola remota) fuera de la parte que se mide como espera. Es trabajo para E2;
+  * **carga real con NekoTube y el video de Ado** (158 s desde `latencia cero`, ~41 s de video): CPU 0 **38,9 %
+    trabajo + 61,1 % espera activa**; CPU 1-3 0,2 / 0,1 / 1,1 %. El «100 %» que veía el usuario era sobre todo
+    espera activa; los hilos de servicio casi no pesan; lo real que queda en CPU 0 es la aplicación, el manejo del
+    video y el compositor (candidatos de E4);
+  * sin regresión: `prueba_hilos.elf` PASS (×2,9; flecha atendida 121 veces, hueco máximo 20 ms), `hilos prueba` y
+    `cerrojos prueba` PASS; video con USB 3 ms, red 4 ms, HDA 6 ms, `HDA_SALTOS_TARDIOS=0`, 7 tardíos de 1166;
+    «SYS largas» sigue igual (`ARCHIVOS` 1713 ms, `FLUJO` 1109 ms, `RED` 650 ms): eso es E3.
 * **Publicación en GitHub (pedido del usuario, antes de una etapa dura de desarrollo):** se sube H215 con el gestor de
   hilos marcado **experimental** y Thread Director **congelado** en el README, y con lo probado separado de lo no
   probado. Auditoría de lo que se sube (todo lo que git agregaría en `github/`):
