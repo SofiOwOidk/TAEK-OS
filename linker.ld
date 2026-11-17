@@ -16,7 +16,9 @@ SECTIONS
     . = 0xffffffff80000000;
 
     .text : {
+        __taek_text_inicio = .;
         *(.text .text.*)
+        __taek_text_fin = .;
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

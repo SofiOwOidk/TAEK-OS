@@ -87,7 +87,13 @@ static void estado(void) {
     consola_imprimir_linea(fuera ? por_que_fuera : lista ? "iniciada" : "sin iniciar");
 }
 
+/* H195: presentacion por Iris (conversion, escalado y plano de pantalla en la GPU). Apagada por defecto. */
+static int presentar_iris;
+int video_gpu_presentar_iris(void) { return presentar_iris; }
 int video_gpu_comando(const char *a) {
+    if (igual(a, "presentar iris")) { presentar_iris = 1; consola_imprimir_linea("[VIDEO] Presentacion: Iris en la GPU (sin copias de la CPU)."); return 1; }
+    if (igual(a, "presentar cpu")) { presentar_iris = 0; consola_imprimir_linea("[VIDEO] Presentacion: CPU (conversion y copia al framebuffer)."); return 1; }
+    if (igual(a, "presentar")) { consola_imprimir_linea(presentar_iris ? "[VIDEO] Presentacion: Iris" : "[VIDEO] Presentacion: CPU"); return 1; }
     if (igual(a, "motor")) { estado(); return 1; }
     if (igual(a, "motor auto")) { motor = MOTOR_AUTO; estado(); return 1; }
     if (igual(a, "motor software")) { motor = MOTOR_SOFTWARE; estado(); return 1; }

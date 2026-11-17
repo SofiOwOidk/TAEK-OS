@@ -24,7 +24,7 @@ static int simbolo(const uint8_t *f,size_t n,const struct driver_elf_plan *p,uns
     memcpy(out,f+s->offset+idx*24,24);return 0;
 }
 int driver_elf_planificar(const void *input,size_t n,struct driver_elf_plan *p){
-    if(!input || !p || n<64 || n>32u*1024u*1024u)return -1;
+    if(!input || !p || n<64 || n>DRIVER_ARCHIVO_MAX)return -1;
     const uint8_t *f=input;struct elf_cabecera h;memcpy(&h,f,64);memset(p,0,sizeof(*p));
     const uint8_t magic[]={127,'E','L','F',2,1,1};
     if(memcmp(h.ident,magic,7) || (h.ident[7]!=0 && h.ident[7]!=3) || h.tipo!=1 || h.maquina!=62 || h.version!=1 || h.flags || h.entrada || h.phnum || h.ehsize!=64 || h.shsize!=64 || h.shnum<2 || h.shnum>DRIVER_ELF_SECCIONES || h.shstr>=h.shnum || !rango(h.shoff,(uint64_t)h.shnum*64,n))return -1;

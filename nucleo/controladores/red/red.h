@@ -86,6 +86,22 @@ int  red_enviar_trama(const void *datos, uint32_t longitud);
 // Extrae una trama recibida. Devuelve 1 si se copió una, 0 si no hay ninguna.
 int  red_recibir_trama(void *buffer, uint32_t capacidad, uint32_t *longitud);
 
+// H165: interfaz alternativa (WiFi). Mientras esta activa, red_enviar_trama,
+// red_recibir_trama, red_enlace_actualizar y red_obtener_info la usan a ella en
+// lugar del e1000; las tramas siguen siendo Ethernet II.
+struct red_externa {
+    const char *modelo;
+    uint16_t id_proveedor, id_dispositivo;
+    uint32_t velocidad_mbps;
+    uint8_t  mac[RED_MAX_MAC];
+    int (*enviar)(const void *datos, uint32_t longitud);
+    int (*recibir)(void *buffer, uint32_t capacidad, uint32_t *longitud);
+    int (*enlace)(void);
+};
+void red_usar_externa(const struct red_externa *ext);   // NULL = volver al e1000
+const struct red_externa *red_externa_activa(void);
+int  red_enlace_cable(void);                             // H166: enlace del e1000 (1 = con cable)
+
 // ---------------- Pila de red ----------------
 
 // Procesa tramas pendientes: ARP, IPv4, ICMP, UDP, TCP y temporizadores.
@@ -96,6 +112,8 @@ void red_configurar_vacia(void);
 
 // Configuración dinámica por DHCP (bloqueante). 0 = concedida.
 int  red_dhcp(int timeout_ms);
+// H172: respuestas DHCP vistas, descartadas por xid o por tipo, y tipo de la ultima.
+void red_dhcp_contadores(uint32_t *vistos, uint32_t *xid_mal, uint32_t *tipo_mal, uint8_t *ultimo_tipo);
 
 // Configuración estática. dns admite NULL (sin DNS).
 int  red_ip_estatica(const uint8_t ip[4], const uint8_t mascara[4],
@@ -103,6 +121,9 @@ int  red_ip_estatica(const uint8_t ip[4], const uint8_t mascara[4],
 
 // Resuelve la MAC de una IPv4 (consulta/actualiza la caché ARP). 0 = ok.
 int  red_arp_resolver(const uint8_t ip[4], uint8_t mac_salida[6], int timeout_ms);
+// H151: cache ARP para 'red arp' y 'red arp vaciar'
+int  red_arp_listar(uint8_t ip[][4], uint8_t mac[][6], uint64_t edad_ms[], int max);
+int  red_arp_vaciar(void);
 
 // Resuelve un nombre por DNS. 0 = ok.
 int  red_resolver_nombre(const char *nombre, uint8_t ip_salida[4], int timeout_ms);
@@ -124,9 +145,25 @@ int red_tcp_intercambiar(const uint8_t ip[4], uint16_t puerto,
 // desde puntos cooperativos de consola, nunca IRQ/serial. Abrir acotado a 300 ms.
 int red_tcp_flujo_abrir(const uint8_t ip[4], uint16_t puerto);
 int red_tcp_flujo_abrir_timeout(const uint8_t ip[4], uint16_t puerto, int timeout_ms);
+// H189: apertura sin bloquear (stream de consola). iniciar: 0 SYN enviado, 1 falta ARP, <0 fallo.
+int red_tcp_flujo_iniciar(const uint8_t ip[4], uint16_t puerto);
+int red_tcp_flujo_sondear(void);       // 1 establecida, 0 en curso, <0 fallo
+void red_tcp_flujo_abandonar(void);
 int red_tcp_flujo_enviar(const void *datos, uint32_t longitud); // 0 aceptado, 1 ocupado
 int red_tcp_flujo_recibir(void *datos, uint32_t capacidad); // bytes, negativo desconectado
 void red_tcp_flujo_cerrar(void);
+// H183: conexiones TCP por manejador (1-7), simultaneas y sin pausar el stream de consola.
+int  red_tcp_abrir(const uint8_t ip[4], uint16_t puerto, int timeout_ms);  // id >= 1 o negativo
+int  red_tcp_enviar_h(int id, const void *datos, uint32_t longitud);        // 0 aceptado, 1 ocupado, -1 caida
+int  red_tcp_recibir_h(int id, void *datos, uint32_t capacidad);            // bytes, 0 nada aun, -1 terminada
+int  red_tcp_estado_h(int id);                                              // 1 abierta, 2 cerrada por el otro, 0 caida
+void red_tcp_cerrar_h(int id);
+void red_tcp_cerrar_todas_h(void);
+void red_tcp_contadores(uint32_t *recortes, uint32_t *fuera_orden);         // H184
+// H178: ACK de TCP cada N segmentos (1-64; otro valor = consultar).
+int red_tcp_ack_cada(int n);
+// H182: ventana TCP anunciada maxima en KiB (16-1024; otro valor = consultar).
+int red_tcp_ventana_kib(int kib);
 // Snapshot de log + metadatos; solo retorna 0 si el receptor confirma persistencia.
 int red_telemetria_enviar(const uint8_t ip[4], uint16_t puerto,
                          uint32_t *bytes_enviados, uint64_t *bytes_perdidos);

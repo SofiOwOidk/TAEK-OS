@@ -1,4 +1,5 @@
 #include "teclado.h"
+#include "ps2.h"
 #include "../arquitectura/x86_64/puertos.h"
 
 #define PUERTO_DATOS_TECLADO  0x60
@@ -135,17 +136,24 @@ char teclado_leer_caracter(void) {
 
     uint8_t estado = leer_puerto_b(PUERTO_ESTADO_TECLADO);
     // Si el bit 5 (0x20) está activo, el byte en 0x60 pertenece al ratón/touchpad (puerto AUX).
-    // Lo leemos y descartamos para no interpretar coordenadas de ratón como teclas.
+    // Desde H142 va al mouse PS/2 (que lo descarta si no se inicio); nunca se interpreta como tecla.
     if (estado & 0x20) {
-        leer_puerto_b(PUERTO_DATOS_TECLADO);
+        ps2_raton_byte(leer_puerto_b(PUERTO_DATOS_TECLADO));
         return 0;
     }
 
-    uint8_t scancode = leer_puerto_b(PUERTO_DATOS_TECLADO);
+    return teclado_traducir(leer_puerto_b(PUERTO_DATOS_TECLADO));
+}
+
+/* Codigo de rastreo del juego 1 (el que deja la traduccion del 8042) a caracter. Tambien lo usa ps2.c. */
+char teclado_traducir(uint8_t scancode) {
     if(scancode==0xe0){g_extendido=1;return 0;}
     int extendido=g_extendido;g_extendido=0;
     if(extendido && (scancode==0x48 || scancode==0x50))
         return scancode==0x48?(g_ctrl?TECLA_CTRL_ARRIBA:TECLA_ARRIBA):(g_ctrl?TECLA_CTRL_ABAJO:TECLA_ABAJO);
+    if(extendido && (scancode==0x4B || scancode==0x4D))return scancode==0x4B?TECLA_IZQUIERDA:TECLA_DERECHA;
+    if(extendido && scancode==0x53)return TECLA_SUPRIMIR;
+    if(!extendido && scancode==0x3C)return TECLA_F2;
 
     // Liberación de tecla
     if (scancode & 0x80) {

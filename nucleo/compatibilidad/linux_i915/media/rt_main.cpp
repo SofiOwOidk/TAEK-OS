@@ -124,6 +124,7 @@ extern "C" void taek_h264_contexto(VADriverContextP);
 extern "C" int taek_h264_caps(char *, size_t);
 extern "C" int taek_h264_decodificar(unsigned, unsigned, char *, size_t);
 extern "C" int taek_h264_op(struct taek_video_peticion *);
+extern "C" int taek_h264_exponer(char *, size_t);
 static int driver_listo;
 
 static int iniciar_driver(char *texto, size_t bytes) {
@@ -163,5 +164,6 @@ extern "C" int taek_media_entrada(int orden, char *texto, size_t bytes) {
     if (orden == TAEK_MEDIA_MAL) return taek_h264_decodificar(1, 1, texto, bytes);
     if (orden == TAEK_MEDIA_VIDEO) return taek_h264_decodificar(300, 0, texto, bytes);
     if (orden == TAEK_MEDIA_OP) return taek_h264_op(reinterpret_cast<struct taek_video_peticion *>(texto));
+    if (orden == TAEK_MEDIA_EXPONER) return taek_h264_exponer(texto, bytes);
     return -22;
 }

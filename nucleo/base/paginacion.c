@@ -1,4 +1,5 @@
 #include "paginacion.h"
+#include "cerrojo.h"
 #include "trabajos.h"
 #include "memoria.h"
 #include "huevo.h"
@@ -28,6 +29,89 @@ uint64_t paginacion_obtener_pml4_activo(void) {
 void paginacion_invalidar_tlb(uint64_t dir_virtual) {
     __asm__ volatile ("invlpg (%0)" : : "r"(dir_virtual) : "memory");
 }
+
+/* ------------------------------------------------------------------ H205: cerrojo e invalidacion entre CPU
+ * invlpg solo vale para la CPU que lo ejecuta. Hasta H204 las auxiliares recargaban CR3 al empezar cada lote y los
+ * mapeos no cambiaban durante uno. Con hilos corriendo siempre eso no alcanza:
+ *  - cada cambio de una entrada que ya estaba presente (remapear o desmapear) sube una epoca y deja la
+ *    sincronizacion pendiente; una entrada nueva no la necesita (la TLB no guarda traducciones ausentes);
+ *  - paginacion_tlb_atender() vacia la TLB de la CPU que la llama si su epoca quedo atras. La llaman el manejador
+ *    de la IPI, la espera de un cerrojo y el arranque de cada lote;
+ *  - paginacion_tlb_sincronizar() manda la IPI y espera a que todas las CPU hayan atendido. Se llama una vez al
+ *    final de una tanda de cambios, sin cerrojos en la mano. */
+static cerrojo_t g_cerrojo_paginas = CERROJO("paginas");
+static volatile uint64_t g_tlb_epoca;
+static volatile uint64_t g_tlb_vista[CERROJO_CPUS];
+static volatile uint32_t g_tlb_pendiente;
+static uint64_t g_tlb_rondas, g_tlb_tardias, g_tlb_espera_max_ciclos;
+
+static void tlb_vaciar_local(void) {
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    if (cr4 & (1u << 7)) {   /* PGE: apagarlo y encenderlo vacia tambien las entradas globales */
+        uint64_t sin = cr4 & ~(UINT64_C(1) << 7);
+        __asm__ volatile("mov %0, %%cr4; mov %1, %%cr4" :: "r"(sin), "r"(cr4) : "memory");
+    } else {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0; mov %0, %%cr3" : "=&r"(cr3) :: "memory");
+    }
+}
+
+void paginacion_tlb_atender(void) {
+    unsigned c = cpu_actual();
+    uint64_t e = __atomic_load_n(&g_tlb_epoca, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&g_tlb_vista[c], __ATOMIC_RELAXED) == e) return;
+    tlb_vaciar_local();
+    __atomic_store_n(&g_tlb_vista[c], e, __ATOMIC_RELEASE);
+}
+
+/* Un cambio de una entrada presente: la CPU que lo hace ya hizo su invlpg */
+static void tlb_marcar(void) {
+    __atomic_add_fetch(&g_tlb_epoca, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlb_pendiente, 1, __ATOMIC_RELEASE);
+}
+
+int paginacion_tlb_sincronizar(void) {
+    if (!__atomic_exchange_n(&g_tlb_pendiente, 0, __ATOMIC_ACQ_REL)) return 0;
+    uint64_t e = __atomic_load_n(&g_tlb_epoca, __ATOMIC_ACQUIRE);
+    unsigned yo = cpu_actual(), n = trabajos_cpu_arrancadas();
+    tlb_vaciar_local();
+    __atomic_store_n(&g_tlb_vista[yo], e, __ATOMIC_RELEASE);
+    if (n < 2) return 0;
+    if (n > CERROJO_CPUS) n = CERROJO_CPUS;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t t0 = ((uint64_t)hi << 32) | lo, ahora = t0;
+    uint64_t limite = trabajos_ticks_por_ms(0) * 200u;   /* 200 ms: una CPU que no contesta esta colgada */
+    trabajos_ipi_demas();
+    int tarde = 0;
+    for (;;) {
+        unsigned faltan = 0;
+        for (unsigned i = 0; i < n; i++)
+            if (i != yo && __atomic_load_n(&g_tlb_vista[i], __ATOMIC_ACQUIRE) < e) faltan++;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        ahora = ((uint64_t)hi << 32) | lo;
+        if (!faltan) break;
+        if (limite && ahora - t0 > limite) { tarde = 1; break; }
+        __asm__ volatile("pause");
+    }
+    g_tlb_rondas++;
+    if (ahora - t0 > g_tlb_espera_max_ciclos) g_tlb_espera_max_ciclos = ahora - t0;
+    if (tarde) {
+        g_tlb_tardias++;
+        serial_imprimir_linea("[TLB] Una CPU no atendio la invalidacion en 200 ms.");
+        return -1;
+    }
+    return 0;
+}
+
+void paginacion_tlb_estadisticas(uint64_t *epoca, uint64_t *rondas, uint64_t *tardias, uint64_t *espera_max_ciclos) {
+    if (epoca) *epoca = __atomic_load_n(&g_tlb_epoca, __ATOMIC_RELAXED);
+    if (rondas) *rondas = g_tlb_rondas;
+    if (tardias) *tardias = g_tlb_tardias;
+    if (espera_max_ciclos) *espera_max_ciclos = g_tlb_espera_max_ciclos;
+}
+uint64_t paginacion_tlb_vista(unsigned cpu) { return cpu < CERROJO_CPUS ? __atomic_load_n(&g_tlb_vista[cpu], __ATOMIC_ACQUIRE) : 0; }
 
 void paginacion_iniciar(void) {
     g_hhdm_offset = memoria_obtener_hhdm_offset();
@@ -74,7 +158,7 @@ void paginacion_iniciar(void) {
     serial_imprimir_linea("]");
 }
 
-int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t banderas) {
+static int mapear_sin_cerrojo(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t banderas) {
     if(trabajos_en_curso())return -1;
     if (!g_paginacion_iniciada || g_pml4_kernel == NULL) {
         return -1;
@@ -120,15 +204,25 @@ int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t bander
     tabla_paginacion_t *pt = (tabla_paginacion_t *)FISICA_A_VIRTUAL(pd->entradas[idx_pd] & MASCARA_DIRECCION_FISICA);
 
     // Nivel 1: PT -> Marco Físico de 4 KiB
-    pt->entradas[idx_pt] = dir_fisica | banderas | PAGINA_PRESENTE;
+    uint64_t vieja = pt->entradas[idx_pt], nueva = dir_fisica | banderas | PAGINA_PRESENTE;
+    pt->entradas[idx_pt] = nueva;
 
     // Invalidar TLB para que la CPU refresque la traducción inmediatamente
     paginacion_invalidar_tlb(dir_virtual);
+    /* H205: si ya habia una traduccion distinta, las otras CPU pueden tenerla en su TLB */
+    if ((vieja & PAGINA_PRESENTE) && vieja != nueva) tlb_marcar();
 
     return 0;
 }
 
-int paginacion_desmapear(uint64_t dir_virtual) {
+int paginacion_mapear(uint64_t dir_virtual, uint64_t dir_fisica, uint64_t banderas) {
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_paginas);
+    int r = mapear_sin_cerrojo(dir_virtual, dir_fisica, banderas);
+    cerrojo_soltar_irq(&g_cerrojo_paginas, f);
+    return r;
+}
+
+static int desmapear_sin_cerrojo(uint64_t dir_virtual) {
     if(trabajos_en_curso())return -1;
     if (!g_paginacion_iniciada || g_pml4_kernel == NULL) {
         return -1;
@@ -151,10 +245,19 @@ int paginacion_desmapear(uint64_t dir_virtual) {
     tabla_paginacion_t *pt = (tabla_paginacion_t *)FISICA_A_VIRTUAL(pd->entradas[idx_pd] & MASCARA_DIRECCION_FISICA);
 
     // Desmapear la entrada en la tabla final
+    uint64_t vieja = pt->entradas[idx_pt];
     pt->entradas[idx_pt] = 0;
     paginacion_invalidar_tlb(dir_virtual);
+    if (vieja & PAGINA_PRESENTE) tlb_marcar();   /* H205 */
 
     return 0;
+}
+
+int paginacion_desmapear(uint64_t dir_virtual) {
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_paginas);
+    int r = desmapear_sin_cerrojo(dir_virtual);
+    cerrojo_soltar_irq(&g_cerrojo_paginas, f);
+    return r;
 }
 
 #define PML4_ALIAS_USUARIO 192ULL
@@ -165,12 +268,15 @@ int paginacion_alias_pml4(uint64_t dir_destino, uint64_t dir_origen) {
     uint64_t d = (dir_destino >> 39) & 0x1FFULL, o = (dir_origen >> 39) & 0x1FFULL;
     /* Mitad inferior: solo la ventana 0x6000_0000_0000, memoria "de usuario" del driver multimedia en el mismo Ring 0. */
     if ((d < 256 && d != PML4_ALIAS_USUARIO) || o < 256) return -1;
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_paginas);
     uint64_t entrada = g_pml4_kernel->entradas[o];
-    if (!(entrada & PAGINA_PRESENTE)) return -2;
-    if (g_pml4_kernel->entradas[d] == entrada) return 0;
-    if (g_pml4_kernel->entradas[d] & PAGINA_PRESENTE) return -3;
-    g_pml4_kernel->entradas[d] = entrada;
-    return 0;
+    int r = 0;
+    if (!(entrada & PAGINA_PRESENTE)) r = -2;
+    else if (g_pml4_kernel->entradas[d] == entrada) r = 0;
+    else if (g_pml4_kernel->entradas[d] & PAGINA_PRESENTE) r = -3;
+    else g_pml4_kernel->entradas[d] = entrada;
+    cerrojo_soltar_irq(&g_cerrojo_paginas, f);
+    return r;
 }
 
 uint64_t paginacion_obtener_fisica(uint64_t dir_virtual) {

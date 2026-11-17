@@ -9,8 +9,12 @@
 #include "../arquitectura/x86_64/idt.h"
 #include "../controladores/red/stream.h"
 #include "paginacion.h"
+#include "../controladores/red/red_cerrojo.h"   /* H211 */
 
 static huevo_estabilidad_t g_huevo;
+
+/* H150: copia de solo lectura para el panel de Configuracion */
+void huevo_obtener(huevo_estabilidad_t *h) { if (h) *h = g_huevo; }
 
 /* Sin marcos de pila en los modulos: se listan candidatos a direccion de retorno. El rango
  * coincide con DRIVER_VA de driver_ram.c; se simboliza con simbolizar_modulo.py. */
@@ -174,6 +178,10 @@ static void huevo_autopsia_forense(const char *motivo_fatal, const struct marco_
     /* Laboratorio remoto: con stream LAN activo nadie esta mirando la pantalla. La evidencia
      * ya esta en el registro serial que el stream transmite; se envia y se reinicia para poder
      * seguir iterando. Sin stream se conserva el cierre de siempre. */
+    /* H211: con hilos, otra CPU puede tener el cerrojo de la red o de la consola en este momento. Se esperan hasta 200 ms
+     * y se toman igual: despues de esto solo queda mandar la evidencia y reiniciar. */
+    red_cerrojo_forzar();
+    consola_cerrojo_forzar();
     if (red_stream_activo()) {
         serial_imprimir_linea("[HUEVO LAN] Evidencia enviada por stream; reinicio automatico en 6 s.");
         uint64_t fin = tiempo_obtener_milisegundos() + 6000;

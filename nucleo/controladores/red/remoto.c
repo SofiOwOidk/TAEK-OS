@@ -4,6 +4,7 @@
 #include "../../base/memoria.h"
 #include "../../base/tiempo.h"
 #include "../../arquitectura/x86_64/serial.h"
+#include "red_cerrojo.h"   /* H211: cerrojo de la red (Fase C) */
 
 static uint8_t destino[4];
 static uint16_t puerto;
@@ -23,11 +24,11 @@ static int permitido(const char *cmd) {
     return 0;
 }
 void red_remoto_ejecutor(void (*fn)(const char *)) { ejecutar=fn; }
-void red_remoto_iniciar(const uint8_t ip[4],uint16_t port) {
+void red_remoto_iniciar(const uint8_t ip[4],uint16_t port) { RED_EXCLUSIVA();
     memcpy(destino,ip,4);puerto=port;ultimo_id=0;pendiente=0;proximo=0;activo=1;
 }
 void red_remoto_detener(void) { activo=0;capturando=0;pendiente=0; }
-int red_remoto_activo(void) { return activo; }
+int red_remoto_activo(void) { RED_EXCLUSIVA(); return activo; }
 void red_remoto_capturar(char c) {
     if(!capturando)return;
     if(longitud<sizeof(salida))salida[longitud++]=c;else ++perdidos;
@@ -54,7 +55,8 @@ static int entregar(void) {
     serial_imprimir("[REMOTO_LAN] RESULTADO=1 ID=");serial_imprimir_dec(ultimo_id);serial_imprimir_linea("");
     return 0;
 }
-void red_remoto_atender(void) {
+void red_remoto_atender(void) { if (!__atomic_load_n(&activo, __ATOMIC_RELAXED)) return;   /* H211: la terminal llama esto en cada vuelta; sin consola remota no se toma el cerrojo */
+    RED_EXCLUSIVA();
     if(!activo||!ejecutar)return;
     uint64_t ahora=tiempo_obtener_milisegundos();
     if(ahora<proximo)return;

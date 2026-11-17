@@ -11,7 +11,7 @@
 #define XHCI_MMIO_VIRTUAL_BASE 0xFFFFFE0004000000ULL
 
 // Número máximo de dispositivos y puertos gestionados
-#define XHCI_MAX_SLOTS   8
+#define XHCI_MAX_SLOTS   16   /* H139: con hubs hay mas dispositivos a la vez (antes 8) */
 #define XHCI_MAX_PUERTOS 32
 #define XHCI_TAM_ANILLO  64
 
@@ -145,5 +145,52 @@ int xhci_hid_mouse_tomar(void);
 int xhci_hid_mouse_leer(struct taek_hid_mouse_reporte *);
 void xhci_hid_mouse_liberar(void);
 uint64_t xhci_hid_mouse_perdidos(void);
+
+/* Diagnostico: cada transferencia de un endpoint HID tal como llega (cualquier codigo), para ver que manda un
+ * raton o teclado real. Solo copia; no cambia nada de la recepcion normal. */
+struct xhci_hid_crudo { uint64_t ms; uint8_t slot, dci, cc, len, iface, es_raton, confirmado, datos[8]; };
+void xhci_hid_crudo_activar(int activo);
+int xhci_hid_crudo_leer(struct xhci_hid_crudo *out);
+uint64_t xhci_hid_crudo_perdidos(void);
+void xhci_hid_listar(void);
+
+/* Hubs USB (H139): 'usb hub' lista los hubs, sus puertos y lo que cuelga de cada uno. */
+void xhci_hub_listar(void);
+
+/* H204, Fase 0 del gestor de hilos: lo que pasa en el anillo de eventos y en los puertos raiz. Solo mide. */
+enum {
+    XHCI_SUCESO_EVENTO = 1,       /* Port Status Change Event: PORTSC leido al sacar el evento del anillo */
+    XHCI_SUCESO_CONEXION = 2,     /* El escaneo vio CCS de 0 a 1 */
+    XHCI_SUCESO_DESCONEXION = 3,  /* El escaneo vio CCS de 1 a 0 */
+    XHCI_SUCESO_SIN_ENLACE = 4,   /* Reset sin PED (el aviso de siempre); se programa el reintento 1 */
+    XHCI_SUCESO_RECUPERADO = 5,   /* Un reintento dejo el enlace habilitado */
+    XHCI_SUCESO_REINTENTO_FALLO = 6,
+    XHCI_SUCESO_PERDIDO = 7,      /* Tres reintentos sin enlace: hay que desenchufar y volver a enchufar */
+};
+#define XHCI_SUCESOS 8
+struct xhci_suceso_puerto { uint64_t ms; uint32_t portsc; uint8_t puerto, tipo, intento, reservado; };
+struct xhci_fase0 {
+    uint32_t reentradas;          /* Pasadas por el anillo que empezaron con otra en curso (llamada anidada) */
+    uint32_t eventos_max;         /* Mas eventos sacados en una pasada; el anillo tiene XHCI_TAM_ANILLO */
+    uint32_t eventos_hc;          /* Host Controller Events */
+    uint32_t anillo_lleno;        /* ... con Event Ring Full Error (codigo 21) */
+    uint32_t cambios_puerto;      /* Port Status Change Events */
+    uint32_t reintentos, recuperados, perdidos;
+    uint64_t teclas_perdidas;     /* Teclas que no cupieron en el bufer del teclado USB */
+    uint64_t reentrada_desde;     /* Direccion de retorno de la primera llamada anidada (solo para la consola) */
+    uint32_t sucesos_total;       /* Sucesos de puerto desde el arranque; los ultimos XHCI_SUCESOS estan en sucesos */
+    struct xhci_suceso_puerto sucesos[XHCI_SUCESOS];
+};
+const struct xhci_fase0 *xhci_fase0(void);
+/* Copia los ultimos sucesos del mas viejo al mas nuevo; devuelve cuantos */
+unsigned xhci_fase0_sucesos(struct xhci_suceso_puerto *out, unsigned max);
+void xhci_fase0_cero(void);
+
+/* H208, Fase B: hilo de tiempo real en CPU 1 que bombea el anillo de eventos cada ~2 ms. 1 enciende, 0 apaga;
+ * devuelve el modo resultante, o -1 si no se pudo crear el hilo. */
+int xhci_hilo(int encender);
+void xhci_hilo_estado(int *modo, uint64_t *bombeos, uint64_t *ocupado);
+/* H210, Fase B2: pasadas del hilo de puertos (escaneo, hubs, reintentos y enumeracion en CPU 1) */
+uint64_t xhci_hilo_puertos_pasadas(void);
 
 #endif // CONTROLADORES_XHCI_H

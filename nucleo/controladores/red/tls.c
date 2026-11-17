@@ -14,6 +14,7 @@ extern const unsigned char taek_tls_ca_bundle[];
 extern const size_t taek_tls_ca_bundle_size;
 struct cliente_tls {mbedtls_ssl_context ssl;mbedtls_ssl_config conf;mbedtls_x509_crt ca;uint64_t fin;int error;};
 static uint8_t ocupado;
+static int g_tls_activas;                 /* H183: sesiones por manejador abiertas */
 static int restante(struct cliente_tls *c){uint64_t ahora=tiempo_obtener_milisegundos();return ahora>=c->fin?0:(int)(c->fin-ahora);}
 static int limite(struct cliente_tls *c){if(consola_sondear_cancelacion())c->error=TLS_ERR_CANCELADO;else if(!restante(c))c->error=TLS_ERR_TIMEOUT;return c->error;}
 static int enviar(void *ctx,const unsigned char *p,size_t n){
@@ -91,5 +92,92 @@ int red_https_obtener(const char *host,const char *ruta,uint16_t puerto,char *sa
 fin:
     if(ret<0){memset(salida,0,usados+1);}if(c){mbedtls_ssl_free(&c->ssl);mbedtls_ssl_config_free(&c->conf);mbedtls_x509_crt_free(&c->ca);liberar_memoria(c);}
     if(tcp)red_tcp_flujo_cerrar();if(pausado)red_stream_pausar(0);
-    mbedtls_psa_crypto_free();__atomic_clear(&ocupado,__ATOMIC_RELEASE);return ret;
+    if(!g_tls_activas)mbedtls_psa_crypto_free();   /* H183: no con sesiones abiertas */
+    __atomic_clear(&ocupado,__ATOMIC_RELEASE);return ret;
 }
+
+/* ================================================================== H183
+ * Sesiones TLS 1.3 por manejador, para las apps (SYS_RED): hasta 4 a la vez sobre conexiones TCP 1-7, sin
+ * pausar el stream de consola. Misma politica que red_https_obtener: TLS 1.3, verificacion X.509 obligatoria
+ * (CA del paquete, nombre, vigencia, firma). La cadena de CA se interpreta una sola vez. Sin salida por
+ * consola (regla de la tabla TCP: con otra conexion en curso no se usa la consola). */
+#define TLS_SESIONES 4
+struct sesion_tls { mbedtls_ssl_context ssl; mbedtls_ssl_config conf; int tcp; uint64_t fin; int error; };
+static struct sesion_tls *g_ses[TLS_SESIONES];
+static mbedtls_x509_crt g_ca_comun;
+static int g_ca_lista;
+static int s_restante(struct sesion_tls *s){uint64_t a=tiempo_obtener_milisegundos();return a>=s->fin?0:(int)(s->fin-a);}
+static int s_enviar(void *ctx,const unsigned char *p,size_t n){
+    struct sesion_tls *s=ctx;if(!s_restante(s)){s->error=TLS_ERR_TIMEOUT;return MBEDTLS_ERR_SSL_INTERNAL_ERROR;}
+    if(n>1400)n=1400;int r=red_tcp_enviar_h(s->tcp,p,(uint32_t)n);
+    if(r<0){s->error=TLS_ERR_TX;return MBEDTLS_ERR_SSL_INTERNAL_ERROR;}return r?MBEDTLS_ERR_SSL_WANT_WRITE:(int)n;
+}
+static int s_recibir(void *ctx,unsigned char *p,size_t n){
+    struct sesion_tls *s=ctx;if(n>16384)n=16384;int r=red_tcp_recibir_h(s->tcp,p,(uint32_t)n);
+    return r<0?MBEDTLS_ERR_SSL_CONN_EOF:r?r:MBEDTLS_ERR_SSL_WANT_READ;
+}
+static int s_esperar(struct sesion_tls *s,int code){
+    if(code!=MBEDTLS_ERR_SSL_WANT_READ && code!=MBEDTLS_ERR_SSL_WANT_WRITE)return 0;
+    if(!s_restante(s)){s->error=TLS_ERR_TIMEOUT;return 0;}red_pila_sondeo();esperar_milisegundos(1);return 1;
+}
+static void s_liberar(int i){
+    struct sesion_tls *s=g_ses[i];if(!s)return;
+    mbedtls_ssl_free(&s->ssl);mbedtls_ssl_config_free(&s->conf);
+    if(s->tcp>0)red_tcp_cerrar_h(s->tcp);
+    liberar_memoria(s);g_ses[i]=0;if(g_tls_activas)g_tls_activas--;
+}
+int red_tls_abrir(const char *host,const uint8_t ip[4],uint16_t puerto,int timeout_ms){
+    if(!host || !*host || !ip || !puerto)return TLS_ERR_PARAM;
+    if(timeout_ms<=0)timeout_ms=15000;if(timeout_ms>60000)timeout_ms=60000;
+    if(taek_tls_time(0)<0)return TLS_ERR_RELOJ;
+    unsigned char prueba;if(taek_tls_random(0,&prueba,1))return TLS_ERR_ENTROPIA;
+    int i=-1;for(int k=0;k<TLS_SESIONES;k++)if(!g_ses[k]){i=k;break;}
+    if(i<0)return TLS_ERR_OCUPADO;
+    if(psa_crypto_init()!=PSA_SUCCESS)return TLS_ERR_ENTROPIA;
+    if(!g_ca_lista){mbedtls_x509_crt_init(&g_ca_comun);
+        if(mbedtls_x509_crt_parse(&g_ca_comun,taek_tls_ca_bundle,taek_tls_ca_bundle_size)<0){mbedtls_x509_crt_free(&g_ca_comun);return TLS_ERR_AUTH_FALLIDA;}
+        g_ca_lista=1;}
+    struct sesion_tls *s=asignar_memoria_cero(sizeof(*s));if(!s)return TLS_ERR_BUFER;
+    g_ses[i]=s;g_tls_activas++;s->fin=tiempo_obtener_milisegundos()+(uint32_t)timeout_ms;
+    mbedtls_ssl_init(&s->ssl);mbedtls_ssl_config_init(&s->conf);
+    s->tcp=red_tcp_abrir(ip,puerto,s_restante(s));
+    if(s->tcp<0){s->tcp=0;s_liberar(i);return TLS_ERR_TCP;}
+    int ret=TLS_ERR_PROTOCOLO;
+    if(mbedtls_ssl_config_defaults(&s->conf,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT))goto mal;
+    mbedtls_ssl_conf_min_tls_version(&s->conf,MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(&s->conf,MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_authmode(&s->conf,MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_conf_ca_chain(&s->conf,&g_ca_comun,0);
+    mbedtls_ssl_conf_rng(&s->conf,taek_tls_random,0);
+    static const char *alpn[]={"http/1.1",0};
+    if(mbedtls_ssl_conf_alpn_protocols(&s->conf,alpn) || mbedtls_ssl_setup(&s->ssl,&s->conf) || mbedtls_ssl_set_hostname(&s->ssl,host))goto mal;
+    mbedtls_ssl_set_bio(&s->ssl,s,s_enviar,s_recibir,0);
+    for(;;){int code=mbedtls_ssl_handshake(&s->ssl);if(!code)break;if(s_esperar(s,code))continue;
+        ret=s->error?s->error:TLS_ERR_AUTH_FALLIDA;goto mal;}
+    if(mbedtls_ssl_get_verify_result(&s->ssl)){ret=TLS_ERR_AUTH_FALLIDA;goto mal;}
+    return i;
+mal:
+    s_liberar(i);return ret;
+}
+/* Envia todo (bloquea hasta timeout_ms). Devuelve n o un TLS_ERR_*. */
+int red_tls_enviar(int i,const void *d,uint32_t n,int timeout_ms){
+    if(i<0 || i>=TLS_SESIONES || !g_ses[i] || (!d && n))return TLS_ERR_PARAM;
+    struct sesion_tls *s=g_ses[i];s->error=0;s->fin=tiempo_obtener_milisegundos()+(uint32_t)(timeout_ms>0?timeout_ms:15000);
+    for(uint32_t off=0;off<n;){int code=mbedtls_ssl_write(&s->ssl,(const unsigned char *)d+off,n-off);
+        if(code>0){off+=(uint32_t)code;continue;}if(s_esperar(s,code))continue;return s->error?s->error:TLS_ERR_TX;}
+    return (int)n;
+}
+/* Sin bloquear: bytes descifrados, 0 si aun no hay, TLS_ERR_RX si el servidor cerro o la sesion fallo. */
+int red_tls_recibir(int i,void *d,uint32_t cap){
+    if(i<0 || i>=TLS_SESIONES || !g_ses[i] || !d || !cap)return TLS_ERR_PARAM;
+    struct sesion_tls *s=g_ses[i];
+    int code=mbedtls_ssl_read(&s->ssl,(unsigned char *)d,cap);
+    if(code>0)return code;
+    if(code==MBEDTLS_ERR_SSL_WANT_READ || code==MBEDTLS_ERR_SSL_WANT_WRITE)return 0;
+    return TLS_ERR_RX;
+}
+void red_tls_cerrar(int i){
+    if(i<0 || i>=TLS_SESIONES || !g_ses[i])return;
+    mbedtls_ssl_close_notify(&g_ses[i]->ssl);s_liberar(i);
+}
+void red_tls_cerrar_todas(void){for(int i=0;i<TLS_SESIONES;i++)if(g_ses[i])s_liberar(i);}

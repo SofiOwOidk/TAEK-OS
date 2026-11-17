@@ -27,6 +27,7 @@
 #include "controladores/video/intel/intel_diagnostico_ring0.h"
 #include "controladores/video/intel/i915_drv.h"
 #include "video_gpu.h"
+void red_pila_sondeo(void);   /* controladores/red/pila.c */
 
 #ifndef TAEK_REVISION_CODIGO
 #define TAEK_REVISION_CODIGO "sin identificar"
@@ -116,6 +117,7 @@ typedef struct {
     unsigned presentaciones_cabeza,presentaciones_pendientes;
     int64_t presentaciones_pts[2];
     uint64_t reloj_maestro_ultimo, servicio_ultimo, servicio_max_ms;
+    uint64_t reloj_base_audio;   /* H203: si el audio se reanuda, su reloj vuelve a 0: se suma donde iba */
     uint32_t vaciados_en_pista,vaciados_eof;
     uint64_t silencio_eof_inicio;
     uint64_t silencio_en_pista,silencio_despues_eof;
@@ -152,6 +154,7 @@ typedef struct {
     struct taek_video_peticion *gpu;
     uint8_t *gpu_planos;
     int gpu_uso, gpu_a_soft;
+    int gpu_iris;   /* H195: cada fotograma lo presenta Iris en el plano de pantalla, sin copias de la CPU */
     uint32_t gpu_ultimo_idr, gpu_muestra_fallo;
     uint64_t gpu_cuadros, gpu_decod, gpu_cortes, gpu_ns, gpu_ns_copia;
     char motor_motivo[96];
@@ -159,6 +162,14 @@ typedef struct {
     int hay_pts_salida;
     int64_t pts_salida;
     mp4_contenedor video_inicio;
+    /* H187: sesion en flujo. Las muestras llegan de un programa; el audio no se saca del MP4 y el reloj parte del
+     * primer PTS de audio (primer_pts_fijo). */
+    int flujo, primer_pts_fijo;
+    /* H188: saltos (no mostrar antes de pts_desde), teclas para el programa y capa OSD */
+    int hay_desde; int64_t pts_desde;
+    uint8_t teclas[32]; unsigned teclas_n;
+    uint32_t *osd; unsigned osd_x, osd_y, osd_w, osd_h; size_t osd_bytes; uint64_t osd_hasta; int osd_activo;
+    uint32_t osd_version;   /* H196: sube con cada capa nueva; Iris solo la vuelve a subir a la GPU si cambia */
 } reproductor;
 
 typedef struct {
@@ -237,6 +248,15 @@ static int atender(reproductor *p) {
             if(p->audio_comprimido)p->audio_comprimido->error=MP4_ERROR_LECTURA;
         }
     }
+    if (p && p->flujo) {
+        /* H188: en flujo las teclas son del programa (pausa, saltos...). Solo Ctrl+C se queda aqui y cancela. */
+        char ct;
+        while ((ct = consola_leer_caracter()) != 0) {
+            if (ct == 3) p->cancelado = 1;
+            else if (p->teclas_n < sizeof(p->teclas)) p->teclas[p->teclas_n++] = (uint8_t)ct;
+        }
+        goto medido;
+    }
     while (teclado_hay_datos()) {
         char c = teclado_leer_caracter();
         if (c == 27 || c == 3 || c == 'q' || c == 'Q') {
@@ -253,6 +273,7 @@ static int atender(reproductor *p) {
             if (p && p->descriptor_vfs_audio >= 0) vfs_cancelar(p->descriptor_vfs_audio);
         }
     }
+medido:;
     uint64_t dt = rdtsc() - t0;
     if (p) {
         p->telem.ciclos_hda_usb += dt;
@@ -294,7 +315,7 @@ static int siguiente_audio(reproductor *p,const uint8_t **d,size_t *n,int64_t *p
 
 // PCM estéreo S16 44.1 kHz del dispositivo: objetivo 750 ms, servicio prioritario.
 static void reproductor_alimentar_audio(reproductor *p) {
-    if (!p || !p->dec_aac || !p->mp4 || !p->mp4->tiene_audio || p->modo != MODO_INTERACTIVO) return;
+    if (!p || p->flujo || !p->dec_aac || !p->mp4 || !p->mp4->tiene_audio || p->modo != MODO_INTERACTIVO) return;
     if(p->audio_eof)return;
     uint64_t ahora_servicio=tiempo_obtener_milisegundos();
     if(p->servicio_ultimo && ahora_servicio-p->servicio_ultimo>p->servicio_max_ms)
@@ -510,15 +531,57 @@ static void telem_print_fila_etapa(const char *etiqueta, uint64_t ciclos, uint64
 }
 
 static uint64_t reloj_maestro(reproductor *p) {
-    uint64_t t=audio_ac97_esta_reproduciendo()?audio_ac97_obtener_tiempo_ms():tiempo_obtener_milisegundos()-p->inicio;
+    uint64_t t=audio_ac97_esta_reproduciendo()?audio_ac97_obtener_tiempo_ms()+p->reloj_base_audio:tiempo_obtener_milisegundos()-p->inicio;
     if(t<p->reloj_maestro_ultimo)t=p->reloj_maestro_ultimo;
     p->reloj_maestro_ultimo=t;return t;
+}
+/* H188: capa del programa (controles). El framebuffer es memoria de video con escritura combinada: leerlo es
+ * lentisimo (con 1920x210 pixeles un cuadro llego a 121 ms). Por eso la capa se mezcla sobre el cuadro RGB en RAM
+ * ('img', antes de copiarlo) y en las bandas negras fuera de la imagen se escribe sin leer: capa sobre negro, o
+ * negro si ya vencio. ARGB premultiplicado. */
+static void osd_pintar(reproductor *p, uint32_t *img) {
+    uint8_t *fb = pantalla_obtener_base();
+    uint64_t paso = pantalla_obtener_stride_bytes();
+    int sw = (int)pantalla_obtener_ancho(), sh = (int)pantalla_obtener_alto();
+    if (!fb || !p->osd || !img) { p->osd_activo = 0; return; }
+    int ix0 = (sw - (int)p->ancho) / 2, iy0 = (sh - (int)p->alto) / 2;
+    if (ix0 < 0) ix0 = 0;
+    if (iy0 < 0) iy0 = 0;
+    int ix1 = ix0 + (int)p->ancho, iy1 = iy0 + (int)p->alto;
+    int vencido = tiempo_obtener_milisegundos() >= p->osd_hasta;
+    for (unsigned y = 0; y < p->osd_h; y++) {
+        int sy = (int)(p->osd_y + y);
+        if (sy >= sh) break;
+        uint32_t *d = (uint32_t *)(fb + (uint64_t)sy * paso) + p->osd_x;
+        const uint32_t *s = p->osd + (size_t)y * p->osd_w;
+        int fuera_y = sy < iy0 || sy >= iy1;
+        uint32_t *fila = fuera_y ? 0 : img + (size_t)(sy - iy0) * p->ancho;
+        for (unsigned x = 0; x < p->osd_w; x++) {
+            int sx = (int)(p->osd_x + x);
+            if (sx >= sw) break;
+            uint32_t c = vencido ? 0 : s[x], a = c >> 24;
+            if (fuera_y || sx < ix0 || sx >= ix1) { d[x] = c & 0xFFFFFFu; continue; }   /* banda: solo escribir */
+            if (!a) continue;
+            uint32_t *q = &fila[sx - ix0];
+            if (a == 255) { *q = c & 0xFFFFFFu; continue; }
+            /* rojo y azul juntos y luego verde, con /255 por desplazamientos */
+            uint32_t o = *q, na = 255 - a;
+            uint32_t rb = (o & 0xFF00FFu) * na + 0x800080u;
+            rb = ((rb + ((rb >> 8) & 0xFF00FFu)) >> 8) & 0xFF00FFu;
+            uint32_t g = (o & 0xFF00u) * na + 0x8000u;
+            g = ((g + ((g >> 8) & 0xFF00u)) >> 8) & 0xFF00u;
+            *q = (c & 0xFFFFFFu) + rb + g;   /* premultiplicado: no se pasa de 255 */
+        }
+    }
+    if (vencido) p->osd_activo = 0;
 }
 static int presentar_pendiente(reproductor *p,int esperar) {
     if(!p->presentaciones_pendientes)return 0;
     // 1. Espera de sincronización PTS (solo en MODO_INTERACTIVO)
     if (p->modo == MODO_INTERACTIVO) {
         int64_t delta = p->presentaciones_pts[p->presentaciones_cabeza] - p->primer_pts;
+        /* En flujo el video puede empezar unos ms antes que el audio: esos cuadros salen de inmediato. */
+        if (delta < 0 && p->flujo) delta = 0;
         if (delta < 0 || (uint64_t)delta / p->escala > 86400) {
             p->error = 1;
             return 1;
@@ -542,6 +605,7 @@ static int presentar_pendiente(reproductor *p,int esperar) {
                 if (atender(p)) return 1;
                 if(recargar(p,0)<0)return 1;
                 reproductor_alimentar_audio(p);
+                if(p->flujo)red_pila_sondeo();   /* H187: la descarga del programa sigue llegando mientras se espera */
                 trabajo_pts+=rdtsc()-t_trabajo;
                 esperar_microsegundos(200);
             }
@@ -571,6 +635,7 @@ static int presentar_pendiente(reproductor *p,int esperar) {
 
 
     uint64_t t=rdtsc();
+    if(p->osd_activo)osd_pintar(p,p->rgb+(size_t)p->presentaciones_cabeza*p->ancho*p->alto);
     pantalla_dibujar_imagen_centrada((int)p->ancho,(int)p->alto,p->rgb+(size_t)p->presentaciones_cabeza*p->ancho*p->alto);
     uint64_t dt=rdtsc()-t;p->telem.ciclos_copia_fb+=dt;
     traza_registrar(p->traza,0,TR_FRAMEBUFFER,p->muestra_actual,p->presentaciones_pts[p->presentaciones_cabeza],
@@ -608,11 +673,12 @@ static int presentar(void *usuario, const h264_imagen *im) {
     reproductor *p = (reproductor *)usuario;
     if (atender(p)) return 1;
 
+    if (p->hay_desde && im->marca_tiempo < p->pts_desde) return 0;   /* H188: salto, aun antes del destino */
     if (p->gpu_a_soft && p->hay_pts_salida && im->marca_tiempo <= p->pts_salida) return 0;
     p->pts_salida = im->marca_tiempo; p->hay_pts_salida = 1;
 
     if (!p->cuadros) {
-        p->primer_pts = im->marca_tiempo;
+        if (!p->primer_pts_fijo) p->primer_pts = im->marca_tiempo;
         p->inicio = tiempo_obtener_milisegundos();
     }
 
@@ -1330,6 +1396,11 @@ static struct limine_file *modulo_arranque(const char *nombre) {
         if (iguales(r->modules[i]->cmdline, nombre)) return r->modules[i];
     return NULL;
 }
+const void *taek_modulo_arranque(const char *cmdline, uint64_t *tamano) {
+    struct limine_file *f = modulo_arranque(cmdline);
+    if (tamano) *tamano = f ? f->size : 0;
+    return f ? f->address : NULL;
+}
 static void motivo_motor(reproductor *p, const char *m) {
     unsigned i = 0;
     while (m && m[i] && i + 1 < sizeof(p->motor_motivo)) { p->motor_motivo[i] = m[i]; i++; }
@@ -1337,12 +1408,17 @@ static void motivo_motor(reproductor *p, const char *m) {
 }
 static void gpu_cerrar(reproductor *p) {
     if (!p->gpu) return;
+    /* H195: primero el plano vuelve al firmware e Iris suelta lo importado; despues Media Driver destruye las superficies. */
+    if (p->gpu_iris) { video_gpu_orden(p->gpu, TAEK_VIDEO_IRIS_FIN); p->gpu_iris = 0; pantalla_limpiar(0); }
     video_gpu_orden(p->gpu, TAEK_VIDEO_CERRAR);
     p->gpu_decod += p->gpu->decodificados; p->gpu_cortes += p->gpu->cortes;
     p->gpu_ns += p->gpu->ns_gpu; p->gpu_ns_copia += p->gpu->ns_copia;
     soltar(p, p->gpu_planos); soltar(p, p->gpu);
     p->gpu_planos = NULL; p->gpu = NULL;
 }
+/* H201: rectangulo del video pedido por el programa (SYS_FLUJO MARCO). Vale para la sesion siguiente y se borra al cerrar. */
+static struct { int x, y, ancho, alto; } g_marco;
+uint32_t audio_hda_saltos_tardios(void);   /* H203: audio_hda.c */
 static void gpu_abrir(reproductor *p, mp4_contenedor *mp4) {
     const char *m = NULL;
     struct limine_file *f = modulo_arranque("taek:i915");
@@ -1370,11 +1446,72 @@ static void gpu_abrir(reproductor *p, mp4_contenedor *mp4) {
     }
     r->y = p->gpu_planos; r->u = r->y + ty; r->v = r->u + tc;
     p->gpu = r; p->gpu_uso = 1;
+    /* H195: solo a pedido ('h264 presentar iris'). H196: tambien en SYS_FLUJO, con el OSD del programa compuesto por Iris.
+     * H201: un marco pedido por el programa tambien la enciende (solo en flujo): el video en un rectangulo y la app encima. */
+    p->gpu_iris = video_gpu_presentar_iris() || (p->flujo && g_marco.ancho > 0);
+}
+
+/* H195: presentacion por Iris. Misma espera por PTS que presentar_pendiente; la conversion, el escalado y la copia a pantalla
+ * los hace la GPU (PRESENTAR_IRIS dibuja en un bufer de escaneo y cambia el plano en el vblank). */
+static int presentar_iris(reproductor *p, struct taek_video_peticion *r) {
+    if (atender(p)) return 1;
+    if (p->hay_desde && r->pts_salida < p->pts_desde) return 0;
+    p->pts_salida = r->pts_salida; p->hay_pts_salida = 1;
+    if (!p->cuadros) {
+        if (!p->primer_pts_fijo) p->primer_pts = r->pts_salida;
+        p->inicio = tiempo_obtener_milisegundos();
+    }
+    if (p->modo == MODO_INTERACTIVO) {
+        int64_t delta = r->pts_salida - p->primer_pts;
+        if (delta < 0) delta = 0;
+        uint64_t destino = (uint64_t)delta * 1000 / p->escala, ahora = reloj_maestro(p);
+        if (ahora < destino) {
+            uint64_t c_ms = tiempo_ciclos_por_ms(), t0 = rdtsc();
+            if (!c_ms) c_ms = 2500000;
+            while (reloj_maestro(p) < destino && rdtsc() - t0 < c_ms * 500ULL) {
+                if (atender(p)) return 1;
+                if (recargar(p, 0) < 0) return 1;
+                reproductor_alimentar_audio(p);
+                esperar_microsegundos(200);
+            }
+            uint64_t dt = rdtsc() - t0;
+            p->telem.ciclos_espera_pts += dt;
+            if (dt > p->telem.max_ciclos_espera_pts) p->telem.max_ciclos_espera_pts = dt;
+        } else {
+            uint64_t periodo = p->mp4->v_muestras ? p->mp4->v_duracion_ticks * 1000 / p->escala / p->mp4->v_muestras : 42;
+            if (!periodo) periodo = 42;
+            if (ahora - destino > 2 * periodo && p->ya_presentado) { p->cuadros_tardios++; p->cuadros++; return 0; }
+        }
+    }
+    uint64_t t = rdtsc();
+    r->dest_x = r->dest_y = r->dest_ancho = r->dest_alto = 0;   /* pantalla completa conservando la proporcion */
+    if (p->flujo && g_marco.ancho > 0) { r->dest_x = g_marco.x; r->dest_y = g_marco.y; r->dest_ancho = g_marco.ancho; r->dest_alto = g_marco.alto; }
+    /* H196: la capa del programa va a Iris; al vencer deja de dibujarse (no hay bandas que limpiar: Iris borra todo el bufer). */
+    if (p->osd_activo && tiempo_obtener_milisegundos() >= p->osd_hasta) p->osd_activo = 0;
+    r->osd_visible = p->osd_activo && p->osd;
+    r->osd_px = p->osd; r->osd_x = p->osd_x; r->osd_y = p->osd_y; r->osd_w = p->osd_w; r->osd_h = p->osd_h;
+    r->osd_version = p->osd_version;
+    int rc = video_gpu_orden(r, TAEK_VIDEO_PRESENTAR_IRIS);
+    uint64_t dt = rdtsc() - t;
+    p->telem.ciclos_copia_fb += dt;
+    if (dt > p->telem.max_ciclos_copia_fb) p->telem.max_ciclos_copia_fb = dt;
+    if (rc) { motivo_motor(p, r->motivo[0] ? r->motivo : "Iris no presento el fotograma"); p->error = 1; return 1; }
+    p->ultima_presentacion_ms = reloj_maestro(p); p->ya_presentado = 1;
+    p->telem.cuadros_presentados++;
+    p->cuadros++;
+    return 0;
 }
 /* Saca n fotogramas de la GPU hacia el mismo presentar del software. 1: cancelado; negativo: fallo de la GPU. */
 static int gpu_sacar(reproductor *p, unsigned n) {
     struct taek_video_peticion *r = p->gpu;
     while (n--) {
+        if (p->gpu_iris) {   /* H195: sin copiar pixeles */
+            int rc = video_gpu_orden(r, TAEK_VIDEO_TOMAR_GPU);
+            if (rc) return rc < 0 ? rc : TAEK_VIDEO_FALLO;
+            p->gpu_cuadros++;
+            if (presentar_iris(p, r)) return 1;
+            continue;
+        }
         int rc = video_gpu_orden(r, TAEK_VIDEO_TOMAR);
         if (rc) return rc < 0 ? rc : TAEK_VIDEO_FALLO;
         h264_imagen im = {r->y, r->u, r->v, r->ancho, r->alto, r->paso_y, r->paso_c, r->poc, r->pts_salida, r->rango_completo, r->matriz_color};
@@ -1883,6 +2020,293 @@ int reproductor_reproducir_fuente(mp4_lectura_posicional leer, void *contexto,
     liberar_memoria(muestra_video);
     liberar_memoria(metadatos);
     return resultado;
+}
+
+/* ======================================================================== H187: reproduccion en flujo
+ * El programa (Anillo 3) baja y demultiplexa; aqui solo se decodifica, se sincroniza con el audio y se presenta, con
+ * las mismas piezas del reproductor de archivos (GPU, presentar, reloj maestro). Ver struct taek_flujo. */
+typedef struct {
+    reproductor p;
+    mp4_contenedor mp4;
+    h264_decodificador *dec;
+    aac_decodificador *aac;
+    uint8_t avcc[1024];
+    h264_resultado avcc_sw;
+    int audio_iniciado, esperar_idr;
+    uint64_t t_inicio, muestras_v, muestras_a, bytes_v, bytes_a, pcm_bytes;
+    uint64_t ms_bloqueado;      /* tiempo dentro de VIDEO/AUDIO esperando la hora del cuadro o lugar en el audio */
+    uint32_t audio_reanudado, audio_descartes;   /* H203: veces que se reanudo el HDA detenido; tramas soltadas por tope */
+} flujo;
+static flujo *g_flujo;
+
+int reproductor_flujo_abierto(void) { return g_flujo != NULL; }
+
+/* H201: el marco del video. Dentro de la pantalla y de al menos 16 x 16; ancho 0 lo quita. */
+int reproductor_flujo_marco(int x, int y, int ancho, int alto) {
+    if (ancho <= 0 || alto <= 0) { g_marco.ancho = g_marco.alto = 0; return 0; }
+    int64_t sw = (int64_t)pantalla_obtener_ancho(), sh = (int64_t)pantalla_obtener_alto();
+    if (x < 0 || y < 0 || ancho < 16 || alto < 16 || (int64_t)x + ancho > sw || (int64_t)y + alto > sh) return -1;
+    g_marco.x = x; g_marco.y = y; g_marco.ancho = ancho; g_marco.alto = alto;
+    return 0;
+}
+int reproductor_flujo_iris(void) { return g_flujo && g_flujo->p.gpu_iris; }
+
+static void flujo_iniciar_audio(flujo *f) {
+    if (f->aac && !f->audio_iniciado && f->muestras_a) { audio_ac97_iniciar_stream(); f->audio_iniciado = 1; }
+}
+
+void reproductor_flujo_estado(int64_t *reloj_ms, uint32_t *cola_ms, uint32_t *cuadros, uint32_t *tardios, uint32_t *motor) {
+    flujo *f = g_flujo;
+    if (!f) { *reloj_ms = 0; *cola_ms = *cuadros = *tardios = *motor = 0; return; }
+    reproductor *p = &f->p;
+    *reloj_ms = (int64_t)(f->audio_iniciado || p->cuadros ? reloj_maestro(p) : 0);
+    *cola_ms = f->audio_iniciado || f->muestras_a ? (uint32_t)((uint64_t)audio_ac97_cola_ocupada() * 1000u / (44100u * 4u)) : 0;
+    *cuadros = p->telem.cuadros_presentados;
+    *tardios = p->cuadros_tardios;
+    *motor = p->gpu_a_soft ? 2 : p->gpu_uso ? 1 : 0;
+}
+
+int reproductor_flujo_cerrar(int drenar);
+
+/* H188: las teclas que el usuario pulso durante la sesion, para el programa. */
+unsigned reproductor_flujo_teclas(uint8_t *d, unsigned cap) {
+    flujo *f = g_flujo;
+    if (!f) return 0;
+    reproductor *p = &f->p;
+    atender(p);
+    unsigned n = p->teclas_n < cap ? p->teclas_n : cap;
+    for (unsigned i = 0; i < n; i++) d[i] = p->teclas[i];
+    for (unsigned i = n; i < p->teclas_n; i++) p->teclas[i - n] = p->teclas[i];
+    p->teclas_n -= n;
+    return n;
+}
+
+/* H188: capa del programa sobre el video. ms = 0 la quita (en el proximo cuadro). */
+int reproductor_flujo_osd(const uint32_t *px, unsigned x, unsigned y, unsigned w, unsigned h, unsigned ms) {
+    flujo *f = g_flujo;
+    if (!f) return -1;
+    reproductor *p = &f->p;
+    uint64_t sw = pantalla_obtener_ancho(), sh = pantalla_obtener_alto();
+    if (!ms) { p->osd_hasta = 0; return 0; }   /* osd_pintar repone el negro y la apaga */
+    if (!px || !w || !h || x >= sw || y >= sh || (uint64_t)x + w > sw || (uint64_t)y + h > sh) return -1;
+    size_t b = (size_t)w * h * 4;
+    if (b > p->osd_bytes) {
+        if (p->osd) soltar(p, p->osd);
+        p->osd = reservar(p, b);
+        p->osd_bytes = p->osd ? b : 0;
+        if (!p->osd) { p->osd_activo = 0; return -2; }
+    }
+    /* Si la capa cambia de lugar o tamano, la anterior se limpia primero en las bandas */
+    if (!p->gpu_iris && p->osd_activo && (p->osd_x != x || p->osd_y != y || p->osd_w != w || p->osd_h != h) && p->rgb) {
+        p->osd_hasta = 0; osd_pintar(p, p->rgb);   /* solo limpia las bandas: el cuadro siguiente tapa el resto */
+    }
+    memcpy(p->osd, px, b);
+    p->osd_version++;
+    p->osd_x = x; p->osd_y = y; p->osd_w = w; p->osd_h = h;
+    p->osd_hasta = tiempo_obtener_milisegundos() + ms; p->osd_activo = 1;
+    return 0;
+}
+
+int reproductor_flujo_abrir(const uint8_t *avcc, size_t n, unsigned canales, unsigned frecuencia, unsigned escala,
+                            int hay_desde, int64_t desde) {
+    if (g_flujo) reproductor_flujo_cerrar(0);
+    if (!avcc || n < 7 || n > sizeof(((flujo *)0)->avcc) || avcc[0] != 1 || !escala) return -1;
+    flujo *f = asignar_memoria(sizeof(*f));
+    if (!f) return -2;
+    memset(f, 0, sizeof(*f));
+    memcpy(f->avcc, avcc, n);
+    reproductor *p = &f->p;
+    p->modo = MODO_INTERACTIVO; p->fuente = "flujo"; p->flujo = 1;
+    p->hay_desde = hay_desde; p->pts_desde = desde;
+    p->descriptor_vfs_video = p->descriptor_vfs_audio = -1;
+    p->escala = escala; p->huella = UINT64_C(14695981039346656037);
+    memoria_estadisticas_t m; memoria_obtener_estadisticas(&m); p->heap_inicial = m.heap_bytes_en_uso;
+    f->mp4.avcc = f->avcc; f->mp4.avcc_bytes = n; f->mp4.v_longitud_nal = (avcc[4] & 3) + 1u;
+    f->mp4.v_escala_tiempo = escala;
+    f->mp4.tiene_audio = canales && frecuencia;
+    f->mp4.a_canales = canales; f->mp4.a_frecuencia = frecuencia;
+    p->mp4 = &f->mp4;
+
+    h264_servicios s = { p, reservar, soltar, presentar };
+    f->dec = h264_crear(&s);
+    if (!f->dec) { liberar_memoria(f); return -2; }
+    h264_configurar_sse2(f->dec, H264_INTER_SSE2 && x86_64_fpu_sse2_lista());
+    h264_configurar_trabajadores(f->dec, ejecutar_lote, p, trabajos_cpu_activas(), servir_coordinador);
+    p->dec_video = f->dec;
+    if (f->mp4.tiene_audio) {
+        aac_servicios sa = { .usuario = p, .asignar = reservar, .liberar = soltar };
+        f->aac = aac_crear(&sa);
+        if (f->aac) aac_configurar(f->aac, (int)canales, (int)frecuencia);
+        p->dec_aac = f->aac;
+    }
+    gpu_abrir(p, &f->mp4);
+    f->avcc_sw = h264_configurar_avcc(f->dec, f->avcc, n);
+    if (!p->gpu && f->avcc_sw) {
+        if (f->aac) aac_destruir(f->aac);
+        h264_destruir(f->dec); liberar_memoria(f);
+        return -3;
+    }
+    f->t_inicio = tiempo_obtener_milisegundos();
+    g_flujo = f;
+    consola_imprimir("[FLUJO] Abierto: escala "); consola_imprimir_dec(escala);
+    consola_imprimir(", audio "); consola_imprimir_dec(canales); consola_imprimir("x"); consola_imprimir_dec(frecuencia);
+    consola_imprimir(", motor "); consola_imprimir_linea(p->gpu ? "GPU Intel" : (p->motor_motivo[0] ? p->motor_motivo : "software"));
+    return 0;
+}
+
+static int flujo_resultado(reproductor *p) { return p->cancelado ? 1 : p->error ? -1 : 0; }
+
+int reproductor_flujo_video(const uint8_t *d, size_t n, int64_t pts) {
+    flujo *f = g_flujo;
+    if (!f || !d || !n) return -1;
+    reproductor *p = &f->p;
+    if (p->cancelado || p->error) return flujo_resultado(p);
+    flujo_iniciar_audio(f);
+    uint64_t t0 = tiempo_obtener_milisegundos();
+    red_pila_sondeo();
+    if (servir_coordinador(p) || presentar_pendiente(p, 0)) return flujo_resultado(p);
+    p->muestra_actual = (unsigned)f->muestras_v++; p->pts_actual = pts;
+    f->bytes_v += n;
+    unsigned lng = f->mp4.v_longitud_nal;
+    if (p->gpu) {
+        int rg = gpu_muestra(p, d, n, pts);
+        if (rg > 0) return flujo_resultado(p);
+        if (rg < 0) {
+            /* Sin las referencias de la GPU el software sigue desde el proximo IDR (esta misma muestra si lo es). */
+            motivo_motor(p, p->gpu->motivo[0] ? p->gpu->motivo : "fallo de la GPU");
+            p->gpu_muestra_fallo = p->muestra_actual; p->gpu_a_soft = 1;
+            gpu_cerrar(p);
+            consola_imprimir("[FLUJO] La GPU fallo ("); consola_imprimir(p->motor_motivo); consola_imprimir_linea("); sigue por software");
+            if (f->avcc_sw) { p->error = 1; return -1; }
+            f->esperar_idr = 1;
+        }
+    }
+    if (!p->gpu) {
+        if (f->esperar_idr) {
+            if (!muestra_con_idr(d, n, lng)) goto fin;
+            f->esperar_idr = 0;
+        }
+        h264_resultado r = h264_decodificar_muestra_avcc(f->dec, lng, d, n, pts);
+        if (r == H264_CANCELADO) { if (!p->error) p->cancelado = 1; }
+        else if (r) { p->error = 1; consola_imprimir("[FLUJO] H.264: "); consola_imprimir_linea(h264_error(f->dec)); }
+    }
+fin:
+    f->ms_bloqueado += tiempo_obtener_milisegundos() - t0;
+    return flujo_resultado(p);
+}
+
+int reproductor_flujo_audio(const uint8_t *d, size_t n, int64_t pts) {
+    flujo *f = g_flujo;
+    if (!f || !d || !n || n > 8192) return -1;
+    reproductor *p = &f->p;
+    if (!f->aac) return 0;
+    if (p->cancelado || p->error) return flujo_resultado(p);
+    if (!f->muestras_a++) { p->primer_pts = pts; p->primer_pts_fijo = 1; }
+    f->bytes_a += n;
+    const uint8_t *ptr = d; int rem = (int)n;
+    int16_t pcm[2048];
+    uint64_t t_aac = rdtsc();
+    int s = aac_decodificar(f->aac, &ptr, &rem, pcm);
+    p->telem.ciclos_aac += rdtsc() - t_aac;
+    if (s <= 0) return 0;   /* una trama mala se salta: el reloj sigue al DMA */
+    uint32_t bytes = (uint32_t)s * (uint32_t)sizeof(int16_t);
+    const uint8_t *o = (const uint8_t *)pcm;
+    uint64_t t0 = tiempo_obtener_milisegundos(), t_avance = t0;
+    while (bytes) {
+        int esc = audio_ac97_encolar_pcm(o, bytes);
+        if (esc > 0) { o += esc; bytes -= (uint32_t)esc; f->pcm_bytes += (uint32_t)esc; t_avance = tiempo_obtener_milisegundos(); continue; }
+        /* H203: el HDA se detuvo (atasco o error) con la cola llena: nunca se vaciaria. Se reanuda desde la cola y el
+         * reloj sigue donde iba (reloj_base_audio). */
+        if (f->audio_iniciado && !audio_ac97_esta_reproduciendo() && f->audio_reanudado < 8) {
+            p->reloj_base_audio = reloj_maestro(p);
+            f->audio_reanudado++;
+            consola_imprimir("[FLUJO] el audio se detuvo con la cola llena: se reanuda en ");
+            consola_imprimir_dec(p->reloj_base_audio); consola_imprimir_linea(" ms");
+            f->audio_iniciado = 0;
+            flujo_iniciar_audio(f);
+            t_avance = tiempo_obtener_milisegundos();
+            continue;
+        }
+        /* Cola llena: si aun no suena, que empiece; si suena, esperar mostrando lo que toque. */
+        flujo_iniciar_audio(f);
+        if (atender(p) || presentar_pendiente(p, 0)) break;
+        /* H203: tope. Dos segundos sin lugar en la cola: se suelta esta trama en vez de trabar al programa. */
+        if (tiempo_obtener_milisegundos() - t_avance > 2000) { f->audio_descartes++; break; }
+        red_pila_sondeo();
+        esperar_microsegundos(200);
+    }
+    if (!f->audio_iniciado && audio_ac97_cola_ocupada() >= 160u * 1024u) flujo_iniciar_audio(f);
+    f->ms_bloqueado += tiempo_obtener_milisegundos() - t0;
+    return flujo_resultado(p);
+}
+
+int reproductor_flujo_cerrar(int drenar) {
+    flujo *f = g_flujo;
+    if (!f) return -1;
+    reproductor *p = &f->p;
+    if (drenar && !p->cancelado && !p->error) {
+        flujo_iniciar_audio(f);
+        if (p->gpu) { if (gpu_drenar(p) < 0) p->error = 1; }
+        else if (!f->esperar_idr) h264_finalizar(f->dec);
+        while (!p->cancelado && !p->error && p->presentaciones_pendientes)
+            if (presentar_pendiente(p, 1)) break;
+        if (f->audio_iniciado) {
+            audio_ac97_drenar();
+            uint64_t t = tiempo_obtener_milisegundos();
+            while (audio_ac97_esta_reproduciendo() && tiempo_obtener_milisegundos() - t < 1500) {
+                if (atender(p)) break;
+                esperar_milisegundos(10);
+            }
+        }
+    }
+    uint64_t ms = tiempo_obtener_milisegundos() - f->t_inicio;
+    int era_iris = p->gpu_iris;
+    gpu_cerrar(p);
+    if (f->aac) { audio_ac97_detener(); aac_destruir(f->aac); }
+    int r = flujo_resultado(p);
+    consola_imprimir("[FLUJO] MS="); consola_imprimir_dec(ms);
+    consola_imprimir(" MUESTRAS_V="); consola_imprimir_dec(f->muestras_v);
+    consola_imprimir(" MUESTRAS_A="); consola_imprimir_dec(f->muestras_a);
+    consola_imprimir(" KB_V="); consola_imprimir_dec(f->bytes_v / 1024);
+    consola_imprimir(" KB_A="); consola_imprimir_dec(f->bytes_a / 1024);
+    consola_imprimir(" PRESENTADOS="); consola_imprimir_dec(p->telem.cuadros_presentados);
+    consola_imprimir(" BLOQUEADO_MS="); consola_imprimir_dec(f->ms_bloqueado);
+    consola_imprimir(" HEAP_PICO_KB="); consola_imprimir_dec(p->memoria_maxima / 1024);
+    consola_imprimir(" VACIADOS_AUDIO="); consola_imprimir_dec(audio_ac97_obtener_vaciados());
+    consola_imprimir(" RESULTADO="); consola_imprimir(r < 0 ? "-1" : r ? "1" : "0");
+    consola_imprimir_linea("");
+    {   /* H188: donde se va el tiempo (para los cuadros tardios) */
+        uint64_t c = tiempo_ciclos_por_ms(); if (!c) c = 2500000;
+        consola_imprimir("[FLUJO_T] RGB_MS="); consola_imprimir_dec(p->telem.ciclos_yuv_rgb / c);
+        consola_imprimir(" RGB_MAX_MS="); consola_imprimir_dec(p->telem.max_ciclos_yuv_rgb / c);
+        consola_imprimir(" FB_MS="); consola_imprimir_dec(p->telem.ciclos_copia_fb / c);
+        consola_imprimir(" FB_MAX_MS="); consola_imprimir_dec(p->telem.max_ciclos_copia_fb / c);
+        consola_imprimir(" PTS_MS="); consola_imprimir_dec(p->telem.ciclos_espera_pts / c);
+        consola_imprimir(" SERVICIO_MS="); consola_imprimir_dec(p->telem.ciclos_hda_usb / c);
+        consola_imprimir(" SERVICIO_MAX_MS="); consola_imprimir_dec(p->telem.max_ciclos_hda_usb / c);
+        consola_imprimir(" AAC_MS="); consola_imprimir_dec(p->telem.ciclos_aac / c);
+        consola_imprimir(" GPU_MS="); consola_imprimir_dec((p->gpu_ns + (p->gpu ? p->gpu->ns_gpu : 0)) / 1000000);
+        consola_imprimir(" RETRASO_MAX_MS="); consola_imprimir_dec(p->telem.retraso_pts_max_us / 1000);
+        consola_imprimir(" OSD="); consola_imprimir_dec(p->osd_bytes / 1024);
+        consola_imprimir(" OSD_VERSIONES="); consola_imprimir_dec(p->osd_version);
+        consola_imprimir(" IRIS="); consola_imprimir_dec((uint64_t)era_iris);   /* H201 */
+        consola_imprimir(" AUDIO_REANUDADO="); consola_imprimir_dec(f->audio_reanudado);   /* H203 */
+        consola_imprimir(" AUDIO_DESCARTES="); consola_imprimir_dec(f->audio_descartes);
+        consola_imprimir(" HDA_SALTOS_TARDIOS="); consola_imprimir_dec(audio_hda_saltos_tardios());
+        if (g_marco.ancho > 0) {
+            consola_imprimir(" MARCO="); consola_imprimir_dec((uint64_t)g_marco.ancho); consola_imprimir("x"); consola_imprimir_dec((uint64_t)g_marco.alto);
+            consola_imprimir("+"); consola_imprimir_dec((uint64_t)g_marco.x); consola_imprimir("+"); consola_imprimir_dec((uint64_t)g_marco.y);
+        }
+        consola_imprimir_linea("");
+    }
+    g_marco.ancho = g_marco.alto = 0;   /* H201: el marco era de esta sesion */
+    informe_motor_final(p, ms);
+    h264_destruir(f->dec);
+    if (p->rgb) soltar(p, p->rgb);
+    if (p->osd) soltar(p, p->osd);
+    g_flujo = NULL;
+    liberar_memoria(f);
+    return r;
 }
 
 static void reproducir(const char *nombre, enum modo_reproduccion modo) {

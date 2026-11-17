@@ -1022,6 +1022,9 @@ void taek_early_robada_detectar(struct pci_dev *d) {
 }
 
 unsigned long taek_early_fb_fisica(void) { return e.ops.fb_fisica(); }
+int taek_early_pantalla_copiar(const void *p, unsigned w, unsigned h, unsigned paso, int x, int y) {
+    return e.ops.pantalla_copiar ? e.ops.pantalla_copiar(p, w, h, paso, x, y) : -ENODEV;
+}
 
 /* ------------------------------------------------------------------ arranque */
 int taek_early_frontera_iniciar(const struct taek_early_ops *ops) {

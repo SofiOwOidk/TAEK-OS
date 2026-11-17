@@ -288,6 +288,36 @@ static int entrada_crear(struct operacion *o,struct operacion *lector,struct dir
     if(fin && pos+(uint64_t)entradas*32<(uint64_t)d->total*o->vol.bytes_cluster){memset(e,0,32);r=dir_escribir(o,d,pos+(uint64_t)entradas*32,e,1);}
     return r;
 }
+/* H147: entradas de un archivo o carpeta nuevos, sin un origen del que copiarlas. Fechas en 1980-01-01, como las copias
+ * entre formatos; carpeta: atributo 0x10 (y en exFAT su largo es el de su cluster), archivo: 0x20. */
+static int entrada_nueva(struct operacion *o,struct directorio *d,const uint16_t *nombre,unsigned n,uint32_t primero,uint64_t longitud,int carpeta){
+    unsigned entradas=o->vol.exfat?2+(n+14)/15:1+(n+12)/13;uint8_t alias[11];
+    int r=0;if(!o->vol.exfat){r=alias_generar(o,d,nombre,n,alias);if(r)return r;}
+    uint64_t pos;int fin;r=buscar_ranuras(o,d,entradas,&pos,&fin);if(r)return r;
+    uint8_t prim[32],stream[32],e[32];
+    if(o->vol.exfat){
+        memset(prim,0,32);memset(stream,0,32);
+        prim[0]=0x85;prim[1]=(uint8_t)(entradas-1);b16(prim+4,carpeta?0x10:0x20);
+        b32(prim+8,33u<<16);b32(prim+12,33u<<16);b32(prim+16,33u<<16);prim[22]=prim[23]=prim[24]=0x80;
+        stream[0]=0xc0;stream[1]=1;stream[3]=(uint8_t)n;   /* AllocationPossible; cadena en la FAT */
+        uint16_t h=0;for(unsigned i=0;i<n;i++){uint16_t u=o->vol.upcase[nombre[i]];h=suma16(h,(uint8_t)u);h=suma16(h,(uint8_t)(u>>8));}b16(stream+4,h);
+        b64(stream+8,longitud);b32(stream+20,primero);b64(stream+24,longitud);
+        uint16_t sum=0;for(unsigned i=0;i<entradas;i++){
+            if(!i)memcpy(e,prim,32);else if(i==1)memcpy(e,stream,32);else {memset(e,0,32);e[0]=0xc1;for(unsigned j=0;j<15;j++){unsigned k=(i-2)*15+j;if(k<n)b16(e+2+j*2,nombre[k]);}}
+            for(unsigned j=0;j<32;j++)if(i || (j!=2 && j!=3))sum=suma16(sum,e[j]);r=dir_escribir(o,d,pos+i*32,e,1);if(r)return r;
+        }b16(prim+2,sum);r=dir_escribir(o,d,pos,prim,1);if(r)return r;
+    }else {
+        memset(prim,0,32);memcpy(prim,alias,11);prim[11]=carpeta?0x10:0x20;b16(prim+16,33);b16(prim+18,33);b16(prim+24,33);
+        b16(prim+20,(uint16_t)(primero>>16));b16(prim+26,(uint16_t)primero);b32(prim+28,carpeta?0:(uint32_t)longitud);
+        unsigned lfn=entradas-1;uint8_t sum=checksum83(alias);static const unsigned offsets[]={1,3,5,7,9,14,16,18,20,22,24,28,30};
+        for(unsigned i=0;i<lfn;i++){unsigned ord=lfn-i;memset(e,0,32);e[0]=(uint8_t)(ord|(i?0:0x40));e[11]=15;e[13]=sum;
+            for(unsigned j=0;j<13;j++){unsigned k=(ord-1)*13+j;b16(e+offsets[j],k<n?nombre[k]:k==n?0:0xffff);}r=dir_escribir(o,d,pos+i*32,e,1);if(r)return r;}
+        r=dir_escribir(o,d,pos+lfn*32,prim,1);if(r)return r;
+    }
+    if(fin && pos+(uint64_t)entradas*32<(uint64_t)d->total*o->vol.bytes_cluster){memset(e,0,32);r=dir_escribir(o,d,pos+(uint64_t)entradas*32,e,1);}
+    return r;
+}
+
 static int entrada_eliminar(struct operacion *o,struct directorio *d,const struct fat_lector_nodo *n){
     for(unsigned i=0;i<n->entrada_cantidad;i++){uint8_t e[32];int r=dir_leer(o,d,n->entrada_posicion+i*32,e);if(r)return r;
         e[0]=o->vol.exfat?(uint8_t)(e[0]&127):0xe5;r=dir_escribir(o,d,n->entrada_posicion+i*32,e,1);if(r)return r;}return 0;
@@ -413,6 +443,81 @@ fin:
     if(padre)liberar_memoria(padre);if(nombre)liberar_memoria(nombre);if(src)liberar_memoria(src);
     return r;
 }
+/* H147: crear una carpeta vacia, o un archivo con 'datos' (si ya existe un archivo con ese nombre, se reemplaza en la
+ * misma operacion). Mismo esquema que copiar: validar el volumen entero, planear, marcar Dirty, escribir los datos en
+ * clusters que nadie referencia todavia, releerlos, confirmar los metadatos y limpiar Dirty; si algo falla, deshacer.
+ * Los clusters nuevos se reservan antes de soltar los del archivo reemplazado: si hay que deshacer, el viejo sigue ahi. */
+static int crear_interno(const struct particion *p,const char *ruta,int carpeta,const uint8_t *datos,uint64_t n){
+    if(!p || !ruta || (carpeta && n) || (n && !datos))return VOLUMEN_NOMBRE_INVALIDO;
+    if(p->formato!=VOLUMEN_FAT32 && p->formato!=VOLUMEN_EXFAT)return VOLUMEN_SOLO_LECTURA;
+    struct operacion *o=asignar_memoria_cero(sizeof(*o));
+    struct directorio *dd=asignar_memoria_cero(sizeof(*dd)),*nc=asignar_memoria_cero(sizeof(*nc)),*vc=asignar_memoria_cero(sizeof(*vc));
+    char *padre=asignar_memoria(RUTA_MAX),*nombre=asignar_memoria(FAT_LECTOR_NOMBRE);struct fat_lector_nodo *viejo=asignar_memoria(sizeof(*viejo));
+    int r=VOLUMEN_SIN_MEMORIA,reemplazar=0;
+    if(!o || !dd || !nc || !vc || !padre || !nombre || !viejo)goto fin;
+    r=preflight(o,p);if(r)goto fin;
+    r=validar_duenos(o);if(r)goto fin;
+    r=ruta_separar(ruta,padre,nombre);if(r)goto fin;
+    r=directorio_cargar(o,padre,dd);if(r)goto fin;
+    uint16_t utf16[255];unsigned unidades;r=nombre_validar(nombre,utf16,&unidades);if(r)goto fin;
+    r=fat_lector_resolver(&o->vol,ruta,viejo,0);
+    if(!r){
+        if(carpeta || viejo->directorio){r=VOLUMEN_EXISTE;goto fin;}
+        reemplazar=1;r=cadena(o,viejo,vc,0);if(r)goto fin;r=validar_asignados(o,vc);if(r)goto fin;
+    }else if(r!=VOLUMEN_NO_ENCONTRADO)goto fin;
+    if(!o->vol.exfat && n>UINT32_MAX){r=VOLUMEN_NO_SOPORTADO;goto fin;}
+    uint32_t bc=o->vol.bytes_cluster;
+    uint64_t cantidad=carpeta?1:n/bc+(n%bc!=0);
+    if(cantidad>o->vol.clusters){r=VOLUMEN_SIN_ESPACIO;goto fin;}
+    for(uint32_t i=0;i<cantidad;i++){uint32_t cl;r=cluster_reservar(o,&cl);if(r)goto fin;r=vector_agregar(nc,cl);if(r)goto fin;
+        if(i){r=fat_escribir(o,nc->cadena[i-1],cl,0);if(r)goto fin;}r=fat_escribir(o,cl,o->vol.exfat?UINT32_MAX:0x0fffffff,0);if(r)goto fin;}
+    uint32_t primero=nc->total?nc->cadena[0]:0;
+    if(carpeta){
+        /* Cluster nuevo a cero: en exFAT una carpeta vacia es eso. FAT32 pide ademas '.' (ella) y '..' (el padre; 0 si es la raiz). */
+        for(unsigned s=0;s<o->vol.sectores_cluster;s++){struct cambio *c;r=preparar(o,sector_cluster(o,primero)+s,0,&c);if(r)goto fin;memset(c->despues,0,512);}
+        if(!o->vol.exfat){
+            struct cambio *c;r=preparar(o,sector_cluster(o,primero),0,&c);if(r)goto fin;
+            uint32_t arriba=dd->nodo.cluster==o->vol.raiz?0:dd->nodo.cluster;
+            for(unsigned k=0;k<2;k++){uint8_t *e=c->despues+k*32;memset(e,' ',11);e[0]='.';if(k)e[1]='.';e[11]=0x10;
+                uint32_t cl=k?arriba:primero;b16(e+16,33);b16(e+18,33);b16(e+24,33);b16(e+20,(uint16_t)(cl>>16));b16(e+26,(uint16_t)cl);}
+        }
+    }
+    if(reemplazar){
+        r=entrada_eliminar(o,dd,viejo);if(r)goto fin;
+        for(uint32_t i=0;i<vc->total;i++){r=asignar(o,vc->cadena[i],0,2);if(r)goto fin;if(o->vol.exfat && !viejo->contiguo){r=fat_escribir(o,vc->cadena[i],0,2);if(r)goto fin;}}
+    }
+    r=entrada_nueva(o,dd,utf16,unidades,primero,carpeta?bc:n,carpeta);if(r)goto fin;
+    r=info_libres(o);if(r)goto fin;
+    r=sync(o);if(r)goto fin;r=marcar_dirty(o,1);if(r)goto fallo;
+    if(n){
+        struct sha256 h,verificado;uint8_t digest[32],real[32];sha256_iniciar(&h);sha256_iniciar(&verificado);
+        for(uint64_t off=0;off<n;){
+            unsigned k=(unsigned)(n-off>32768?32768:n-off),dentro=(unsigned)(off%bc);if(k>bc-dentro)k=bc-dentro;
+            memcpy(o->datos,datos+off,k);sha256_actualizar(&h,o->datos,k);unsigned bloques=(k+511)/512;memset(o->datos+k,0,bloques*512-k);
+            r=io(o,sector_cluster(o,nc->cadena[off/bc])+dentro/512,bloques,o->datos,1);if(r)goto fallo;off+=k;
+        }
+        r=sync(o);if(r)goto fallo;
+        for(uint64_t off=0;off<n;){
+            unsigned k=(unsigned)(n-off>32768?32768:n-off),dentro=(unsigned)(off%bc);if(k>bc-dentro)k=bc-dentro;
+            r=io(o,sector_cluster(o,nc->cadena[off/bc])+dentro/512,(k+511)/512,o->datos,0);if(r)goto fallo;
+            sha256_actualizar(&verificado,o->datos,k);off+=k;
+        }
+        sha256_final(&h,digest);sha256_final(&verificado,real);if(memcmp(digest,real,32)){r=VOLUMEN_CORRUPTO;goto fallo;}
+    }
+    r=commit(o);if(r)goto fallo;r=marcar_dirty(o,0);if(r)goto fallo;goto fin;
+fallo:
+    if(o->dirty){int restaurado=rollback(o);if(restaurado){consola_imprimir_linea("[ARCHIVOS] Fallo de restauracion; volumen Dirty. Revisar el medio antes de nuevas escrituras.");r=restaurado;}}
+fin:
+    if(o){while(o->cambios){struct cambio *c=o->cambios;o->cambios=c->siguiente;liberar_memoria(c);}fat_lector_desmontar(&o->vol);liberar_memoria(o);}
+    struct directorio *dirs[]={dd,nc,vc};for(unsigned i=0;i<3;i++)if(dirs[i]){if(dirs[i]->cadena)liberar_memoria(dirs[i]->cadena);liberar_memoria(dirs[i]);}
+    if(padre)liberar_memoria(padre);if(nombre)liberar_memoria(nombre);if(viejo)liberar_memoria(viejo);
+    return r;
+}
+int fat_crear(const struct particion *p,const char *ruta,int carpeta,const void *datos,uint64_t n){
+    if(__atomic_test_and_set(&ocupado,__ATOMIC_ACQUIRE))return VOLUMEN_OCUPADO;
+    int r=crear_interno(p,ruta,carpeta,datos,n);__atomic_clear(&ocupado,__ATOMIC_RELEASE);return r;
+}
+
 int fat_operar_archivo(const struct particion *p,const char *origen,const char *destino,enum fat_operacion op){
     if(__atomic_test_and_set(&ocupado,__ATOMIC_ACQUIRE))return VOLUMEN_OCUPADO;
     int r=operar_interno(p,0,origen,destino,op);__atomic_clear(&ocupado,__ATOMIC_RELEASE);return r;

@@ -80,6 +80,9 @@ struct taek_kernel_api {
     /* Paginas contiguas para objetos de la GPU, fuera del alcance de 32 bits; se liberan con
      * paginas_liberar. 0 si este equipo no tiene esa arena o no queda hueco. */
     uint64_t (*paginas_gpu_asignar)(uint32_t);
+    /* Opcional (H192): copia un bloque de pixeles de 32 bits al framebuffer real. x o y negativos se cuentan desde el borde
+     * derecho o inferior (-1 = pegado al borde). 0 bien, -1 si no cabe o no hay pantalla. Ruta de presentacion por CPU. */
+    int (*pantalla_copiar)(const void *,uint32_t,uint32_t,uint32_t,int32_t,int32_t);
 };
 #define TAEK_KERNEL_API_BASE_BYTES offsetof(struct taek_kernel_api,hid_mouse_tomar)
 #define TAEK_KERNEL_API_HID_BYTES offsetof(struct taek_kernel_api,fibra_crear)
@@ -90,6 +93,7 @@ struct taek_kernel_api {
 #define TAEK_KERNEL_API_MMIO_BYTES (offsetof(struct taek_kernel_api,ciclos_por_ms)+sizeof(((struct taek_kernel_api *)0)->ciclos_por_ms))
 #define TAEK_KERNEL_API_DMA_BYTES (offsetof(struct taek_kernel_api,fb_fisica)+sizeof(((struct taek_kernel_api *)0)->fb_fisica))
 #define TAEK_KERNEL_API_GPU_BYTES (offsetof(struct taek_kernel_api,paginas_gpu_asignar)+sizeof(((struct taek_kernel_api *)0)->paginas_gpu_asignar))
+#define TAEK_KERNEL_API_PANTALLA_BYTES (offsetof(struct taek_kernel_api,pantalla_copiar)+sizeof(((struct taek_kernel_api *)0)->pantalla_copiar))
 struct taek_driver {
     uint64_t magia;
     uint32_t bytes,version;

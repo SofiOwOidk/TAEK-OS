@@ -6,6 +6,9 @@
 #include "../../arquitectura/x86_64/serial.h"
 #include "../../base/memoria.h"
 #include "../../base/tiempo.h"
+#include "../../base/atencion.h"
+#include "red_cerrojo.h"
+#include "../../base/hilos.h"   /* H211: cerrojo de la red (Fase C) */
 
 // =====================================================================
 //  Pila IPv4 mínima de TAEK OS: Ethernet + ARP + IPv4 + ICMP + UDP +
@@ -182,6 +185,25 @@ static void red_arp_aprender(const struct red_arp *arp) {
     g_arp[elegido].ultimo_uso = tiempo_obtener_milisegundos();
 }
 
+/* H151: la cache ARP (8 vecinos, se reemplaza el menos usado) a la vista, y vaciarla a pedido. */
+int red_arp_listar(uint8_t ip[][4], uint8_t mac[][6], uint64_t edad_ms[], int max) { RED_EXCLUSIVA();
+    int n = 0;
+    uint64_t ahora = tiempo_obtener_milisegundos();
+    for (int i = 0; i < 8 && n < max; i++) {
+        if (!g_arp[i].valida) continue;
+        memcpy(ip[n], g_arp[i].ip, 4); memcpy(mac[n], g_arp[i].mac, 6);
+        edad_ms[n] = ahora - g_arp[i].ultimo_uso;
+        n++;
+    }
+    return n;
+}
+int red_arp_vaciar(void) { RED_EXCLUSIVA();
+    int n = 0;
+    for (int i = 0; i < 8; i++) n += g_arp[i].valida != 0;
+    memset(g_arp, 0, sizeof(g_arp));
+    return n;
+}
+
 static uint16_t g_ip_id = 1;
 
 // Ping
@@ -232,11 +254,42 @@ struct red_tcp_conexion {
     uint32_t rx_longitud;
     int      rx_completo;
     int      rx_desbordado;
+    uint32_t rx_ini;            // H177: inicio del anillo del flujo
+    uint8_t  ws_ok;             // H177: escalado de ventana negociado (RFC 7323), factor 2^RED_TCP_WS
+    uint8_t  sin_ack;           // H177: segmentos en orden aun sin ACK (H178: cada g_tcp_ack_cada)
+    int      flujo;             // H183: modo flujo (anillo, ACK retardado); antes era global
+    int      en_uso;            // H183: manejador reservado (1-7)
+    char    *anillo;            // H183: anillo propio del manejador (se conserva entre usos)
+    // H184: trozos recibidos fuera de orden, ya escritos en su lugar del anillo [ini, fin) en numeros de
+    // secuencia, y SACK (RFC 2018) si el otro lado lo permitio en su SYN.
+    uint32_t trozo_ini[8], trozo_fin[8];
+    uint8_t  n_trozos;
+    uint8_t  sack_ok;
 };
-static struct red_tcp_conexion g_tcp;
+// H183: tabla de conexiones. La 0 es la de siempre (stream de consola, archivos, HTTP/HTTPS del nucleo), con
+// su cerrojo g_tcp_ocupada; la 1-7 se piden por manejador (red_tcp_abrir) y no pausan el stream. 'g_tcp' es
+// la conexion en curso: los segmentos entrantes se reparten por IP y puertos y el codigo de siempre sigue
+// escribiendo g_tcp. Regla: no imprimir en consola con g_tcp_actual fuera de la 0 (la consola usa el stream).
+#define RED_TCP_CONEXIONES 8
+static struct red_tcp_conexion g_tcp_tabla[RED_TCP_CONEXIONES];
+static struct red_tcp_conexion *g_tcp_actual = &g_tcp_tabla[0];
+#define g_tcp (*g_tcp_actual)
+#define g_tcp_flujo (g_tcp.flujo)
 static unsigned char g_tcp_ocupada;
-static int g_tcp_flujo;
-static char g_tcp_flujo_rx[32768];
+static uint32_t g_tcp_recortes, g_tcp_fuera_orden;   // H184: diagnostico
+void red_tcp_contadores(uint32_t *recortes, uint32_t *fuera_orden) { *recortes = g_tcp_recortes; *fuera_orden = g_tcp_fuera_orden; }
+// H177: anillo de 256 KiB (antes 32 KiB lineal con desplazamiento byte a byte). Con escalado x8 la
+// ventana anunciada llega a 256 KiB: por WiFi a ~3 ms de RTT da techo de ~700 Mbit/s.
+#define RED_TCP_WS 4                 // x16: anuncios hasta 1 MiB; el tope real es g_tcp_ventana (H182)
+// H178: ACK cada N segmentos en orden (ACK "estirado") y siempre al vaciar una rafaga. Por WiFi cada
+// trama de subida cuesta ~200 us de aire fijos (DIFS, backoff, preambulo, ACK de capa 2) sin importar
+// la tasa: con N = 2 los ACK de TCP se comian ~85 % del aire a 100 Mbit/s. 'red ack N' lo cambia.
+static uint32_t g_tcp_ack_cada = 48;   // H180: medido en H179 con CCMP por hardware: 32 -> 364, 48 -> 387, 64 -> 379 Mbit/s
+int red_tcp_ack_cada(int n) { if (n >= 1 && n <= 64) g_tcp_ack_cada = (uint32_t)n; return (int)g_tcp_ack_cada; }
+static char g_tcp_flujo_rx[1048576];   // H182: 1 MiB de anillo; se anuncia como mucho g_tcp_ventana
+// H182: ventana anunciada maxima, ajustable con 'red ventana N' (KiB). H181 midio 256 KiB como la mejor.
+static uint32_t g_tcp_ventana = 262144;
+int red_tcp_ventana_kib(int kib) { if (kib >= 16 && kib <= 1024) g_tcp_ventana = (uint32_t)kib << 10; return (int)(g_tcp_ventana >> 10); }
 
 // Búferes de trabajo (reutilizados; operación sincrónica)
 static uint8_t g_trama[RED_MAX_TRAMA];
@@ -273,9 +326,10 @@ static void red_procesar_tcp(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t c
 static void red_tcp_temporizador(void);
 static void red_icmp_responder(const uint8_t *rx, uint32_t carga_len);
 
-void red_pila_sondeo(void) {
+void red_pila_sondeo(void) { if (red_cede_el_sondeo()) return; RED_EXCLUSIVA();
     const struct red_info *info = red_obtener_info();
     if (!info->controlador_listo) return;
+    atencion_marcar(&atencion_red);   /* H204, Fase 0: hueco entre dos pasadas por la pila */
 
     // Búfer local: evita que una transmisión (que puede reentrar vía ARP)
     // pise la trama que se está procesando.
@@ -333,6 +387,11 @@ void red_pila_sondeo(void) {
             int para_nosotros = (g_cfg.configurada && red_ip_igual(ip->destino, g_cfg.ip)) ||
                                 red_ip_igual(ip->destino, broadcast) ||
                                 red_ip_igual(ip->destino, (const uint8_t[4]){255,255,255,255});
+            // H169: durante el DHCP el servidor puede responder por unicast a la IP que va a
+            // conceder (p. ej. la concesion previa de esta MAC), aunque pidamos broadcast.
+            if (!para_nosotros && g_dhcp_esperado && ip->protocolo == RED_IP_UDP &&
+                carga_len >= sizeof(struct red_udp) &&
+                red_be16(((struct red_udp *)carga)->destino_port) == 68) para_nosotros = 1;
             if (!para_nosotros) continue;
 
             if (ip->protocolo == RED_IP_ICMP && carga_len >= sizeof(struct red_icmp)) {
@@ -420,7 +479,7 @@ static int red_enviar_ipv4(const uint8_t destino_ip[4], uint8_t protocolo,
 }
 
 // ------------------------------------------------------------------- ARP
-int red_arp_resolver(const uint8_t ip[4], uint8_t mac_salida[6], int timeout_ms) {
+int red_arp_resolver(const uint8_t ip[4], uint8_t mac_salida[6], int timeout_ms) { RED_EXCLUSIVA();
     for (int i = 0; i < 8; i++) {
         if (g_arp[i].valida && red_ip_igual(g_arp[i].ip, ip)) {
             g_arp[i].ultimo_uso=tiempo_obtener_milisegundos();
@@ -501,7 +560,7 @@ static void red_icmp_responder(const uint8_t *rx, uint32_t carga_len) {
     red_enviar_trama(g_trama, sizeof(struct red_eth) + 20 + carga_len);
 }
 
-int red_ping(const uint8_t ip[4], int intentos, int timeout_ms) {
+int red_ping(const uint8_t ip[4], int intentos, int timeout_ms) { RED_EXCLUSIVA();
     if (!g_cfg.configurada) return -1;
     g_ping_id = (uint16_t)(rdtsc() & 0xFFFF);
     g_ping_respuestas = 0;
@@ -591,11 +650,19 @@ static uint32_t red_dhcp_construir(uint8_t tipo, const uint8_t pedir_ip[4], cons
     return 240 + i;
 }
 
+// H172: contadores de respuestas DHCP para diagnosticar (red_dhcp_contadores).
+static uint32_t g_dhcp_vistos, g_dhcp_xid_mal, g_dhcp_tipo_mal;
+static uint8_t  g_dhcp_ultimo_tipo;
+void red_dhcp_contadores(uint32_t *vistos, uint32_t *xid_mal, uint32_t *tipo_mal, uint8_t *ultimo_tipo) { RED_EXCLUSIVA();
+    *vistos = g_dhcp_vistos; *xid_mal = g_dhcp_xid_mal; *tipo_mal = g_dhcp_tipo_mal; *ultimo_tipo = g_dhcp_ultimo_tipo;
+}
+
 static void red_procesar_dhcp(const uint8_t *datos, uint32_t longitud) {
     if (longitud < 240) return;
     const struct red_dhcp *dh = (const struct red_dhcp *)datos;
     if (dh->op != 2) return;
-    if (red_be32(dh->xid) != g_dhcp_xid) return;
+    g_dhcp_vistos++;
+    if (red_be32(dh->xid) != g_dhcp_xid) { g_dhcp_xid_mal++; return; }
 
     uint32_t off = 240;
     uint8_t tipo = 0;
@@ -620,7 +687,8 @@ static void red_procesar_dhcp(const uint8_t *datos, uint32_t longitud) {
         off += len;
     }
 
-    if (tipo != g_dhcp_esperado) return;
+    g_dhcp_ultimo_tipo = tipo;
+    if (tipo != g_dhcp_esperado) { g_dhcp_tipo_mal++; return; }
 
     memcpy(g_dhcp_ip, dh->yiaddr, 4);
     if (!red_ip_cero(mascara)) memcpy(g_dhcp_mascara, mascara, 4);
@@ -657,25 +725,37 @@ static int red_dhcp_emitir(uint8_t tipo, const uint8_t pedir_ip[4], const uint8_
     udp->checksum = 0;
     memcpy((uint8_t *)udp + sizeof(struct red_udp), g_payload, dhcp_len);
 
-    red_enviar_trama(g_trama, sizeof(struct red_eth) + 20 + sizeof(struct red_udp) + dhcp_len);
-
+    // H168: copia propia; red_pila_sondeo reutiliza g_trama (respuestas ARP). Se reenvia cada
+    // 1,5 s con el mismo xid (RFC 2131 4.1): por WiFi una sola trama perdida tumbaba el paso.
+    static uint8_t copia[RED_MAX_TRAMA];
+    uint32_t largo = sizeof(struct red_eth) + 20 + sizeof(struct red_udp) + dhcp_len;
+    if (largo > sizeof(copia)) return -1;
+    memcpy(copia, g_trama, largo);
     g_dhcp_esperado = esperado;
     g_dhcp_recibido = 0;
-    uint64_t inicio = tiempo_obtener_milisegundos();
+    red_enviar_trama(copia, largo);
+    uint64_t inicio = tiempo_obtener_milisegundos(), reenvio = inicio + 1500;
     while ((int)(tiempo_obtener_milisegundos() - inicio) < timeout_ms) {
         red_pila_sondeo();
-        if (g_dhcp_recibido) return 0;
+        if (g_dhcp_recibido) { g_dhcp_esperado = 0; return 0; }
+        if (tiempo_obtener_milisegundos() >= reenvio) { red_enviar_trama(copia, largo); reenvio += 1500; }
         esperar_milisegundos(1);
     }
+    g_dhcp_esperado = 0;
     return -1;
 }
 
-int red_dhcp(int timeout_ms) {
+int red_dhcp(int timeout_ms) { RED_EXCLUSIVA();
     const struct red_info *info = red_obtener_info();
     if (!info->controlador_listo) return -1;
     if (!info->enlace_activo) red_enlace_actualizar();
 
-    g_dhcp_xid = (uint32_t)rdtsc() ^ 0x5441454Bu;
+    // H172: el mismo xid durante 2 min: un servidor lento (prueba la IP antes de ofrecerla)
+    // responde al intento anterior, y con un xid nuevo esa oferta se descartaba.
+    static uint64_t xid_ms;
+    uint64_t ahora_xid = tiempo_obtener_milisegundos();
+    if (!g_dhcp_xid || ahora_xid - xid_ms > 120000) g_dhcp_xid = (uint32_t)rdtsc() ^ 0x5441454Bu;
+    xid_ms = ahora_xid;
     int por_intento = timeout_ms / 3;
     if (por_intento < 1000) por_intento = 1000;
 
@@ -759,7 +839,7 @@ static void red_procesar_dns(const uint8_t *datos, uint32_t longitud) {
     }
 }
 
-int red_resolver_nombre(const char *nombre, uint8_t ip_salida[4], int timeout_ms) {
+int red_resolver_nombre(const char *nombre, uint8_t ip_salida[4], int timeout_ms) { RED_EXCLUSIVA();
     if (!g_cfg.configurada) return -1;
 
     // ¿Ya es una IP literal?
@@ -820,9 +900,40 @@ static int red_tcp_enviar_segmento_seq(const uint8_t *datos, uint32_t longitud, 
     tcp->acuse = red_be32(g_tcp.ack);
     tcp->offset_reservado = 0x50; // 5 * 4 = 20 bytes, sin opciones
     tcp->banderas = banderas;
-    tcp->ventana = red_be16(g_tcp_flujo ? g_tcp.rx_capacidad - g_tcp.rx_longitud : 64240);
+    uint32_t libre = g_tcp_flujo ? g_tcp.rx_capacidad - g_tcp.rx_longitud : 64240;
+    if (g_tcp_flujo) {                           // H182: tope configurable
+        uint32_t tope = g_tcp_ventana > g_tcp.rx_longitud ? g_tcp_ventana - g_tcp.rx_longitud : 0;
+        if (tope < libre) libre = tope;
+    }
+    // H177: en el SYN la ventana no se escala; despues, si el otro lado acepto WS, va >> RED_TCP_WS.
+    uint32_t campo = (!(banderas & RED_TCP_SYN) && g_tcp.ws_ok) ? libre >> RED_TCP_WS : libre;
+    tcp->ventana = red_be16((uint16_t)(campo > 0xFFFF ? 0xFFFF : campo));
     tcp->urgente = 0;
-    if (longitud) memcpy(g_payload + sizeof(struct red_tcp), datos, longitud);
+    uint32_t opc = 0;
+    if (banderas & RED_TCP_SYN) {                // H177: MSS 1460, NOP, Window Scale; H184: NOP NOP SACK permitido
+        uint8_t *o = g_payload + sizeof(struct red_tcp);
+        o[0] = 2; o[1] = 4; o[2] = (uint8_t)(1460 >> 8); o[3] = (uint8_t)(1460 & 0xFF);
+        o[4] = 1; o[5] = 3; o[6] = 3; o[7] = RED_TCP_WS;
+        o[8] = 1; o[9] = 1; o[10] = 4; o[11] = 2;
+        opc = 12;
+        tcp->offset_reservado = 0x80;
+    } else if (g_tcp.sack_ok && g_tcp.n_trozos && (banderas & RED_TCP_ACK) && !longitud) {
+        // H184: hasta 3 bloques SACK con los trozos fuera de orden (el mas reciente primero).
+        uint8_t *o = g_payload + sizeof(struct red_tcp);
+        uint32_t k = g_tcp.n_trozos < 3 ? g_tcp.n_trozos : 3;
+        o[0] = 1; o[1] = 1; o[2] = 5; o[3] = (uint8_t)(2 + 8 * k);
+        for (uint32_t i = 0; i < k; i++) {
+            uint32_t j = g_tcp.n_trozos - 1 - i, a = g_tcp.trozo_ini[j], b = g_tcp.trozo_fin[j];
+            uint8_t *q = o + 4 + 8 * i;
+            q[0] = (uint8_t)(a >> 24); q[1] = (uint8_t)(a >> 16); q[2] = (uint8_t)(a >> 8); q[3] = (uint8_t)a;
+            q[4] = (uint8_t)(b >> 24); q[5] = (uint8_t)(b >> 16); q[6] = (uint8_t)(b >> 8); q[7] = (uint8_t)b;
+        }
+        opc = 4 + 8 * k;
+        tcp->offset_reservado = (uint8_t)(((20 + opc) / 4) << 4);
+    }
+    if (longitud) memcpy(g_payload + sizeof(struct red_tcp) + opc, datos, longitud);
+    longitud += opc;
+    g_tcp.sin_ack = 0;                           // todo segmento lleva el ACK acumulado
 
     // Pseudo-cabecera IPv4 para el checksum TCP.
     struct red_ipv4 pseudo;
@@ -850,7 +961,58 @@ static void red_tcp_guardar_ultimo(const uint8_t *datos, uint32_t longitud, uint
     g_tcp.ack_de_datos = 0;
 }
 
+static void red_procesar_tcp_una(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t carga_len);
+// H183: reparto por conexion.
 static void red_procesar_tcp(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t carga_len) {
+    if (carga_len < sizeof(struct red_tcp)) return;
+    const struct red_tcp *t = (const struct red_tcp *)tcp_carga;
+    uint16_t dp = red_be16(t->destino_port), sp = red_be16(t->origen_port);
+    for (int i = 0; i < RED_TCP_CONEXIONES; i++) {
+        struct red_tcp_conexion *c = &g_tcp_tabla[i];
+        if (!c->activa || c->puerto_local != dp || c->puerto_remoto != sp || !red_ip_igual(ip->origen, c->remota_ip)) continue;
+        struct red_tcp_conexion *previa = g_tcp_actual;
+        g_tcp_actual = c;
+        red_procesar_tcp_una(ip, tcp_carga, carga_len);
+        g_tcp_actual = previa;
+        return;
+    }
+}
+// H184: trozos fuera de orden. Se mantienen ordenados por llegada (el ultimo, el mas reciente: va primero en SACK).
+static void red_tcp_anotar_trozo(uint32_t a, uint32_t b) {
+    for (uint32_t i = 0; i < g_tcp.n_trozos; i++) {           // fundir con uno que se toque o solape
+        if ((int32_t)(a - g_tcp.trozo_fin[i]) <= 0 && (int32_t)(b - g_tcp.trozo_ini[i]) >= 0) {
+            uint32_t na = (int32_t)(a - g_tcp.trozo_ini[i]) < 0 ? a : g_tcp.trozo_ini[i];
+            uint32_t nb = (int32_t)(b - g_tcp.trozo_fin[i]) > 0 ? b : g_tcp.trozo_fin[i];
+            for (uint32_t j = i; j + 1 < g_tcp.n_trozos; j++) { g_tcp.trozo_ini[j] = g_tcp.trozo_ini[j + 1]; g_tcp.trozo_fin[j] = g_tcp.trozo_fin[j + 1]; }
+            g_tcp.n_trozos--;
+            red_tcp_anotar_trozo(na, nb);                          // puede tocar a otro mas
+            return;
+        }
+    }
+    if (g_tcp.n_trozos == 8) {                                  // lleno: se olvida el mas viejo (se reenviara)
+        for (uint32_t j = 0; j + 1 < 8; j++) { g_tcp.trozo_ini[j] = g_tcp.trozo_ini[j + 1]; g_tcp.trozo_fin[j] = g_tcp.trozo_fin[j + 1]; }
+        g_tcp.n_trozos--;
+    }
+    g_tcp.trozo_ini[g_tcp.n_trozos] = a; g_tcp.trozo_fin[g_tcp.n_trozos] = b; g_tcp.n_trozos++;
+}
+// Con el ACK avanzado, absorber los trozos que ahora quedan contiguos (sus bytes ya estan en el anillo).
+static void red_tcp_unir_trozos(void) {
+    for (int otra = 1; otra; ) {
+        otra = 0;
+        for (uint32_t i = 0; i < g_tcp.n_trozos; i++) {
+            if ((int32_t)(g_tcp.trozo_ini[i] - g_tcp.ack) > 0) continue;   // aun hay hueco antes
+            if ((int32_t)(g_tcp.trozo_fin[i] - g_tcp.ack) > 0) {
+                uint32_t extra = g_tcp.trozo_fin[i] - g_tcp.ack;
+                g_tcp.rx_longitud += extra; g_tcp.ack += extra;
+            }
+            for (uint32_t j = i; j + 1 < g_tcp.n_trozos; j++) { g_tcp.trozo_ini[j] = g_tcp.trozo_ini[j + 1]; g_tcp.trozo_fin[j] = g_tcp.trozo_fin[j + 1]; }
+            g_tcp.n_trozos--;
+            otra = 1;
+            break;
+        }
+    }
+}
+static void red_procesar_tcp_una(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t carga_len) {
     if (!g_tcp.activa) return;
     if (!red_ip_igual(ip->origen, g_tcp.remota_ip)) return;
     if (carga_len < sizeof(struct red_tcp) || red_tcp_checksum(ip, tcp_carga, carga_len) != 0) return;
@@ -875,6 +1037,16 @@ static void red_procesar_tcp(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t c
 
     if (banderas & RED_TCP_SYN) {
         if (g_tcp.estado == 1 && (banderas & RED_TCP_ACK) && ackno == g_tcp.isn + 1) {
+            // H177: Window Scale (kind 3) en el SYN-ACK = escalado aceptado en ambos sentidos.
+            for (uint32_t q = 20; q < doff; ) {
+                uint8_t k = tcp_carga[q];
+                if (k == 0) break;
+                if (k == 1) { q++; continue; }
+                if (q + 1 >= doff || tcp_carga[q + 1] < 2) break;
+                if (k == 3 && tcp_carga[q + 1] == 3) g_tcp.ws_ok = 1;
+                if (k == 4 && tcp_carga[q + 1] == 2) g_tcp.sack_ok = 1;      // H184
+                q += tcp_carga[q + 1];
+            }
             g_tcp.ack = seq + 1;
             g_tcp.seq = g_tcp.isn + 1;
             g_tcp.estado = 2;
@@ -892,19 +1064,51 @@ static void red_procesar_tcp(struct red_ipv4 *ip, uint8_t *tcp_carga, uint32_t c
     }
 
     if (datos_len > 0) {
+        // H184: segmento que se solapa con lo ya recibido (retransmision reempaquetada, RFC 9293 3.10.7.4):
+        // recortar el prefijo repetido y quedarse con el resto. Antes se descartaba entero y, con servidores
+        // de internet, el reenvio identico volvia a descartarse con espera exponencial (pausas de 10 s).
+        int32_t repetido = (int32_t)(g_tcp.ack - seq);
+        if (g_tcp.estado >= 2 && repetido > 0 && (uint32_t)repetido < datos_len) {
+            datos += repetido; datos_len -= (uint32_t)repetido; seq = g_tcp.ack;
+            g_tcp_recortes++;
+        }
         if (seq == g_tcp.ack) {
             uint32_t espacio = g_tcp.rx_capacidad - g_tcp.rx_longitud;
             uint32_t copiar = datos_len < espacio ? datos_len : espacio;
             if (copiar < datos_len && !g_tcp_flujo) g_tcp.rx_desbordado = 1;
-            if (copiar && g_tcp.rx_destino) {
+            if (copiar && g_tcp.rx_destino && g_tcp_flujo) {      // H177: anillo
+                uint32_t pos = (g_tcp.rx_ini + g_tcp.rx_longitud) % g_tcp.rx_capacidad;
+                uint32_t a = g_tcp.rx_capacidad - pos < copiar ? g_tcp.rx_capacidad - pos : copiar;
+                memcpy(g_tcp.rx_destino + pos, datos, a);
+                if (copiar > a) memcpy(g_tcp.rx_destino, datos + a, copiar - a);
+                g_tcp.rx_longitud += copiar;
+            } else if (copiar && g_tcp.rx_destino) {
                 memcpy(g_tcp.rx_destino + g_tcp.rx_longitud, datos, copiar);
                 g_tcp.rx_longitud += copiar;
             }
             // Flujo: confirmar solo bytes retenidos. Una ventana llena no debe
             // ACKear y perder la cola de una descarga binaria grande.
             g_tcp.ack += g_tcp_flujo ? copiar : datos_len;
+            // H184: si habia trozos adelantados, este segmento pudo cerrar el hueco: absorberlos y ACK inmediato.
+            int habia_trozos = g_tcp_flujo && g_tcp.n_trozos;
+            if (habia_trozos) red_tcp_unir_trozos();
+            // H177: ACK retardado en el flujo (RFC 1122 4.2.3.2: al menos cada 2 segmentos completos);
+            // red_tcp_flujo_recibir confirma lo pendiente en cada sondeo.
+            if (!habia_trozos && g_tcp_flujo && copiar == datos_len && ++g_tcp.sin_ack < g_tcp_ack_cada && !(banderas & RED_TCP_PSH)) goto sin_ack;
+        } else if ((int32_t)(seq - g_tcp.ack) > 0 && g_tcp_flujo && g_tcp.rx_destino) {
+            // H184: adelantado. Se escribe en su lugar del anillo (si cabe en el espacio libre) y se anota.
+            g_tcp_fuera_orden++;
+            uint32_t off = seq - g_tcp.ack, libre = g_tcp.rx_capacidad - g_tcp.rx_longitud;
+            if (off + datos_len <= libre) {
+                uint32_t pos = (g_tcp.rx_ini + g_tcp.rx_longitud + off) % g_tcp.rx_capacidad;
+                uint32_t a = g_tcp.rx_capacidad - pos < datos_len ? g_tcp.rx_capacidad - pos : datos_len;
+                memcpy(g_tcp.rx_destino + pos, datos, a);
+                if (datos_len > a) memcpy(g_tcp.rx_destino, datos + a, datos_len - a);
+                red_tcp_anotar_trozo(seq, seq + datos_len);
+            }
         }
         red_tcp_enviar_segmento(NULL, 0, RED_TCP_ACK);
+    sin_ack:;
     }
 
     if ((banderas & RED_TCP_FIN) && seq + datos_len == g_tcp.ack && !g_tcp.fin_recibido) {
@@ -932,10 +1136,18 @@ static int red_tcp_cond_ack(void) { return g_tcp.ack_de_datos || g_tcp.estado ==
 static int red_tcp_cond_cerrado(void) { return g_tcp.estado == 0 || g_tcp.estado == 4 || g_tcp.rx_completo; }
 
 static int red_tcp_conectar(const uint8_t ip[4], uint16_t puerto, int timeout_ms) {
+    int en_uso = g_tcp.en_uso; char *anillo = g_tcp.anillo;            // H183: datos del manejador
     memset(&g_tcp, 0, sizeof(g_tcp));
+    g_tcp.en_uso = en_uso; g_tcp.anillo = anillo;
     memcpy(g_tcp.remota_ip, ip, 4);
     g_tcp.puerto_remoto = puerto;
-    g_tcp.puerto_local = (uint16_t)(40000 + (rdtsc() % 20000));
+    for (int intento = 0; intento < 16; intento++) {                    // H183: puerto local unico en la tabla
+        g_tcp.puerto_local = (uint16_t)(40000 + (rdtsc() % 20000));
+        int repetido = 0;
+        for (int i = 0; i < RED_TCP_CONEXIONES; i++)
+            if (&g_tcp_tabla[i] != g_tcp_actual && g_tcp_tabla[i].activa && g_tcp_tabla[i].puerto_local == g_tcp.puerto_local) repetido = 1;
+        if (!repetido) break;
+    }
     g_tcp.isn = (uint32_t)rdtsc();
     g_tcp.seq = g_tcp.isn;
     g_tcp.ack = 0;
@@ -979,7 +1191,17 @@ static void red_tcp_cerrar(void) {
     g_tcp.estado = 0;
 }
 
-static void red_tcp_temporizador(void) {
+static void red_tcp_temporizador_una(void);
+static void red_tcp_temporizador(void) {           // H183: todas las conexiones
+    for (int i = 0; i < RED_TCP_CONEXIONES; i++) {
+        if (!g_tcp_tabla[i].activa) continue;
+        struct red_tcp_conexion *previa = g_tcp_actual;
+        g_tcp_actual = &g_tcp_tabla[i];
+        red_tcp_temporizador_una();
+        g_tcp_actual = previa;
+    }
+}
+static void red_tcp_temporizador_una(void) {
     if (!g_tcp.activa || g_tcp.ack_de_datos) return;
     if (g_tcp.estado == 0) return;
     if ((int)(tiempo_obtener_milisegundos() - g_tcp.ultimo_envio_ms) < RED_TCP_REENVIO_MS) return;
@@ -1039,9 +1261,11 @@ static int red_http_obtener_interno(const char *host, const char *ruta, uint16_t
 }
 
 int red_http_obtener(const char *host, const char *ruta, uint16_t puerto,
-                     char *salida, uint32_t capacidad, int timeout_ms) {
-    if (__atomic_test_and_set(&g_tcp_ocupada, __ATOMIC_ACQUIRE)) return -16;
+                     char *salida, uint32_t capacidad, int timeout_ms) { RED_EXCLUSIVA();
+    /* H143: primero se pausa la terminal por LAN, que es quien tiene la unica conexion TCP; antes se miraba si estaba
+     * libre y, con la LAN activa, HTTP devolvia siempre -16 (HTTPS ya lo hacia en este orden). */
     red_stream_pausar(1);
+    if (__atomic_test_and_set(&g_tcp_ocupada, __ATOMIC_ACQUIRE)) { red_stream_pausar(0); return -16; }
     int resultado = red_http_obtener_interno(host, ruta, puerto, salida, capacidad, timeout_ms);
     __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
     red_stream_pausar(0);
@@ -1053,7 +1277,7 @@ static int red_tcp_tiempo_restante(uint64_t inicio, int timeout_ms) {
     return transcurrido >= (uint64_t)timeout_ms ? 0 : timeout_ms - (int)transcurrido;
 }
 
-int red_tcp_flujo_abrir_timeout(const uint8_t ip[4], uint16_t puerto, int timeout_ms) {
+int red_tcp_flujo_abrir_timeout(const uint8_t ip[4], uint16_t puerto, int timeout_ms) { RED_EXCLUSIVA();
     if (!ip || !puerto || !g_cfg.configurada) return -2;
     if (__atomic_test_and_set(&g_tcp_ocupada, __ATOMIC_ACQUIRE)) return -16;
     uint8_t mac[6];
@@ -1068,6 +1292,7 @@ int red_tcp_flujo_abrir_timeout(const uint8_t ip[4], uint16_t puerto, int timeou
     g_tcp.rx_destino = g_tcp_flujo_rx;
     g_tcp.rx_capacidad = sizeof(g_tcp_flujo_rx);
     g_tcp.rx_longitud = 0;
+    g_tcp.rx_ini = 0;
     g_tcp.rx_desbordado = 0;
     g_tcp_flujo = 1;
     return 0;
@@ -1077,11 +1302,69 @@ fallo:
     return -3;
 }
 
-int red_tcp_flujo_abrir(const uint8_t ip[4], uint16_t puerto) {
+int red_tcp_flujo_abrir(const uint8_t ip[4], uint16_t puerto) { RED_EXCLUSIVA();
     return red_tcp_flujo_abrir_timeout(ip, puerto, 1500);
 }
 
-int red_tcp_flujo_enviar(const void *datos, uint32_t longitud) {
+/* H189: apertura sin bloquear para el stream de consola. Antes, con el receptor caido, cada reintento esperaba
+ * hasta 1,5 s dentro de consola/teclado y el sistema entero se congelaba ~1 s de cada 2,5 s.
+ * iniciar: 0 SYN enviado, 1 falta ARP (pedido ya enviado; reintentar), <0 fallo. El cerrojo queda tomado con 0. */
+int red_tcp_flujo_iniciar(const uint8_t ip[4], uint16_t puerto) { RED_EXCLUSIVA();
+    if (!ip || !puerto || !g_cfg.configurada) return -2;
+    if (__atomic_test_and_set(&g_tcp_ocupada, __ATOMIC_ACQUIRE)) return -16;
+    uint8_t mac[6];
+    const uint8_t *siguiente = red_misma_subred(ip) ? ip : g_cfg.puerta;
+    red_pila_sondeo();                     /* procesa la respuesta ARP del intento anterior (y ping, DHCP...) */
+    if (red_arp_resolver(siguiente, mac, 5) != 0) {           /* envia la peticion; la respuesta se toma al volver */
+        __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
+        return 1;
+    }
+    int en_uso = g_tcp.en_uso; char *anillo = g_tcp.anillo;
+    memset(&g_tcp, 0, sizeof(g_tcp));
+    g_tcp.en_uso = en_uso; g_tcp.anillo = anillo;
+    memcpy(g_tcp.remota_ip, ip, 4);
+    g_tcp.puerto_remoto = puerto;
+    for (int intento = 0; intento < 16; intento++) {
+        g_tcp.puerto_local = (uint16_t)(40000 + (rdtsc() % 20000));
+        int repetido = 0;
+        for (int i = 0; i < RED_TCP_CONEXIONES; i++)
+            if (&g_tcp_tabla[i] != g_tcp_actual && g_tcp_tabla[i].activa && g_tcp_tabla[i].puerto_local == g_tcp.puerto_local) repetido = 1;
+        if (!repetido) break;
+    }
+    g_tcp.isn = (uint32_t)rdtsc();
+    g_tcp.seq = g_tcp.isn;
+    g_tcp.estado = 1;
+    g_tcp.activa = 1;
+    red_tcp_guardar_ultimo(NULL, 0, RED_TCP_SYN);
+    if (red_tcp_enviar_segmento(NULL, 0, RED_TCP_SYN) != 0) {
+        g_tcp.activa = 0; g_tcp.estado = 0;
+        __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
+        return -3;
+    }
+    return 0;
+}
+/* 1 establecida (queda como flujo), 0 aun no, <0 rechazada o caida (cerrojo liberado). */
+int red_tcp_flujo_sondear(void) { RED_EXCLUSIVA();
+    red_pila_sondeo();
+    if (g_tcp.estado == 2) {
+        g_tcp.rx_destino = g_tcp_flujo_rx;
+        g_tcp.rx_capacidad = sizeof(g_tcp_flujo_rx);
+        g_tcp.rx_longitud = 0;
+        g_tcp.rx_ini = 0;
+        g_tcp.rx_desbordado = 0;
+        g_tcp_flujo = 1;
+        return 1;
+    }
+    if (!g_tcp.activa || g_tcp.estado != 1) { red_tcp_flujo_abandonar(); return -1; }
+    return 0;
+}
+/* Corta un intento en curso (plazo vencido). */
+void red_tcp_flujo_abandonar(void) { RED_EXCLUSIVA();
+    g_tcp.activa = 0; g_tcp.estado = 0;
+    __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
+}
+
+int red_tcp_flujo_enviar(const void *datos, uint32_t longitud) { RED_EXCLUSIVA();
     if (!g_tcp_flujo || !g_tcp.activa || g_tcp.estado != 2 ||
         !datos || !longitud || longitud > RED_TCP_MAX_SEGMENTO) return -1;
     if (!g_tcp.ack_de_datos) return 1;
@@ -1090,26 +1373,119 @@ int red_tcp_flujo_enviar(const void *datos, uint32_t longitud) {
     return red_tcp_enviar_segmento_seq(datos, longitud, RED_TCP_ACK | RED_TCP_PSH, g_tcp.seq_ultimo);
 }
 
-int red_tcp_flujo_recibir(void *datos, uint32_t capacidad) {
+int red_tcp_flujo_recibir(void *datos, uint32_t capacidad) { RED_EXCLUSIVA();
     if (!g_tcp_flujo || !datos || !capacidad) return -1;
     red_pila_sondeo();
     uint32_t n = g_tcp.rx_longitud < capacidad ? g_tcp.rx_longitud : capacidad;
-    if (n) {
-        memcpy(datos, g_tcp_flujo_rx, n);
-        for (uint32_t i = n; i < g_tcp.rx_longitud; ++i) g_tcp_flujo_rx[i-n] = g_tcp_flujo_rx[i];
+    if (n) {                                     // H177: lectura del anillo
+        uint32_t cap = g_tcp.rx_capacidad, a = cap - g_tcp.rx_ini < n ? cap - g_tcp.rx_ini : n;
+        uint32_t antes = cap - g_tcp.rx_longitud;
+        memcpy(datos, g_tcp.rx_destino + g_tcp.rx_ini, a);
+        if (n > a) memcpy((uint8_t *)datos + a, g_tcp.rx_destino, n - a);
+        g_tcp.rx_ini = (g_tcp.rx_ini + n) % cap;
         g_tcp.rx_longitud -= n;
-        if (g_tcp.activa && g_tcp.estado == 2) red_tcp_enviar_segmento(NULL, 0, RED_TCP_ACK);
+        // ACK si hay segmentos sin confirmar o si la ventana se reabre de forma apreciable.
+        if (g_tcp.activa && g_tcp.estado == 2 && (g_tcp.sin_ack >= g_tcp_ack_cada || antes < 2 * RED_TCP_MAX_SEGMENTO || n >= cap / 4))
+            red_tcp_enviar_segmento(NULL, 0, RED_TCP_ACK);
         return (int)n;
     }
+    if (g_tcp.sin_ack && g_tcp.activa && g_tcp.estado == 2) red_tcp_enviar_segmento(NULL, 0, RED_TCP_ACK);
     if (!g_tcp.activa || g_tcp.estado != 2 || g_tcp.rx_desbordado) return -1;
     return 0;
 }
 
-void red_tcp_flujo_cerrar(void) {
+void red_tcp_flujo_cerrar(void) { RED_EXCLUSIVA();
     if (!g_tcp_flujo) return;
     if (g_tcp.activa && g_tcp.estado == 2) red_tcp_enviar_segmento(NULL, 0, RED_TCP_RST | RED_TCP_ACK);
     g_tcp.activa = 0; g_tcp.estado = 0; g_tcp_flujo = 0;
     __atomic_clear(&g_tcp_ocupada, __ATOMIC_RELEASE);
+}
+
+// ------------------------------------------------- H183: conexiones por manejador (1-7)
+// Igual que el flujo de la conexion 0 (anillo, ventana escalada, ACK estirado), pero cada una con su anillo
+// de 256 KiB y sin pausar el stream de consola. El envio sigue siendo de un segmento a la vez.
+#define RED_TCP_ANILLO_H (256u * 1024u)
+static struct red_tcp_conexion *red_tcp_h(int id) {
+    if (id < 1 || id >= RED_TCP_CONEXIONES || !g_tcp_tabla[id].en_uso) return 0;
+    return &g_tcp_tabla[id];
+}
+
+int red_tcp_abrir(const uint8_t ip[4], uint16_t puerto, int timeout_ms) { RED_EXCLUSIVA();
+    if (!ip || !puerto || !g_cfg.configurada) return -2;
+    int id = -1;
+    for (int i = 1; i < RED_TCP_CONEXIONES; i++) if (!g_tcp_tabla[i].en_uso) { id = i; break; }
+    if (id < 0) return -16;
+    struct red_tcp_conexion *c = &g_tcp_tabla[id];
+    if (!c->anillo) c->anillo = asignar_memoria(RED_TCP_ANILLO_H);
+    if (!c->anillo) return -12;
+    c->en_uso = 1;
+    uint8_t mac[6];
+    uint64_t inicio = tiempo_obtener_milisegundos();
+    const uint8_t *siguiente = red_misma_subred(ip) ? ip : g_cfg.puerta;
+    int arp = timeout_ms / 2;
+    if (arp < 200) arp = 200;
+    if (arp > 2000) arp = 2000;
+    if (red_arp_resolver(siguiente, mac, arp) != 0) { c->en_uso = 0; return -3; }
+    int restante = red_tcp_tiempo_restante(inicio, timeout_ms);
+    struct red_tcp_conexion *previa = g_tcp_actual;
+    g_tcp_actual = c;
+    int r = restante ? red_tcp_conectar(ip, puerto, restante) : -2;
+    if (!r) {
+        g_tcp.rx_destino = g_tcp.anillo;
+        g_tcp.rx_capacidad = RED_TCP_ANILLO_H;
+        g_tcp.rx_longitud = 0;
+        g_tcp.rx_ini = 0;
+        g_tcp.rx_desbordado = 0;
+        g_tcp.flujo = 1;
+    } else {
+        g_tcp.activa = 0; g_tcp.estado = 0; g_tcp.en_uso = 0;
+    }
+    g_tcp_actual = previa;
+    return r ? -3 : id;
+}
+
+// 0 = segmento aceptado, 1 = el anterior aun sin ACK (reintentar), -1 = conexion caida o parametros.
+int red_tcp_enviar_h(int id, const void *datos, uint32_t longitud) { RED_EXCLUSIVA();
+    struct red_tcp_conexion *c = red_tcp_h(id);
+    if (!c) return -1;
+    struct red_tcp_conexion *previa = g_tcp_actual;
+    g_tcp_actual = c;
+    int r = red_tcp_flujo_enviar(datos, longitud);
+    g_tcp_actual = previa;
+    return r;
+}
+
+// Bytes leidos, 0 si no hay nada todavia, -1 si la conexion termino y no quedan datos.
+int red_tcp_recibir_h(int id, void *datos, uint32_t capacidad) { RED_EXCLUSIVA();
+    struct red_tcp_conexion *c = red_tcp_h(id);
+    if (!c) return -1;
+    struct red_tcp_conexion *previa = g_tcp_actual;
+    g_tcp_actual = c;
+    int r = red_tcp_flujo_recibir(datos, capacidad);
+    if (r < 0 && g_tcp.estado == 4 && g_tcp.rx_longitud == 0) r = -1;   /* FIN del otro lado y anillo vacio */
+    g_tcp_actual = previa;
+    return r;
+}
+
+// 1 = establecida, 2 = el otro lado cerro (quedan datos por leer o no), 0 = caida o cerrada.
+int red_tcp_estado_h(int id) { RED_EXCLUSIVA();
+    struct red_tcp_conexion *c = red_tcp_h(id);
+    if (!c || !c->activa) return 0;
+    return c->estado == 2 ? 1 : c->estado == 4 ? 2 : 0;
+}
+
+void red_tcp_cerrar_h(int id) { RED_EXCLUSIVA();
+    struct red_tcp_conexion *c = red_tcp_h(id);
+    if (!c) return;
+    struct red_tcp_conexion *previa = g_tcp_actual;
+    g_tcp_actual = c;
+    if (g_tcp.activa && (g_tcp.estado == 2 || g_tcp.estado == 4)) red_tcp_enviar_segmento(NULL, 0, RED_TCP_RST | RED_TCP_ACK);
+    g_tcp.activa = 0; g_tcp.estado = 0; g_tcp.flujo = 0; g_tcp.en_uso = 0;
+    g_tcp_actual = previa;
+}
+
+void red_tcp_cerrar_todas_h(void) { RED_EXCLUSIVA();
+    for (int i = 1; i < RED_TCP_CONEXIONES; i++) if (g_tcp_tabla[i].en_uso) red_tcp_cerrar_h(i);
 }
 
 static int red_tcp_cond_respuesta(void) {
@@ -1120,7 +1496,7 @@ static int red_tcp_cond_respuesta(void) {
 int red_tcp_intercambiar(const uint8_t ip[4], uint16_t puerto,
                         const void *cabecera, uint32_t cabecera_len,
                         const void *datos, uint32_t longitud,
-                        void *respuesta, uint32_t respuesta_len, int timeout_ms) {
+                        void *respuesta, uint32_t respuesta_len, int timeout_ms) { RED_EXCLUSIVA();
     if (!ip || !puerto || !cabecera || !cabecera_len || cabecera_len > RED_TCP_MAX_SEGMENTO ||
         !datos || !longitud || longitud > 128 * 1024 || !respuesta ||
         !respuesta_len || respuesta_len > RED_TCP_MAX_SEGMENTO ||
@@ -1161,13 +1537,13 @@ const struct red_config *red_obtener_config(void) {
     return &g_cfg;
 }
 
-void red_configurar_vacia(void) {
+void red_configurar_vacia(void) { RED_EXCLUSIVA();
     memset(&g_cfg, 0, sizeof(g_cfg));
     memset(g_arp, 0, sizeof(g_arp));
 }
 
 int red_ip_estatica(const uint8_t ip[4], const uint8_t mascara[4],
-                    const uint8_t puerta[4], const uint8_t dns[4]) {
+                    const uint8_t puerta[4], const uint8_t dns[4]) { RED_EXCLUSIVA();
     if (!ip || !mascara || !puerta) return -1;
     memcpy(g_cfg.ip, ip, 4);
     memcpy(g_cfg.mascara, mascara, 4);
@@ -1222,7 +1598,7 @@ int red_texto_a_ip(const char *texto, uint8_t ip_salida[4]) {
 }
 
 // ------------------------------------------------------------- Autodiagnóstico
-void red_autodiagnostico(void) {
+void red_autodiagnostico(void) { RED_EXCLUSIVA();
     red_log_linea("");
     red_log_linea("==============================================================");
     red_log_linea("  AUTODIAGNÓSTICO DE RED ETHERNET (e1000/e1000e) - TAEK OS");
@@ -1328,3 +1704,50 @@ void red_autodiagnostico(void) {
     red_log_linea("==============================================================");
     red_log_linea("");
 }
+
+/* ------------------------------------------------------------------ H211, Fase C: hilo de red en CPU 3
+ * Bombea la pila (red_pila_sondeo: tramas, ARP, DHCP, TCP y sus temporizadores) y atiende el stream de la consola
+ * (red_stream_atender: envio al PC, teclas del PC, reconexion WiFi). Si hubo tramas, vuelve enseguida; si no, duerme
+ * 1 ms. Va en CPU 3 y no en la 2 del plan: alli corre el hilo de audio de tiempo real, y el de red puede tener el
+ * cerrojo mucho tiempo (descifrar WiFi, reconectar), cosa que en la misma CPU le quitaria el turno al audio. */
+cerrojo_t g_cerrojo_red = CERROJO("red");
+static evento_t g_ev_red = EVENTO("red_hilo");
+static hilo_t *g_hilo_red;
+static volatile int g_red_modo;
+static uint64_t g_red_pasadas;
+
+int red_hilo_activo(void) { return __atomic_load_n(&g_red_modo, __ATOMIC_ACQUIRE) && g_hilo_red; }
+int red_cede_el_sondeo(void) { return red_hilo_activo() && !cerrojo_es_mio(&g_cerrojo_red); }
+
+static void hilo_red(void *u) {
+    (void)u;
+    for (;;) {
+        if (!__atomic_load_n(&g_red_modo, __ATOMIC_ACQUIRE)) { hilo_esperar(&g_ev_red); continue; }
+        const struct red_info *info = red_obtener_info();
+        uint64_t rx_antes = info ? info->rx_paquetes : 0;
+        int tomado = 0;
+        uint64_t limite = rdtsc() + tiempo_ciclos_por_ms() / 20u;
+        while (!(tomado = cerrojo_intentar(&g_cerrojo_red)) && rdtsc() < limite) __asm__ volatile("pause");
+        if (tomado) {
+            red_pila_sondeo();
+            red_stream_atender();
+            g_red_pasadas++;
+            cerrojo_soltar(&g_cerrojo_red);
+        }
+        if (tomado && info && info->rx_paquetes != rx_antes) hilo_ceder();   /* Hay trafico: otra vuelta ya */
+        else hilo_dormir_ms(1);
+    }
+}
+
+int red_hilo(int encender) {
+    if (encender && !g_hilo_red) {
+        g_hilo_red = hilo_crear(hilo_red, 0, "red", 3, HILO_NORMAL, 0);
+        if (!g_hilo_red) return -1;
+    }
+    int antes = g_red_modo;
+    __atomic_store_n(&g_red_modo, encender ? 1 : 0, __ATOMIC_RELEASE);
+    if (encender && !antes) evento_senalar(&g_ev_red);
+    return g_red_modo;
+}
+uint64_t red_hilo_pasadas(void) { return g_red_pasadas; }
+void red_cerrojo_forzar(void) { cerrojo_forzar(&g_cerrojo_red, 200); }

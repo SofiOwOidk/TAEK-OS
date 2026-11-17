@@ -6,6 +6,8 @@
 #include "../base/tiempo.h"
 #include "../base/memoria.h"
 #include "../base/huevo.h"
+#include "../base/cerrojo.h"   /* H211 */
+#include "../base/hilos.h"
 
 // --- REGISTROS MMIO DE INTEL HIGH DEFINITION AUDIO ---
 #define REG_GCAP           0x00 // 16 bits: Global Capabilities
@@ -104,6 +106,7 @@ static uint32_t       g_ultimo_pos_ram = 0;
 static uint32_t       g_ultimo_lpib_reg = 0;
 static uint64_t       g_t_ultimo_bloque = 0;
 static uint64_t       g_t_ultimo_progreso = 0;
+static uint32_t       g_saltos_tardios = 0;   /* H203: avances grandes aceptados por atencion atrasada (desde el arranque) */
 static uint32_t      *g_pos_buffer = NULL;
 static uint64_t       g_pos_buffer_fisica = 0;
 static uint8_t        g_stream_idx = 0;
@@ -279,8 +282,21 @@ struct hda_nodo_salida {
 
 static struct hda_nodo_salida g_hda_nodos_salida[HDA_MAX_NODOS_SALIDA];
 static uint8_t g_hda_num_nodos_salida = 0;
-static int g_hda_volumen_db = -24;
+static int g_hda_volumen_db = -35;   /* H208: volumen por defecto del sistema, a pedido del usuario (antes -24) */
 static int g_hda_silenciado = 0;
+
+/* H211, Fase C del gestor de hilos: un cerrojo para el estado del HDA (cola PCM, anillo DMA, reloj, volumen). Lo toma
+ * cada funcion publica al entrar (HDA_EXCLUSIVO) y lo suelta al salir; es recursivo por CPU. El servicio del DMA lo
+ * hace un hilo de tiempo real en CPU 2 cada ~5 ms; con el encendido, audio_hda_actualizar() vuelve sin hacer nada
+ * fuera de el, salvo que quien llama ya tenga el cerrojo (drenar o encolar esperan con el tomado y atienden ellos). */
+static cerrojo_t g_cerrojo_hda = CERROJO("audio");
+static void hda_soltar_exclusivo(int *p) { (void)p; cerrojo_soltar(&g_cerrojo_hda); }
+#define HDA_EXCLUSIVO() int hda_exclusivo_ __attribute__((cleanup(hda_soltar_exclusivo), unused)) = (cerrojo_tomar(&g_cerrojo_hda), 1)
+static volatile int g_hda_hilo_modo;
+static hilo_t *g_hda_hilo;
+static int hda_cede_el_servicio(void) {
+    return __atomic_load_n(&g_hda_hilo_modo, __ATOMIC_ACQUIRE) && g_hda_hilo && !cerrojo_es_mio(&g_cerrojo_hda);
+}
 
 static void hda_registrar_nodo_salida(uint8_t codec, uint8_t nodo, uint8_t tipo, uint8_t num_entradas) {
     for (uint8_t i = 0; i < g_hda_num_nodos_salida; i++) {
@@ -474,7 +490,7 @@ int audio_hda_obtener_volumen_db(void) {
     return g_hda_volumen_db;
 }
 
-int audio_hda_fijar_volumen_db(int db) {
+int audio_hda_fijar_volumen_db(int db) { HDA_EXCLUSIVO();
     if (db > 6) db = 6;
     if (db < -60) db = -60;
     g_hda_volumen_db = db;
@@ -482,7 +498,7 @@ int audio_hda_fijar_volumen_db(int db) {
     return g_hda_volumen_db;
 }
 
-int audio_hda_ajustar_volumen_db(int delta_db) {
+int audio_hda_ajustar_volumen_db(int delta_db) { HDA_EXCLUSIVO();
     return audio_hda_fijar_volumen_db(g_hda_volumen_db + delta_db);
 }
 
@@ -490,7 +506,7 @@ int audio_hda_esta_silenciado(void) {
     return g_hda_silenciado;
 }
 
-void audio_hda_fijar_silencio(int silenciar) {
+void audio_hda_fijar_silencio(int silenciar) { HDA_EXCLUSIVO();
     g_hda_silenciado = silenciar ? 1 : 0;
     hda_aplicar_volumen_nodos(g_hda_volumen_db, g_hda_silenciado);
 }
@@ -679,7 +695,7 @@ static int hda_arrancar_stream_hardware(void) {
     return 0;
 }
 
-void audio_hda_actualizar(void) {
+void audio_hda_actualizar(void) { if (hda_cede_el_servicio()) return; HDA_EXCLUSIVO();
     if (!g_hda_estado.inicializado) return;
     if (g_hda_estado.estado_reproductor != HDA_ESTADO_REPRODUCIENDO &&
         g_hda_estado.estado_reproductor != HDA_ESTADO_DRENANDO) {
@@ -757,7 +773,7 @@ void audio_hda_actualizar(void) {
     }
 
     // 3. Contabilizar avance del cursor DMA con verificación estricta de monotonicidad
-    int salto_valido = 0;
+    int salto_valido = 0, salto_tardio = 0;
     if (fuente_activa) {
         uint32_t delta = 0;
         if (pos_cruda >= g_pos_dma_anterior) {
@@ -774,6 +790,17 @@ void audio_hda_actualizar(void) {
                 g_pos_dma_anterior = pos_cruda;
                 g_t_ultimo_progreso = t_ahora;
                 salto_valido = 1;
+            } else if (delta < HDA_TAMANO_TOTAL_DMA - 4096 &&
+                       (uint64_t)delta <= (t_ahora - g_t_ultimo_progreso) * 192u + 8192u) {
+                // H203: atencion atrasada, no salto erratico. Si el servicio tardo mas que un bloque (~370 ms), el
+                // avance es real y cuadra con el tiempo transcurrido (192 B/ms cubre hasta 48 kHz estereo de 16 bits).
+                // Rechazarlo dejaba el reloj quieto y al segundo se declaraba un atasco falso que detenia el audio.
+                g_hda_estado.bytes_dma_totales += delta;
+                g_pos_dma_anterior = pos_cruda;
+                g_t_ultimo_progreso = t_ahora;
+                salto_valido = 1;
+                salto_tardio = 1;
+                g_saltos_tardios++;
             } else {
                 // Salto errático rechazado: NO avanza bytes_dma_totales y NO puede liberar bloques
                 g_hda_estado.saltos_posicion_rechazados++;
@@ -828,6 +855,11 @@ void audio_hda_actualizar(void) {
                 hda_llenar_bloque_dma(bloque_liberado, nueva_gen);
                 g_t_ultimo_bloque = t_ahora;
             }
+        } else if (salto_tardio) {
+            // H203: dio la vuelta entera (paso por el otro bloque y volvio): el otro ya se toco y esta libre.
+            uint8_t otro = (uint8_t)(g_bloque_en_dma ^ 1);
+            hda_llenar_bloque_dma(otro, g_bloque_gen[g_bloque_en_dma] + 1);
+            g_t_ultimo_bloque = t_ahora;
         }
     }
 
@@ -845,13 +877,13 @@ void audio_hda_actualizar(void) {
     }
 }
 
-int audio_hda_esta_reproduciendo(void) {
+int audio_hda_esta_reproduciendo(void) { HDA_EXCLUSIVO();
     audio_hda_actualizar();
     return (g_hda_estado.estado_reproductor == HDA_ESTADO_REPRODUCIENDO ||
             g_hda_estado.estado_reproductor == HDA_ESTADO_DRENANDO);
 }
 
-void audio_hda_detener(void) {
+void audio_hda_detener(void) { HDA_EXCLUSIVO();
     if (!g_hda_estado.inicializado) return;
 
     // 1. Confirmar parada del motor DMA antes de tocar la memoria
@@ -935,7 +967,7 @@ static int hda_iniciar_reproduccion(const void *datos_pcm, uint32_t tamano_bytes
     return hda_arrancar_stream_hardware();
 }
 
-int audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+int audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) { HDA_EXCLUSIVO();
     if (!g_hda_estado.inicializado || !datos_pcm || tamano_bytes == 0) {
         return -1;
     }
@@ -1009,7 +1041,7 @@ int audio_hda_encolar_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
     return (int)a_escribir;
 }
 
-int audio_hda_iniciar_stream(void) {
+int audio_hda_iniciar_stream(void) { HDA_EXCLUSIVO();
     if (!g_hda_estado.inicializado) return -1;
     if (g_hda_estado.estado_reproductor == HDA_ESTADO_REPRODUCIENDO) return 0;
 
@@ -1053,7 +1085,7 @@ int audio_hda_iniciar_stream(void) {
     return hda_arrancar_stream_hardware();
 }
 
-int audio_hda_drenar(void) {
+int audio_hda_drenar(void) { HDA_EXCLUSIVO();
     if (!g_hda_estado.inicializado) return -1;
     if (g_hda_estado.estado_reproductor == HDA_ESTADO_REPRODUCIENDO) {
         g_hda_estado.estado_reproductor = HDA_ESTADO_DRENANDO;
@@ -1063,11 +1095,11 @@ int audio_hda_drenar(void) {
     return 0;
 }
 
-enum hda_estado_reproductor audio_hda_obtener_estado_reproductor(void) {
+enum hda_estado_reproductor audio_hda_obtener_estado_reproductor(void) { HDA_EXCLUSIVO();
     return g_hda_estado.estado_reproductor;
 }
 
-void audio_hda_volcar_trazas(void) {
+void audio_hda_volcar_trazas(void) { HDA_EXCLUSIVO();
     serial_imprimir_linea("--- VOLCADO DE TRAZAS HDA (ÚLTIMOS EVENTOS EN RAM) ---");
     uint32_t total = (g_traza_total < HDA_MAX_TRAZAS) ? g_traza_total : HDA_MAX_TRAZAS;
     uint32_t start = (g_traza_total < HDA_MAX_TRAZAS) ? 0 : (g_traza_head % HDA_MAX_TRAZAS);
@@ -1108,22 +1140,22 @@ void audio_hda_volcar_trazas(void) {
     serial_imprimir_linea("-----------------------------------------------------");
 }
 
-uint32_t audio_hda_cola_ocupada(void) {
+uint32_t audio_hda_cola_ocupada(void) { HDA_EXCLUSIVO();
     return g_cola_ocupada;
 }
 
-uint32_t audio_hda_cola_disponible(void) {
+uint32_t audio_hda_cola_disponible(void) { HDA_EXCLUSIVO();
     if (g_cola_ocupada >= HDA_COLA_PCM_CAPACIDAD) return 0;
     return HDA_COLA_PCM_CAPACIDAD - g_cola_ocupada;
 }
 
-uint64_t audio_hda_obtener_tiempo_ms(void) {
+uint64_t audio_hda_obtener_tiempo_ms(void) { HDA_EXCLUSIVO();
     if (!g_hda_estado.inicializado) return 0;
     // 44100 Hz * 16 bits (2B) * 2 canales = 176400 bytes/segundo
     return (g_hda_estado.bytes_dma_totales * 1000ULL) / 176400ULL;
 }
 
-void audio_hda_reiniciar_reloj(void) {
+void audio_hda_reiniciar_reloj(void) { HDA_EXCLUSIVO();
     g_hda_estado.bytes_reproducidos = 0;
     g_hda_estado.bytes_dma_totales = 0;
 
@@ -1144,15 +1176,16 @@ void audio_hda_reiniciar_reloj(void) {
     }
 }
 
-uint32_t audio_hda_obtener_vaciados(void) {
+uint32_t audio_hda_saltos_tardios(void) { return g_saltos_tardios; }   /* H203 */
+uint32_t audio_hda_obtener_vaciados(void) { HDA_EXCLUSIVO();
     return g_vaciados_stream;
 }
 
-int audio_hda_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) {
+int audio_hda_reproducir_pcm(const void *datos_pcm, uint32_t tamano_bytes) { HDA_EXCLUSIVO();
     return hda_iniciar_reproduccion(datos_pcm, tamano_bytes, 0);
 }
 
-int audio_hda_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes) {
+int audio_hda_reproducir_pcm_bucle(const void *datos_pcm, uint32_t tamano_bytes) { HDA_EXCLUSIVO();
     return hda_iniciar_reproduccion(datos_pcm, tamano_bytes, 1);
 }
 
@@ -1165,7 +1198,7 @@ int audio_hda_esta_operativo(void) {
 }
 
 // --- INICIALIZACIÓN DEL CONTROLADOR INTEL HDA ---
-int audio_hda_iniciar(void) {
+int audio_hda_iniciar(void) { HDA_EXCLUSIVO();
     if (g_hda_estado.inicializado) return 0;
 
     serial_imprimir_linea("[HDA] Escaneando bus PCI en busca de controladores de audio (Intel HDA / Multimedia)...");
@@ -1453,3 +1486,36 @@ int audio_hda_iniciar(void) {
     serial_imprimir_linea("[HDA AVISO] Ningún controlador Intel HDA / Audio completó la inicialización.");
     return -1;
 }
+
+/* H211, Fase C: el servicio del DMA del HDA, cada ~5 ms (hilo_dormir_ms(4) con tictac de 1 ms), en CPU 2 con prioridad
+ * de tiempo real. Si CPU 0 tiene el cerrojo (encolando o drenando, que atienden ellos), se insiste hasta ~50 us. */
+static evento_t g_ev_hda = EVENTO("audio_hilo");
+static uint64_t g_hda_hilo_pasadas;
+static void hilo_hda(void *u) {
+    (void)u;
+    for (;;) {
+        if (!__atomic_load_n(&g_hda_hilo_modo, __ATOMIC_ACQUIRE)) { hilo_esperar(&g_ev_hda); continue; }
+        int tomado = 0;
+        uint64_t limite = rdtsc() + tiempo_ciclos_por_ms() / 20u;
+        while (!(tomado = cerrojo_intentar(&g_cerrojo_hda)) && rdtsc() < limite) __asm__ volatile("pause");
+        if (tomado) {
+            audio_hda_actualizar();
+            g_hda_hilo_pasadas++;
+            cerrojo_soltar(&g_cerrojo_hda);
+        }
+        hilo_dormir_ms(4);
+    }
+}
+int audio_hda_hilo(int encender) {
+    if (encender < 0) return __atomic_load_n(&g_hda_hilo_modo, __ATOMIC_ACQUIRE) && g_hda_hilo;   /* Solo consulta */
+    if (encender && !g_hda_estado.inicializado) return -1;
+    if (encender && !g_hda_hilo) {
+        g_hda_hilo = hilo_crear(hilo_hda, 0, "audio_hda", 2, HILO_TIEMPO_REAL, 0);
+        if (!g_hda_hilo) return -1;
+    }
+    int antes = g_hda_hilo_modo;
+    __atomic_store_n(&g_hda_hilo_modo, encender ? 1 : 0, __ATOMIC_RELEASE);
+    if (encender && !antes) evento_senalar(&g_ev_hda);
+    return g_hda_hilo_modo;
+}
+uint64_t audio_hda_hilo_pasadas(void) { return g_hda_hilo_pasadas; }

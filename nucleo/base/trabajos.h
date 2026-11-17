@@ -20,9 +20,16 @@ void trabajos_cancelar(trabajos_lote *);
 int trabajos_terminados(const trabajos_lote *);
 /* Backend kernel: no reentrante, sólo BSP. servicio nunca se ejecuta en AP. */
 int trabajos_ejecutar(trabajo_fn, void *, unsigned, void (*servicio)(void *), void *);
+/* H205: manda la IPI 81 a todas las CPU arrancadas menos la que llama; las despierta y les hace atender la TLB. */
+void trabajos_ipi_demas(void);
+/* H206: IPI 81 a una sola CPU (0 a 3); nada si es la que llama */
+void trabajos_ipi_cpu(unsigned cpu);
+/* H206: 1 si hay un lote publicado que esa CPU todavia no atendio */
+int trabajos_pendiente_en(unsigned cpu);
 unsigned trabajos_cpu_activas(void);
 int trabajos_bsp_calcula(void);
 unsigned trabajos_cpu_arrancadas(void);
+uint64_t trabajos_ocupado_ciclos(unsigned cpu);   /* H151 */
 unsigned trabajos_cpu_detectadas(void);
 /* Reloj calibrado del ejecutor: 0 = BSP, 1..3 = AP. 0 si no hay dato. */
 uint64_t trabajos_ticks_por_ms(unsigned cpu);

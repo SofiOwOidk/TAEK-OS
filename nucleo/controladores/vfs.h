@@ -95,6 +95,8 @@ int vfs_listar_pagina(const char *,unsigned);
 const char *vfs_obtener_ruta_catalogo(void);
 enum vfs_tipo_archivo vfs_inspeccionar_archivo(const char *,int *);
 int vfs_consultar_ruta(const char *,enum vfs_tipo_nodo *);
+/* H145: cada entrada de la carpeta a f (devolver distinto de 0 la corta), sin imprimir. */
+int vfs_recorrer_directorio(const char *ruta,int (*f)(void *ctx,const char *nombre,uint64_t tam,int carpeta),void *ctx);
 
 // Desmonta el volumen actualmente activo
 void vfs_desmontar(void);
@@ -176,6 +178,8 @@ int  vfs_crear_archivo(const char *nombre, const char *contenido);
 
 // Crea un nuevo directorio ('mkdir')
 int  vfs_crear_directorio(const char *nombre);
+// H147: crea o reemplaza un archivo con n bytes (FAT32/exFAT)
+int  vfs_escribir_archivo(const char *ruta, const void *datos, uint64_t n);
 
 // Mueve un archivo de una ruta a otra ('mover')
 int  vfs_mover_archivo(const char *origen, const char *destino);

@@ -1,7 +1,9 @@
+#include "../base/cerrojo.h"
 #include "consola.h"
 #include "audio_ac97.h"
 #include "pantalla.h"
 #include "teclado.h"
+#include "ps2.h"
 #include "xhci.h"
 #include "driver_ram.h"
 #include "puntero.h"
@@ -11,6 +13,7 @@
 #include "red/remoto.h"
 #include "red/stream.h"
 #include "../base/memoria.h"
+#include "../base/atencion.h"
 #define RETENIDAS 1024
 #define COLUMNAS_MAX 240
 struct celda { uint32_t fg,bg; uint8_t glifo; };
@@ -59,7 +62,9 @@ uint64_t consola_linea_visible(unsigned fila){
     uint64_t base=g_linea>=(uint64_t)g_filas?g_linea-g_filas+1:0;
     return fila>=(unsigned)g_filas?UINT64_MAX:base-g_vista+fila;
 }
+static int g_pantalla_cedida;
 void consola_puntero_presentar(void){
+    if(g_pantalla_cedida)return;
     const struct puntero_estado *p=puntero_obtener_estado();
     if(!g_puntero_sucio && p->secuencia==g_puntero_secuencia)return;
     if(g_puntero_dibujado)for(int y=g_puntero_y/16;y<=(g_puntero_y+13)/16;y++)
@@ -73,9 +78,18 @@ void consola_puntero_presentar(void){
     g_puntero_x=p->x;g_puntero_y=p->y;g_puntero_dibujado=1;
 }
 void consola_lote_iniciar(void){g_lote++;}
-static void presentar(void){if(g_redibujar){repintar();g_redibujar=0;}}
+static void presentar(void){if(g_redibujar && !g_pantalla_cedida){repintar();g_redibujar=0;}}
 void consola_lote_finalizar(void){if(g_lote && !--g_lote)presentar();}
+/* Mientras otro dueño pinta, el texto se sigue guardando (lote) y el serial y la LAN siguen recibiendolo. */
+void consola_ceder_pantalla(int ceder){
+    if(ceder==g_pantalla_cedida)return;
+    g_pantalla_cedida=ceder;
+    if(ceder){g_lote++;return;}
+    g_lote--;repintar();g_redibujar=0;
+}
+void consola_repintar_ahora(void){if(!g_pantalla_cedida){repintar();g_redibujar=0;}}
 void consola_desplazar(int n){
+    if(g_pantalla_cedida)return;
     uint64_t base=g_linea>=(uint64_t)g_filas?g_linea-g_filas+1:0;
     uint64_t primero=g_linea>=RETENIDAS?g_linea-RETENIDAS+1:0;
     int max=(int)(base-primero);int vista=(int)g_vista+n;
@@ -110,7 +124,8 @@ void consola_iniciar(void) {
 
 void consola_limpiar(void) {
     g_puntero_dibujado=0;g_puntero_sucio=1;
-    pantalla_limpiar(g_color_bg);
+    /* H151: con la pantalla cedida (una aplicacion de Anillo 3 pinta) no se toca el framebuffer */
+    if(!g_pantalla_cedida)pantalla_limpiar(g_color_bg);else g_redibujar=1;
     g_cursor_x = 0;
     g_cursor_y = 0;
     g_linea=0;g_vista=0;nueva_linea();
@@ -138,7 +153,39 @@ static void consola_avanzar_linea(void) {
     }
 }
 
+/* H151: captura para SYS_ORDEN. Mientras dura, cada caracter va tambien a un bufer; un cambio de color se anota como
+ * 0x01 R G B. El texto sigue llegando a la consola guardada, al serial y a la LAN, como cualquier orden. */
+static char *g_cap; static uint32_t g_cap_cap, g_cap_n, g_cap_fg; static int g_cap_corto;
+void consola_captura_iniciar(char *b, uint32_t cap) { g_cap = b; g_cap_cap = cap; g_cap_n = 0; g_cap_fg = 0xFFFFFFFFu; g_cap_corto = 0; }
+uint32_t consola_captura_terminar(int *truncado) { uint32_t n = g_cap_n; if (truncado) *truncado = g_cap_corto; g_cap = 0; return n; }
+static void capturar(char c) {
+    if (c == '\r') return;
+    if (g_color_fg != g_cap_fg) {
+        if (g_cap_n + 5 > g_cap_cap) { g_cap_corto = 1; return; }
+        /* Un canal en 0 se manda como 1 (se ve igual): asi la salida nunca lleva un 0 que corte una cadena de C */
+        uint8_t r = (uint8_t)(g_color_fg >> 16), v = (uint8_t)(g_color_fg >> 8), a = (uint8_t)g_color_fg;
+        g_cap[g_cap_n++] = 1; g_cap[g_cap_n++] = (char)(r ? r : 1); g_cap[g_cap_n++] = (char)(v ? v : 1); g_cap[g_cap_n++] = (char)(a ? a : 1);
+        g_cap_fg = g_color_fg;
+    }
+    if (g_cap_n + 1 > g_cap_cap) { g_cap_corto = 1; return; }
+    g_cap[g_cap_n++] = c;
+}
+int consola_capturando(void) { return g_cap != 0; }
+
+/* H205, Fase 0.5 del gestor de hilos: cerrojo de la consola. Es hoja (dentro no se toma ningun otro) y recursivo:
+ * una cadena entera sale junta aunque imprima otra CPU, y una interrupcion de esta misma CPU puede imprimir en medio
+ * como hasta ahora. No apaga interrupciones: desplazar la pantalla puede tardar milisegundos. */
+static cerrojo_t g_cerrojo_consola = CERROJO("consola");
+/* H211: para el informe de un colapso (huevo): espera hasta 200 ms y se lo queda aunque otra CPU lo tenga */
+void consola_cerrojo_forzar(void) { cerrojo_forzar(&g_cerrojo_consola, 200); }
+static void escribir_caracter_sc(char c);
 void consola_escribir_caracter(char c) {
+    cerrojo_tomar(&g_cerrojo_consola);
+    escribir_caracter_sc(c);
+    cerrojo_soltar(&g_cerrojo_consola);
+}
+static void escribir_caracter_sc(char c) {
+    if (g_cap) capturar(c);
     g_puntero_sucio=1;
     if(g_lote)g_redibujar=1;
     red_remoto_capturar(c);
@@ -214,26 +261,34 @@ void consola_escribir_caracter(char c) {
 
 void consola_imprimir(const char *texto) {
     if (!texto) return;
+    cerrojo_tomar(&g_cerrojo_consola);
     for (int i = 0; texto[i] != '\0'; i++) {
-        consola_escribir_caracter(texto[i]);
+        escribir_caracter_sc(texto[i]);
     }
+    cerrojo_soltar(&g_cerrojo_consola);
 }
 
 void consola_imprimir_color(const char *texto, uint32_t fg) {
+    cerrojo_tomar(&g_cerrojo_consola);
     uint32_t anterior = g_color_fg;
     g_color_fg = fg;
     consola_imprimir(texto);
     g_color_fg = anterior;
+    cerrojo_soltar(&g_cerrojo_consola);
 }
 
 void consola_imprimir_linea(const char *texto) {
+    cerrojo_tomar(&g_cerrojo_consola);
     consola_imprimir(texto);
     consola_escribir_caracter('\n');
+    cerrojo_soltar(&g_cerrojo_consola);
 }
 
 void consola_imprimir_linea_color(const char *texto, uint32_t fg) {
+    cerrojo_tomar(&g_cerrojo_consola);
     consola_imprimir_color(texto, fg);
     consola_escribir_caracter('\n');
+    cerrojo_soltar(&g_cerrojo_consola);
 }
 
 void consola_imprimir_dec(uint64_t valor) {
@@ -247,18 +302,22 @@ void consola_imprimir_dec(uint64_t valor) {
         buf[idx++] = '0' + (valor % 10);
         valor /= 10;
     }
+    cerrojo_tomar(&g_cerrojo_consola);
     for (int i = idx - 1; i >= 0; i--) {
-        consola_escribir_caracter(buf[i]);
+        escribir_caracter_sc(buf[i]);
     }
+    cerrojo_soltar(&g_cerrojo_consola);
 }
 
 void consola_imprimir_hex(uint64_t valor) {
     const char hex[] = "0123456789ABCDEF";
+    cerrojo_tomar(&g_cerrojo_consola);
     consola_imprimir("0x");
     for (int i = 60; i >= 0; i -= 4) {
         uint8_t nibble = (valor >> i) & 0xF;
-        consola_escribir_caracter(hex[nibble]);
+        escribir_caracter_sc(hex[nibble]);
     }
+    cerrojo_soltar(&g_cerrojo_consola);
 }
 
 static char consola_leer_caracter_directo(void) {
@@ -270,6 +329,9 @@ static char consola_leer_caracter_directo(void) {
         // 2. En Modo xHCI (modo=xhci), leer exclusivamente del controlador USB xHCI
         char cu = xhci_leer_caracter();
         if (cu != 0) return cu;
+        // H142: el teclado interno de la laptop, por el 8042, si 'ps2 iniciar' o el menu lo activaron
+        char cp = ps2_leer_caracter();
+        if (cp != 0) return cp;
     }
 
     // 3. Revisar puerto serial COM1 (siempre disponible para telemetría y depuración)
@@ -327,7 +389,9 @@ int consola_leer_linea(char *buffer, int max_len) {
             pantalla_dibujar_caracter(g_cursor_x, g_cursor_y, c_cursor, COLOR_PROMPT_DEFAULT, g_color_bg);
         }
 
+        uint64_t te = atencion_espera_inicio();   /* H215, E1: una vuelta sin tecla es espera activa de CPU 0 */
         char c = consola_leer_caracter();
+        atencion_espera_fin(te, c == 0);
         if (c == 0) {
             if (idx == 0) red_remoto_atender();
             continue;

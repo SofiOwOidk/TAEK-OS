@@ -38,6 +38,7 @@ void memoria_iniciar(void);
 uint64_t pmm_asignar_pagina_fisica(void);
 void    *pmm_asignar_pagina_virtual(void);
 void     pmm_liberar_pagina_fisica(uint64_t phys);
+uint64_t pmm_paginas_libres(void);
 
 // Primitivas del Heap del Kernel
 void *asignar_memoria(uint64_t bytes);
@@ -48,6 +49,7 @@ void  liberar_memoria(void *ptr);
 // Auditoría de Integridad (Vigilada por El Huevo)
 int  memoria_verificar_integridad(void);
 void memoria_obtener_estadisticas(memoria_estadisticas_t *est);
+uint32_t memoria_mapa_heap(uint8_t *mapa, uint32_t max, uint32_t *escritos);   /* H150 */
 uint64_t memoria_obtener_hhdm_offset(void);
 
 // Primitivas de Asignación Físicamente Contigua (DMA Real / GPU / GSP)

@@ -1,11 +1,11 @@
 {
   "purpose": "M02: inventario pasivo, submission i915 bloqueada",
   "kernel": {
-    "path": "/mnt/c/Users/Pat/AndroidStudioProjects/taek-os/OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/iso_root/boot/nucleo.elf",
+    "path": "/mnt/c/Users/<usuario>/AndroidStudioProjects/taek-os/OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/iso_root/boot/nucleo.elf",
     "sha256": "55ad437c5a2d361a545e8433bf7231274a498879c7078b2906baf81c4b84f6f0"
   },
   "iso": {
-    "path": "/mnt/c/Users/Pat/AndroidStudioProjects/taek-os/OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/taek-i915-m02.iso",
+    "path": "/mnt/c/Users/<usuario>/AndroidStudioProjects/taek-os/OS_experimental/i915/build/i915-mensajes-lan-2026-10-02-final/taek-i915-m02.iso",
     "sha256": "fecf820f7893264cf60f8c784bb7ccc2f94e59b5660a8b9ec767792fd96a3fee"
   },
   "sources": {

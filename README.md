@@ -9,7 +9,46 @@
 
 ---
 
-## 🎬 Versión actual: Hito 132 — H.264 por GPU en Ring 0 (2026-11-07)
+## 🧵 Versión actual: Hito 215 — Gestor de hilos multinúcleo (EXPERIMENTAL) (2026-11-17)
+
+> [!WARNING]
+> **El gestor de hilos (H204–H215) es EXPERIMENTAL.** H204–H214 pasan sus pruebas en un solo equipo (Dell Latitude
+> 5490, i7-8650U, GPU `8086:5917`); **H215 (medición de carga real) solo se probó en QEMU**. No se presenta como estable.
+>
+> **Intel Thread Director está CONGELADO:** el código va compilado y apagado por defecto, sin desarrollo hasta tener
+> un equipo híbrido para probarlo. La i7-8650U no lo tiene (solo se detecta y dice «no disponible»).
+
+Hasta H203 todo corría en la CPU 0: el USB, la red, el audio, el teclado, el trackpad y la aplicación, por sondeo. El
+ratón se «moría» cuando la CPU 0 quedaba ocupada. El gestor de hilos reparte ese trabajo entre los cuatro núcleos:
+
+| Pieza | Dónde corre | Resultado en el i7-8650U con un video 1080p por GPU |
+|---|---|---|
+| Hilos del núcleo con desalojo (tictac de 1 ms, prioridades) | CPU 1–3 | despertar entre CPU: 2 µs de media |
+| Eventos y puertos USB, teclado interno, trackpad | CPU 1–2 | mayor hueco del USB: **5902 ms → 3 ms** |
+| Audio HDA (tiempo real) | CPU 2 | mayor hueco: **180 ms → 6 ms**, sin saltos |
+| Pila de red, WiFi y consola por LAN | CPU 3 | mayor hueco: **1123 ms → 3 ms** |
+| Hilos de las aplicaciones (`SYS_HILO`, `SYS_FUTEX`, TLS) | CPU 1–3 | 3 hilos: **×3,0** sobre 1; 18/18 pruebas |
+| Cerrojos por subsistema, invalidación de TLB entre CPU | todas | `cerrojos prueba` y `hilos prueba` PASS |
+| Carga real por CPU (`latencia`, panel de Configuración) | todas | separa el trabajo de CPU 0 de su espera activa |
+| Intel Thread Director / HFI (`thread director`) | — | **CONGELADO**: sin probar en hardware, apagado por defecto |
+
+**Límites conocidos:**
+* El driver i915 de Linux sigue entero en la CPU 0: está compilado para un solo procesador (`CONFIG_SMP` apagado,
+  RCU de un procesador), así que no puede correr en dos CPU a la vez sin recompilarlo con SMP.
+* La flecha la dibuja la CPU 0: durante llamadas largas del núcleo (abrir un video, escribir en el USB) todavía puede
+  quedarse quieta hasta ~1,7 s. Es la siguiente etapa del plan (Fase E, «fluidez»).
+* La CPU 0 espera girando (`pause`) en vez de dormir; también es de la Fase E.
+* Thread Director (CONGELADO) solo actuaría en procesadores híbridos (12.ª generación en adelante) y solo si se enciende con
+  `thread director encender`; ese camino no se ha ejecutado en ningún equipo.
+
+También nuevo desde H132: programas en Anillo 3 con compositor y escritorio (H133–H151), aplicaciones que se cargan
+del USB sin reiniciar (`ejecutar /app.elf`), WiFi Realtek RTL8822CE con WPA3, composición por GPU con Iris (Mesa) y
+NekoTube, un cliente de video con interfaz propia. El plan del gestor de hilos está en la bitácora (H204–H215) con
+cada medición y cada corrección.
+
+---
+
+## 🎬 Versión anterior: Hito 132 — H.264 por GPU en Ring 0 (2026-11-07)
 
 TAEK OS reproduce H.264 con la **GPU Intel real**, usando el `i915` original de Linux 6.6.78 y el Media Driver de Intel 24.3.4 sobre un shim propio, sin espacio de usuario. Es **experimental y solo está probado en un equipo**: Dell Latitude 5490, i7-8650U, GPU `8086:5917`. En cualquier otro equipo, incluidas otras GPU Intel y las AMD, usa el decodificador por software.
 
@@ -62,7 +101,7 @@ Los problemas y sus correcciones están registrados en [Hito 96](BITACORA.md).
 
 > **Usando apoyo de Gemini (Google DeepMind)** como copiloto de ingeniería, arquitectura de sistemas bare-metal, depuración en bajo nivel y diseño de controladores de hardware.  
 > **Documentación creada por Gemini:** Bitácoras técnicas, guías de arranque en hardware real, especificaciones de controladores y manuales de referencia.  
-> **Hitos recientes:** el shim i915, la decodificación por GPU y su registro en la bitácora se hicieron con apoyo de **Claude (Anthropic)**.
+> **Hitos recientes:** el shim i915, la decodificación por GPU, la interfaz y las aplicaciones de Anillo 3 y el gestor de hilos (H204–H215), con su registro en la bitácora, se hicieron con apoyo de **Claude (Anthropic)**.
 
 ---
 
@@ -142,6 +181,11 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
   * `stream iniciar <ip> [puerto]` / `stream detener`: Espejo interactivo de consola por TCP en tiempo real.
   * `remoto iniciar <ip> [puerto]` / `remoto detener`: Consola remota de diagnóstico por TCP.
   * `huevo`: Diagnóstico del estado del canario de integridad (`0xDEADBEEFCAFECAFE`).
+  * `latencia` / `latencia cero` *(experimental)*: Mayor tiempo sin atender USB, red y audio, llamadas largas y carga real por CPU.
+  * `hilos [prueba]`, `cerrojos [prueba]` *(experimental)*: Estado y autopruebas del gestor de hilos y de los cerrojos.
+  * `usb hilo`, `audio hilo`, `red hilo [encender|apagar]` *(experimental)*: Los hilos de servicio de cada subsistema.
+  * `thread director [encender|apagar|prueba]` *(CONGELADO, sin probar en hardware)*: Intel Thread Director / HFI.
+  * `ejecutar <ruta.elf> [argumento]`: Corre un programa de Anillo 3 desde el disco (por ejemplo `/prueba_hilos.elf`).
   * `apagar` / `reiniciar`: Gestión de energía mediante controladores ACPI y teclado PS/2 / 8042.
 
 ---
@@ -151,16 +195,16 @@ El proyecto combina un desarrollo técnico de ingeniería inversa de bajo nivel 
 ### 1. Grabación y Ejecución en Hardware Real (Bare Metal)
 La ISO se conserva localmente en `build/` y no se publica en este repositorio.
 
-1. Flashear la imagen ISO (`build/taek-os-h132-2026-11-07.iso`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
+1. Flashear la imagen ISO de H215 (`build/taek-h215-bbdf416ef7d8f9ed.iso`, SHA-256 `166a6b6da5933ad7b9ced9274b8734280a1ce924ad6cbfe1dadde381fb799dbe`) en una memoria USB utilizando [Rufus](https://rufus.ie/) (esquema de partición **GPT**, sistema de destino **UEFI non-CSM**) o mediante `dd` en Linux:
    ```bash
-   sudo dd if=build/taek-os-h132-2026-11-07.iso of=/dev/sdX bs=4M status=progress conv=fsync
+   sudo dd if=build/taek-h215-bbdf416ef7d8f9ed.iso of=/dev/sdX bs=4M status=progress conv=fsync
    ```
 2. Conectar la memoria USB al equipo, desactivar *Secure Boot* en la BIOS/UEFI, y arrancar desde el dispositivo USB.
 
 ### 2. Ejecución en Emulador (QEMU)
 Se puede arrancar directamente la ISO en QEMU x86_64 con firmware UEFI (`OVMF.fd`), tarjeta de audio Intel HDA y controlador xHCI:
 ```text
-qemu-system-x86_64 -bios OVMF.fd -cdrom build/taek-os-h132-2026-11-07.iso -m 1024M -M q35 -device intel-hda -device hda-output -device qemu-xhci -device usb-kbd -serial stdio
+qemu-system-x86_64 -bios OVMF.fd -cdrom build/taek-h215-bbdf416ef7d8f9ed.iso -m 1536M -smp 4 -M q35 -device intel-hda -device hda-output -device qemu-xhci -device usb-kbd -serial stdio
 ```
 
 ---
@@ -182,6 +226,7 @@ taek-os/
 │   ├── compatibilidad/        # Capa Linux Shim, shim i915 y cliente H.264 por GPU
 │   └── principal.c            # Punto de entrada del kernel (kmain)
 ├── modulos/                   # Módulos .chad en Ring 0, incluido el de la GPU i915
+├── usuario/                   # Programas de Anillo 3: menú, escritorio, NekoTube, explorador, pruebas (prueba_hilos.c)
 ├── docs/                      # Documentación técnica y guías de red
 ├── recursos/assets/           # Medios, texturas y pistas de audio/video
 ├── .gitignore                 # Filtros limpios para el repositorio

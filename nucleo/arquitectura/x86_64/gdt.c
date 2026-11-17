@@ -1,6 +1,7 @@
 #include "gdt.h"
 
-static struct entrada_gdt g_gdt[5];
+/* 0x28/0x30 con RPL 3 dan SS 0x2B y CS 0x33, el orden que tambien exigiria sysret. */
+static struct entrada_gdt g_gdt[7];
 static struct puntero_gdt g_puntero_gdt;
 
 struct tss64 {
@@ -14,13 +15,13 @@ struct tss64 {
 } __attribute__((packed));
 
 static struct tss64 g_tss;
-static uint8_t g_pila_rsp0[16384] __attribute__((aligned(16)));
+static uint8_t g_pila_rsp0[32768] __attribute__((aligned(16)));
 static uint8_t g_pila_df[16384] __attribute__((aligned(16)));
 static uint8_t g_pila_nmi[16384] __attribute__((aligned(16)));
 static uint8_t g_pila_mc[16384] __attribute__((aligned(16)));
 
 /* TSS y tres IST privados: nunca compartir una pila de excepción entre CPUs. */
-static struct entrada_gdt g_ap_gdt[3][5];
+static struct entrada_gdt g_ap_gdt[3][7];
 static struct tss64 g_ap_tss[3];
 static uint8_t g_ap_pilas[3][4][16384] __attribute__((aligned(16)));
 void gdt_iniciar_cpu(unsigned indice) {
@@ -43,6 +44,11 @@ void gdt_iniciar_cpu(unsigned indice) {
         :::"rax","memory");
     uint16_t selector=0x18;
     __asm__ volatile("ltr %0"::"r"(selector):"memory");
+}
+
+void gdt_fijar_rsp0(unsigned cpu, uint64_t rsp0) {
+    if (!cpu || cpu > 3) return;
+    g_ap_tss[cpu - 1].rsp0 = rsp0 ? rsp0 : (uint64_t)(g_ap_pilas[cpu - 1][0] + 16384);
 }
 
 static void gdt_configurar_puerta(int num, uint32_t base, uint32_t limite, uint8_t acceso, uint8_t gran) {
@@ -79,6 +85,10 @@ void gdt_iniciar(void) {
     gdt_configurar_puerta(3, (uint32_t)base_tss, sizeof(g_tss) - 1, 0x89, 0x00);
     uint64_t mitad_alta = base_tss >> 32;
     __builtin_memcpy(&g_gdt[4], &mitad_alta, sizeof(mitad_alta));
+
+    // 5: Datos de usuario (0x28, DPL 3). 6: Codigo de usuario en 64 bits (0x30, DPL 3).
+    gdt_configurar_puerta(5, 0, 0, 0xF2, 0x00);
+    gdt_configurar_puerta(6, 0, 0, 0xFA, 0x20);
 
     __asm__ volatile ("lgdt %0" : : "m"(g_puntero_gdt));
 

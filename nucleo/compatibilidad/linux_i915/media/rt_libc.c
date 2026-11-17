@@ -237,7 +237,9 @@ int clock_gettime(int id, struct ts *t) { (void)id; unsigned long long n = taek_
 int clock_getres(int id, struct ts *t) { (void)id; if (t) { t->s = 0; t->ns = 1; } return 0; }
 int gettimeofday(struct ts *t, void *z) { (void)z; unsigned long long n = taek_media_ns(); t->s = (long)(n / 1000000000ull); t->ns = (long)(n % 1000000000ull / 1000); return 0; }
 long time(long *o) { long s = (long)(taek_media_ns() / 1000000000ull); if (o) *o = s; return s; }
+#ifndef TAEK_RT_HILOS_PROPIOS   /* Iris (M27) trae sus hilos verdes y su propia espera: iris/rt_iris.c */
 int usleep(unsigned u) { taek_media_dormir_us(u); return 0; }
+#endif
 
 /* ------------------------------------------------------------- proceso */
 char *getenv(const char *n) { (void)n; return 0; }
@@ -287,7 +289,9 @@ long read(int fd, void *b, size_t n) { (void)fd; (void)b; (void)n; errno_taek = 
 long write(int fd, const void *b, size_t n) { (void)b; if (fd == 1 || fd == 2) return (long)n; errno_taek = EBADF; return -1; }
 long lseek(int fd, long o, int w) { (void)fd; (void)o; (void)w; errno_taek = EBADF; return -1; }
 int stat(const char *p, void *s) { (void)p; (void)s; errno_taek = ENOENT; return -1; }
+#ifndef TAEK_RT_FSTAT_PROPIO   /* Iris (M27) necesita fstat del DRM: iris/rt_iris.c */
 int fstat(int fd, void *s) { (void)fd; (void)s; errno_taek = ENOSYS; return -1; }   /* El DRM no es un nodo de ningun sistema de archivos. */
+#endif
 long readlink(const char *p, char *b, size_t n) { (void)p; (void)b; (void)n; errno_taek = ENOENT; return -1; }
 char *realpath(const char *p, char *o) { (void)p; (void)o; errno_taek = ENOENT; return 0; }
 void *fopen(const char *p, const char *m) { (void)p; (void)m; errno_taek = ENOENT; return 0; }
@@ -314,6 +318,7 @@ int munmap(void *d, size_t b) {
     return 0;
 }
 
+#ifndef TAEK_RT_HILOS_PROPIOS
 /* ------------------------------------------------------------- hilos: cooperativo, un CPU, sin hilos nuevos */
 struct mutex_taek { void *dueno; unsigned veces, tipo; };
 _Static_assert(sizeof(struct mutex_taek) <= 40, "pthread_mutex_t");
@@ -358,3 +363,4 @@ int sem_timedwait(struct sem_taek *s, const struct ts *t) {
     s->v--;
     return 0;
 }
+#endif /* TAEK_RT_HILOS_PROPIOS */

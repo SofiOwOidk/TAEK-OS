@@ -24,6 +24,7 @@ typedef struct {
 struct marco_interrupcion;
 
 void huevo_iniciar(void);
+void huevo_obtener(huevo_estabilidad_t *h);   /* H150 */
 void huevo_etapa(const char *nombre_etapa);
 void huevo_etapa_ok(void);
 void huevo_verificar(void);

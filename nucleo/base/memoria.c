@@ -2,6 +2,8 @@
 #include "dma.h"
 #include "huevo.h"
 #include "trabajos.h"
+#include "cerrojo.h"
+#include "tiempo.h"
 #include "../arquitectura/x86_64/serial.h"
 
 #define LIMINE_API_REVISION 2
@@ -79,11 +81,43 @@ typedef struct bloque_heap {
     uint64_t tamano_datos;       // Tamaño útil en bytes para el usuario
     struct bloque_heap *siguiente;
     struct bloque_heap *anterior;
+    struct bloque_heap *libre_sig;   // H207: lista de libres de su tamaño (solo si esta_libre)
+    struct bloque_heap *libre_ant;
     uint64_t canario_fin;        // CANARIO_BLOQUE_FIN (0xCAFEBABEDEAD1000ULL)
 } __attribute__((aligned(16))) bloque_heap_t;
 
 // Estado del Heap del Kernel
 static bloque_heap_t *g_heap_cabeza = NULL;
+static bloque_heap_t *g_heap_cola = NULL;   /* H207: ultimo bloque de la lista, para agregar arenas sin recorrerla */
+
+/* H207, antes de la Fase A2 del gestor de hilos: en H206 el cerrojo del monton llego a 1,6 ms en uso real porque el
+ * primer ajuste recorria la lista entera (miles de bloques, la mayoria en uso). Ahora los bloques libres van ademas en
+ * listas por tamano (potencias de 2, desde 16 bytes): pedir memoria mira solo libres de un tamano que sirve. La lista
+ * de todos los bloques, en orden de arena, sigue igual: la usan las fusiones y las auditorias del huevo. */
+#define HEAP_CLASES 28
+static bloque_heap_t *g_libres[HEAP_CLASES];
+static unsigned clase_de(uint64_t bytes) {
+    unsigned c = 63u - (unsigned)__builtin_clzll(bytes | 16u) ;   /* floor(log2) */
+    c = c >= 4 ? c - 4 : 0;
+    return c < HEAP_CLASES ? c : HEAP_CLASES - 1;
+}
+static uint64_t g_heap_libres_n;   /* H214: bloques libres, llevado al dia aqui en vez de recorrer la lista */
+static void libre_poner(bloque_heap_t *b) {
+    unsigned c = clase_de(b->tamano_datos);
+    g_heap_libres_n++;
+    b->libre_ant = NULL;
+    b->libre_sig = g_libres[c];
+    if (g_libres[c]) g_libres[c]->libre_ant = b;
+    g_libres[c] = b;
+}
+static void libre_quitar(bloque_heap_t *b) {
+    unsigned c = clase_de(b->tamano_datos);
+    if (g_heap_libres_n) g_heap_libres_n--;
+    if (b->libre_ant) b->libre_ant->libre_sig = b->libre_sig;
+    else if (g_libres[c] == b) g_libres[c] = b->libre_sig;
+    if (b->libre_sig) b->libre_sig->libre_ant = b->libre_ant;
+    b->libre_sig = b->libre_ant = NULL;
+}
 static uint64_t       g_heap_capacidad_total = 0;
 static uint64_t       g_heap_bytes_en_uso = 0;
 static uint64_t       g_heap_bloques_activos = 0;
@@ -105,21 +139,18 @@ static uint64_t g_arena_dma_tamano = 0;
 
 // --- FUNCIONES BÁSICAS DE COPIA Y RELLENO (FREESTANDING) ---
 
+/* H206: rep stosb y rep movsb (ERMSB en el i7-8650U: el microcodigo los hace por lineas de cache). Antes eran bucles
+ * de un byte: poner a cero 2 MiB al crecer el monton tardaba milisegundos con el cerrojo de memoria tomado. */
 void *memset(void *dest, int c, size_t n) {
-    uint8_t *d = (uint8_t *)dest;
-    uint8_t v = (uint8_t)c;
-    for (size_t i = 0; i < n; i++) {
-        d[i] = v;
-    }
+    void *d = dest;
+    __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
     return dest;
 }
 
 void *memcpy(void *dest, const void *src, size_t n) {
-    uint8_t *d = (uint8_t *)dest;
-    const uint8_t *s = (const uint8_t *)src;
-    for (size_t i = 0; i < n; i++) {
-        d[i] = s[i];
-    }
+    void *d = dest;
+    const void *s = src;
+    __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) :: "memory");
     return dest;
 }
 
@@ -149,10 +180,27 @@ int memcmp(const void *s1, const void *s2, size_t n) {
     return 0;
 }
 
+/* H205, Fase 0.5 del gestor de hilos: un solo cerrojo para el PMM y el monton (el monton pide paginas al crecer).
+ * Antes estas funciones devolvian vacio fuera de CPU 0 (trabajos_es_coordinador). Es recursivo por CPU: el monton se
+ * llama a si mismo tras incorporar una arena. Las funciones _sc son el cuerpo de siempre, sin cerrojo. */
+static cerrojo_t g_cerrojo_memoria = CERROJO("memoria");
+#define CON_CERROJO(tipo, llamada) { uint64_t f_ = cerrojo_tomar_irq(&g_cerrojo_memoria); tipo r_ = llamada; cerrojo_soltar_irq(&g_cerrojo_memoria, f_); return r_; }
+#define CON_CERROJO_VOID(llamada) { uint64_t f_ = cerrojo_tomar_irq(&g_cerrojo_memoria); llamada; cerrojo_soltar_irq(&g_cerrojo_memoria, f_); }
+
 // --- GESTOR DE MARCOS DE PÁGINA FÍSICA (PMM - 4 KiB) ---
 
+static uint64_t pmm_asignar_pagina_fisica_sc(void);
+/* H206: la pagina se pone a cero despues de soltar el cerrojo. Si quien llama ya tiene el cerrojo (el monton al
+ * crecer), la pagina sale sin limpiar: el monton no promete memoria a cero (asignar_memoria_cero limpia lo suyo). */
 uint64_t pmm_asignar_pagina_fisica(void) {
-    if(!trabajos_es_coordinador())return 0;
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_memoria);
+    int anidada = g_cerrojo_memoria.profundidad > 1;
+    uint64_t phys = pmm_asignar_pagina_fisica_sc();
+    cerrojo_soltar_irq(&g_cerrojo_memoria, f);
+    if (phys && !anidada) memset(FISICA_A_VIRTUAL(phys), 0, TAMANO_PAGINA);
+    return phys;
+}
+static uint64_t pmm_asignar_pagina_fisica_sc(void) {
     if (g_pila_marcos_libres == 0) {
         serial_imprimir_linea("[PMM FATAL] ¡Memoria física agotada! Sin marcos libres.");
         huevo_agrietar("PMM: Memoria física agotada (Out of Memory)");
@@ -175,8 +223,6 @@ uint64_t pmm_asignar_pagina_fisica(void) {
     if (g_paginas_libres > 0) g_paginas_libres--;
     g_paginas_en_uso++;
 
-    // Limpiar el contenido del marco por seguridad
-    memset(frame_virt, 0, TAMANO_PAGINA);
 
     return phys;
 }
@@ -187,8 +233,9 @@ void *pmm_asignar_pagina_virtual(void) {
     return FISICA_A_VIRTUAL(phys);
 }
 
-void pmm_liberar_pagina_fisica(uint64_t phys) {
-    if(!trabajos_es_coordinador())return;
+static void pmm_liberar_pagina_fisica_sc(uint64_t phys);
+void pmm_liberar_pagina_fisica(uint64_t phys) CON_CERROJO_VOID(pmm_liberar_pagina_fisica_sc(phys))
+static void pmm_liberar_pagina_fisica_sc(uint64_t phys) {
     if (phys == 0 || (phys & 0xFFFULL) != 0) {
         huevo_quebrar("PMM: dirección de liberación inválida", phys, 0, 0);
         return;
@@ -232,88 +279,94 @@ static void heap_agregar_arena(void *direccion_virtual, uint64_t tamano_bytes) {
         g_heap_cabeza = nuevo_bloque;
     } else {
         // Enlazar al final de la lista de arenas
-        bloque_heap_t *ultimo = g_heap_cabeza;
-        while (ultimo->siguiente != NULL) {
-            ultimo = ultimo->siguiente;
-        }
-        ultimo->siguiente = nuevo_bloque;
-        nuevo_bloque->anterior = ultimo;
+        g_heap_cola->siguiente = nuevo_bloque;
+        nuevo_bloque->anterior = g_heap_cola;
     }
+    g_heap_cola = nuevo_bloque;
+    libre_poner(nuevo_bloque);
 }
 
-void *asignar_memoria(uint64_t bytes) {
-    if(!trabajos_es_coordinador())return NULL;
-    if (bytes == 0) return NULL;
+static void heap_canario_roto(bloque_heap_t *bloque) {
+    serial_imprimir("[CORRUPCIÓN DETECTADA] Bloque de Heap dañado en ");
+    serial_imprimir_hex((uint64_t)bloque);
+    serial_imprimir_linea("!");
+    huevo_quebrar("Corrupción de memoria en Heap: Canario de bloque destruido", (uint64_t)bloque, 0, 0);
+}
 
-    // Alinear a 16 bytes para compatibilidad y rendimiento de CPU
-    bytes = (bytes + 15ULL) & ~15ULL;
-    if (bytes < 16) bytes = 16;
-
-    bloque_heap_t *bloque = g_heap_cabeza;
-
-    while (bloque != NULL) {
-        // Comprobación de integridad de canarios durante el recorrido
-        if (bloque->canario_inicio != CANARIO_BLOQUE_INICIO || bloque->canario_fin != CANARIO_BLOQUE_FIN) {
-            serial_imprimir("[CORRUPCIÓN DETECTADA] Bloque de Heap dañado en ");
-            serial_imprimir_hex((uint64_t)bloque);
-            serial_imprimir_linea("!");
-            huevo_quebrar("Corrupción de memoria en Heap: Canario de bloque destruido", (uint64_t)bloque, 0, 0);
-        }
-
-        if (bloque->esta_libre && bloque->tamano_datos >= bytes) {
-            // Comprobar si vale la pena dividir el bloque (splitting)
-            if (bloque->tamano_datos >= bytes + sizeof(bloque_heap_t) + 32) {
-                bloque_heap_t *sobrante = (bloque_heap_t *)((uint8_t *)(bloque + 1) + bytes);
-                sobrante->canario_inicio = CANARIO_BLOQUE_INICIO;
-                sobrante->esta_libre = 1;
-                sobrante->reservado = 0;
-                sobrante->tamano_datos = bloque->tamano_datos - bytes - sizeof(bloque_heap_t);
-                sobrante->siguiente = bloque->siguiente;
-                sobrante->anterior = bloque;
-                sobrante->canario_fin = CANARIO_BLOQUE_FIN;
-
-                if (bloque->siguiente != NULL) {
-                    bloque->siguiente->anterior = sobrante;
-                }
-                bloque->siguiente = sobrante;
-                bloque->tamano_datos = bytes;
-            }
-
-            bloque->esta_libre = 0;
-            g_heap_bytes_en_uso += bloque->tamano_datos;
-            g_heap_bloques_activos++;
-
-            return (void *)(bloque + 1);
-        }
-
-        bloque = bloque->siguiente;
+/* El primer libre que sirve: en la clase de la peticion puede haber bloques mas chicos; en las de arriba, todos sirven.
+ * H214: en H212 el cerrojo del monton llego a 1,8 ms con CPU 0 y CPU 3 pidiendo a la vez, porque la clase propia se
+ * recorria entera (muchos bloques apenas mas chicos que lo pedido). Ahora: hasta 16 intentos en la clase propia (asi
+ * se siguen reusando los bloques de ese tamano y no se fragmenta mas), despues el primero de una clase mayor (sirve
+ * seguro, O(1) por clase) y solo si no hay ninguno, el resto de la clase propia. */
+static inline void heap_vigilar_libre(bloque_heap_t *b) {
+    if (b->canario_inicio != CANARIO_BLOQUE_INICIO || b->canario_fin != CANARIO_BLOQUE_FIN || !b->esta_libre)
+        heap_canario_roto(b);
+}
+static bloque_heap_t *heap_buscar_libre(uint64_t bytes) {
+    unsigned c = clase_de(bytes), n = 0;
+    bloque_heap_t *b = g_libres[c];
+    for (; b && n < 16; b = b->libre_sig, n++) {
+        heap_vigilar_libre(b);
+        if (b->tamano_datos >= bytes) return b;
     }
+    for (unsigned k = c + 1; k < HEAP_CLASES; k++) {
+        bloque_heap_t *m = g_libres[k];
+        if (!m) continue;
+        heap_vigilar_libre(m);
+        if (m->tamano_datos >= bytes) return m;
+    }
+    for (; b; b = b->libre_sig) {
+        heap_vigilar_libre(b);
+        if (b->tamano_datos >= bytes) return b;
+    }
+    return NULL;
+}
 
-    // Si no hay espacio suficiente en el Heap actual, expandir asignando nuevas páginas
+/* H214: crecer el monton ya no pasa dentro del cerrojo. En H212-H214 el cerrojo 'memoria' llego a 1,5-1,8 ms, con las
+ * interrupciones apagadas, mientras juntaba hasta 512 paginas contiguas (y hasta 128 intentos si el PMM estaba
+ * fragmentado). Ahora asignar_memoria_sc solo toma de lo libre; si no hay, heap_crecer junta las paginas tomando y
+ * soltando el cerrojo por cada una (el PMM usa el mismo) y solo vuelve a tenerlo para agregar la arena. */
+static void *asignar_memoria_sc(uint64_t bytes);
+static int heap_crecer(uint64_t bytes);
+void *asignar_memoria(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_memoria);
+    void *r = asignar_memoria_sc(bytes);
+    cerrojo_soltar_irq(&g_cerrojo_memoria, f);
+    for (unsigned intento = 0; !r && intento < 128; intento++) {
+        int c = heap_crecer(bytes);
+        if (c < 0) break;
+        f = cerrojo_tomar_irq(&g_cerrojo_memoria);
+        r = asignar_memoria_sc(bytes);
+        cerrojo_soltar_irq(&g_cerrojo_memoria, f);
+    }
+    if (!r) serial_imprimir_linea("[HEAP ADVERTENCIA] No fue posible conseguir arena contigua suficiente para asignación grande.");
+    return r;
+}
+
+/* Agrega una arena nueva. 1 si alcanza para la peticion, 0 si quedo chica (el PMM no tenia tanto contiguo; la arena
+ * igual queda para peticiones menores), -1 sin memoria. */
+static int heap_crecer(uint64_t bytes) {
+    bytes = (bytes + 15ULL) & ~15ULL;
     uint64_t tamano_expansion = bytes + sizeof(bloque_heap_t) + TAMANO_PAGINA;
     tamano_expansion = (tamano_expansion + TAMANO_PAGINA - 1) & ~(TAMANO_PAGINA - 1);
-    if (tamano_expansion < (2ULL * 1024ULL * 1024ULL)) {
-        tamano_expansion = (2ULL * 1024ULL * 1024ULL); // Mínimo 2 MiB de expansión
-    }
-
+    if (tamano_expansion < (2ULL * 1024ULL * 1024ULL)) tamano_expansion = 2ULL * 1024ULL * 1024ULL;
     uint64_t paginas_necesarias = tamano_expansion / TAMANO_PAGINA;
-    // El mapa UEFI puede terminar en regiones libres pequeñas. Incorporarlas
-    // al heap permite avanzar a la siguiente región en lugar de reintentar
-    // siempre el mismo prefijo insuficiente de la pila. Trabajo acotado.
-    for (unsigned intento = 0; intento < 128 && g_pila_marcos_libres; intento++) {
-    uint64_t primera_fisica = pmm_asignar_pagina_fisica();
+
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_memoria);
+    uint64_t primera_fisica = g_pila_marcos_libres ? pmm_asignar_pagina_fisica_sc() : 0;
+    cerrojo_soltar_irq(&g_cerrojo_memoria, f);
     if (primera_fisica == 0) {
         huevo_agrietar("Heap: Memoria agotada al intentar expandir");
-        return NULL;
+        return -1;
     }
-
     // La pila intrusiva suele entregar páginas en orden DESCENDENTE. Ambas
     // direcciones forman una arena válida; primera_fisica conserva el mínimo.
-    uint64_t pagina_previa = primera_fisica;
-    uint64_t paginas_obtenidas = 1;
-
+    uint64_t pagina_previa = primera_fisica, paginas_obtenidas = 1;
     for (uint64_t i = 1; i < paginas_necesarias; i++) {
-        uint64_t nueva_pag = pmm_asignar_pagina_fisica();
+        f = cerrojo_tomar_irq(&g_cerrojo_memoria);
+        uint64_t nueva_pag = g_pila_marcos_libres ? pmm_asignar_pagina_fisica_sc() : 0;
+        cerrojo_soltar_irq(&g_cerrojo_memoria, f);
         if (nueva_pag == 0) break;
         if (nueva_pag == pagina_previa + TAMANO_PAGINA) {
             pagina_previa = nueva_pag;
@@ -322,22 +375,54 @@ void *asignar_memoria(uint64_t bytes) {
             primera_fisica = nueva_pag;
             paginas_obtenidas++;
         } else {
-            // No contigua: devolvemos la página y nos quedamos con lo obtenido hasta aquí
-            pmm_liberar_pagina_fisica(nueva_pag);
+            pmm_liberar_pagina_fisica(nueva_pag);   /* No contigua: se devuelve y se usa lo juntado hasta aqui */
             break;
         }
     }
-
+    f = cerrojo_tomar_irq(&g_cerrojo_memoria);
     heap_agregar_arena(FISICA_A_VIRTUAL(primera_fisica), paginas_obtenidas * TAMANO_PAGINA);
-    if (paginas_obtenidas * TAMANO_PAGINA >= bytes + sizeof(bloque_heap_t)) {
-        // Reintentar recursivamente una vez con la nueva arena incorporada
-        return asignar_memoria(bytes);
-    }
+    cerrojo_soltar_irq(&g_cerrojo_memoria, f);
+    return paginas_obtenidas * TAMANO_PAGINA >= bytes + sizeof(bloque_heap_t) ? 1 : 0;
+}
 
-    // Las páginas de este fragmento quedan como arena libre para peticiones
-    // menores: conservan propietario, contadores y canarios verificables.
+static void *asignar_memoria_sc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+
+    // Alinear a 16 bytes para compatibilidad y rendimiento de CPU
+    bytes = (bytes + 15ULL) & ~15ULL;
+    if (bytes < 16) bytes = 16;
+
+    bloque_heap_t *bloque = heap_buscar_libre(bytes);
+    if (bloque != NULL) {
+        libre_quitar(bloque);
+        // Comprobar si vale la pena dividir el bloque (splitting)
+        if (bloque->tamano_datos >= bytes + sizeof(bloque_heap_t) + 32) {
+            bloque_heap_t *sobrante = (bloque_heap_t *)((uint8_t *)(bloque + 1) + bytes);
+            sobrante->canario_inicio = CANARIO_BLOQUE_INICIO;
+            sobrante->esta_libre = 1;
+            sobrante->reservado = 0;
+            sobrante->tamano_datos = bloque->tamano_datos - bytes - sizeof(bloque_heap_t);
+            sobrante->siguiente = bloque->siguiente;
+            sobrante->anterior = bloque;
+            sobrante->canario_fin = CANARIO_BLOQUE_FIN;
+
+            if (bloque->siguiente != NULL) {
+                bloque->siguiente->anterior = sobrante;
+            } else {
+                g_heap_cola = sobrante;
+            }
+            bloque->siguiente = sobrante;
+            bloque->tamano_datos = bytes;
+            libre_poner(sobrante);
+        }
+
+        bloque->esta_libre = 0;
+        g_heap_bytes_en_uso += bloque->tamano_datos;
+        g_heap_bloques_activos++;
+
+        return (void *)(bloque + 1);
     }
-    serial_imprimir_linea("[HEAP ADVERTENCIA] No fue posible conseguir arena contigua suficiente para asignación grande.");
+    /* H214: sin hueco, asignar_memoria hace crecer el monton fuera del cerrojo (heap_crecer) y vuelve a pedir */
     return NULL;
 }
 
@@ -349,8 +434,9 @@ void *asignar_memoria_cero(uint64_t bytes) {
     return ptr;
 }
 
-void liberar_memoria(void *ptr) {
-    if(!trabajos_es_coordinador())return;
+static void liberar_memoria_sc(void *ptr);
+void liberar_memoria(void *ptr) CON_CERROJO_VOID(liberar_memoria_sc(ptr))
+static void liberar_memoria_sc(void *ptr) {
     if (ptr == NULL) return;
 
     bloque_heap_t *bloque = ((bloque_heap_t *)ptr) - 1;
@@ -382,10 +468,13 @@ void liberar_memoria(void *ptr) {
     if (bloque->siguiente != NULL && bloque->siguiente->esta_libre) {
         uint8_t *fin_datos_bloque = (uint8_t *)(bloque + 1) + bloque->tamano_datos;
         if (fin_datos_bloque == (uint8_t *)bloque->siguiente) {
+            libre_quitar(bloque->siguiente);
             bloque->tamano_datos += sizeof(bloque_heap_t) + bloque->siguiente->tamano_datos;
             bloque->siguiente = bloque->siguiente->siguiente;
             if (bloque->siguiente != NULL) {
                 bloque->siguiente->anterior = bloque;
+            } else {
+                g_heap_cola = bloque;
             }
         }
     }
@@ -394,13 +483,19 @@ void liberar_memoria(void *ptr) {
     if (bloque->anterior != NULL && bloque->anterior->esta_libre) {
         uint8_t *fin_datos_ant = (uint8_t *)(bloque->anterior + 1) + bloque->anterior->tamano_datos;
         if (fin_datos_ant == (uint8_t *)bloque) {
-            bloque->anterior->tamano_datos += sizeof(bloque_heap_t) + bloque->tamano_datos;
-            bloque->anterior->siguiente = bloque->siguiente;
+            bloque_heap_t *ant = bloque->anterior;
+            libre_quitar(ant);   /* Cambia de tamano: vuelve a su lista al final */
+            ant->tamano_datos += sizeof(bloque_heap_t) + bloque->tamano_datos;
+            ant->siguiente = bloque->siguiente;
             if (bloque->siguiente != NULL) {
-                bloque->siguiente->anterior = bloque->anterior;
+                bloque->siguiente->anterior = ant;
+            } else {
+                g_heap_cola = ant;
             }
+            bloque = ant;
         }
     }
+    libre_poner(bloque);
 }
 
 void *reasignar_memoria(void *ptr, uint64_t nuevo_tamano) {
@@ -429,7 +524,10 @@ void *reasignar_memoria(void *ptr, uint64_t nuevo_tamano) {
     return nuevo_ptr;
 }
 
-int memoria_verificar_integridad(void) {
+/* H205: quien recorre la lista entera tambien toma el cerrojo; otra CPU podria estar partiendo o fundiendo bloques. */
+static int memoria_verificar_integridad_sc(void);
+int memoria_verificar_integridad(void) CON_CERROJO(int, memoria_verificar_integridad_sc())
+static int memoria_verificar_integridad_sc(void) {
     if (!g_memoria_inicializada || g_heap_cabeza == NULL) return 1;
 
     bloque_heap_t *curr = g_heap_cabeza;
@@ -454,7 +552,9 @@ int memoria_verificar_integridad(void) {
     return 1;
 }
 
-void memoria_obtener_estadisticas(memoria_estadisticas_t *est) {
+static void memoria_obtener_estadisticas_sc(memoria_estadisticas_t *est);
+void memoria_obtener_estadisticas(memoria_estadisticas_t *est) CON_CERROJO_VOID(memoria_obtener_estadisticas_sc(est))
+static void memoria_obtener_estadisticas_sc(memoria_estadisticas_t *est) {
     if (est == NULL) return;
 
     est->ram_fisica_total     = g_ram_total_bytes;
@@ -466,16 +566,39 @@ void memoria_obtener_estadisticas(memoria_estadisticas_t *est) {
     est->heap_bytes_en_uso    = g_heap_bytes_en_uso;
     est->heap_bloques_activos = g_heap_bloques_activos;
 
-    // Calcular bloques libres recorriendo el Heap
-    uint64_t libres = 0;
-    bloque_heap_t *b = g_heap_cabeza;
-    while (b != NULL) {
-        if (b->esta_libre) libres++;
-        b = b->siguiente;
+    /* H214: en H214 este recorrido (contar libres y auditar todos los canarios) tuvo el cerrojo 672 us con las
+     * interrupciones apagadas: NekoTube lo pide por SYS_SENSORES para su barra. Los libres ya se cuentan al ponerlos
+     * y quitarlos de las listas; la auditoria completa se repite como mucho una vez por segundo para estadisticas
+     * (el huevo y quien llame a memoria_verificar_integridad siguen teniendo la auditoria al momento). */
+    est->heap_bloques_libres  = g_heap_libres_n;
+    static uint64_t auditoria_ms;
+    static int auditoria;
+    uint64_t ahora = tiempo_obtener_milisegundos();
+    if (!auditoria_ms || ahora < auditoria_ms || ahora - auditoria_ms >= 1000) {
+        auditoria = memoria_verificar_integridad();
+        auditoria_ms = ahora ? ahora : 1;
     }
-    est->heap_bloques_libres  = libres;
-    est->canarios_intactos    = memoria_verificar_integridad();
+    est->canarios_intactos    = auditoria;
 }
+
+/* H150: mapa de los primeros bloques del heap para el panel de Configuracion: 0 libre, 1 en uso, 2 canario roto.
+ * Solo mira; no quiebra el huevo (de eso se encarga memoria_verificar_integridad). Devuelve los bloques de la lista. */
+static uint32_t memoria_mapa_heap_sc(uint8_t *mapa, uint32_t max, uint32_t *escritos);
+uint32_t memoria_mapa_heap(uint8_t *mapa, uint32_t max, uint32_t *escritos) CON_CERROJO(uint32_t, memoria_mapa_heap_sc(mapa, max, escritos))
+static uint32_t memoria_mapa_heap_sc(uint8_t *mapa, uint32_t max, uint32_t *escritos) {
+    uint32_t n = 0, total = 0;
+    for (bloque_heap_t *b = g_heap_cabeza; b != NULL && total < 1000000u; b = b->siguiente, total++) {
+        if (n >= max) continue;
+        int roto = b->canario_inicio != CANARIO_BLOQUE_INICIO || b->canario_fin != CANARIO_BLOQUE_FIN;
+        mapa[n++] = roto ? 2 : b->esta_libre ? 0 : 1;
+        if (roto) { total++; break; }   /* Con un canario roto, el enlace siguiente tampoco es de fiar */
+    }
+    if (escritos) *escritos = n;
+    return total;
+}
+
+/* H144: sin recorrer el heap; lo usa cada peticion de memoria de un programa de Anillo 3 */
+uint64_t pmm_paginas_libres(void) { return g_paginas_libres; }
 
 uint64_t memoria_obtener_hhdm_offset(void) {
     return g_hhdm_offset;

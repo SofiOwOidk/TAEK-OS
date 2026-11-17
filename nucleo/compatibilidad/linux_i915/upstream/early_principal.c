@@ -16,6 +16,9 @@
 #include "../upstream_early.h"
 #include "../upstream_wq.h"
 #include <drm/i915_drm.h>
+#include "gem/i915_gem_object.h"
+#include "i915_gem_ww.h"
+#include "i915_vma.h"
 
 extern struct taek_early_resultado *taek_early_resultado_interno(void);
 extern struct pci_dev *taek_early_pci_crear(unsigned devfn);
@@ -41,6 +44,8 @@ extern void taek_original_gt_cerrar(struct drm_i915_private *);
 extern void taek_original_hola_detalle(int);
 extern void taek_original_hola_fuera(int);
 extern int taek_media_probar(struct drm_device *, int, char *, size_t, unsigned *);
+extern int taek_iris_probar(struct drm_device *, int, char *, size_t, unsigned *);
+extern int taek_iris_op(struct drm_device *, void *);
 extern int taek_media_op(struct drm_device *, void *);
 extern int taek_original_gt_ocioso(struct drm_i915_private *, long);
 extern void taek_original_sin_captura(void);
@@ -97,6 +102,112 @@ static void pantalla_tomar(struct intel_uncore *u) {
         pr_info("[MMIO] %s %06x=%08x\n", reg_pantalla[i].n, reg_pantalla[i].r, pantalla_a[i]);
     }
 }
+/* ------------------------------------------------------------------ H193: plano de pantalla sobre un BO de Iris
+ * El plano 1 del pipe A escanea la superficie que dejo el firmware. Para presentar sin copia de la CPU se apunta PLANE_SURF a
+ * un objeto GEM de Iris (lineal, del tamano de la pantalla), fijado en la GGTT con la funcion original para planos. Se guarda
+ * todo lo que se toca y restaurar lo devuelve y lo verifica leyendolo. Solo pipe A, plano 1, lineal y 32 bits por pixel. */
+#define REG_PLANE_CTL 0x70180
+#define REG_PLANE_STRIDE 0x70188
+#define REG_PLANE_SIZE 0x70190
+#define REG_PLANE_SURF 0x7019c
+extern struct drm_file *taek_media_archivo(void);
+static struct drm_i915_private *i915_retenido;
+#define REG_PLANE_SURFLIVE 0x701ac
+/* H195: hasta dos bufers fijados (doble bufer). surf/stride son los del firmware, guardados al primer mostrar. */
+static struct { struct drm_i915_gem_object *obj[2]; struct i915_vma *vma[2]; u32 handle[2], ggtt[2], n; u32 surf, stride, activo;
+                u32 cambios, esperas_vblank_us_max;
+                u32 pendiente, esperas, esperas_us;   /* H201: ultimo SURF armado; veces y tiempo que hubo que esperarlo */ } plano;
+static struct intel_uncore *uncore_plano(void) { return i915_retenido ? to_gt(i915_retenido)->uncore : NULL; }
+int taek_media_plano_info(unsigned *ancho, unsigned *alto) {
+    struct intel_uncore *u = uncore_plano();
+    if (!u) return -ENODEV;
+    u32 ctl = __raw_uncore_read32(u, _MMIO(REG_PLANE_CTL)), tam = __raw_uncore_read32(u, _MMIO(REG_PLANE_SIZE));
+    if (!(ctl & (1u << 31))) return -ENODEV;            /* plano apagado */
+    if ((ctl >> 10) & 7) return -EOPNOTSUPP;              /* no es lineal */
+    *ancho = (tam & 0x1fff) + 1;
+    *alto = ((tam >> 16) & 0xfff) + 1;
+    return 0;
+}
+/* H201: espera a que el hardware escanee el ultimo SURF armado. Hace falta solo antes de dibujar en el otro bufer (el que
+ * podria seguir en pantalla). A 30-60 cuadros por segundo el cambio ya ocurrio y no se espera nada: sin espera activa. */
+int taek_media_plano_esperar(void) {
+    struct intel_uncore *u = uncore_plano();
+    if (!u || !plano.activo || !plano.pendiente) return 0;
+    if ((__raw_uncore_read32(u, _MMIO(REG_PLANE_SURFLIVE)) & ~0xfffu) == plano.pendiente) return 0;
+    u64 t0 = local_clock();
+    while ((__raw_uncore_read32(u, _MMIO(REG_PLANE_SURFLIVE)) & ~0xfffu) != plano.pendiente && local_clock() - t0 < 50 * NSEC_PER_MSEC) udelay(20);
+    u32 us = (u32)((local_clock() - t0) / 1000);
+    if (us > plano.esperas_vblank_us_max) plano.esperas_vblank_us_max = us;
+    plano.esperas++; plano.esperas_us += us;
+    return 0;
+}
+static int plano_armar(unsigned handle, unsigned paso, unsigned *ggtt);
+/* Sincrono (las pruebas de H193-H195): arma y espera el vblank. */
+int taek_media_plano_mostrar(unsigned handle, unsigned paso, unsigned *ggtt) {
+    int r = plano_armar(handle, paso, ggtt);
+    if (!r) taek_media_plano_esperar();
+    return r;
+}
+/* H201: arma el cambio y vuelve; el vblank lo aplica el hardware. */
+int taek_media_plano_mostrar_async(unsigned handle, unsigned paso, unsigned *ggtt) { return plano_armar(handle, paso, ggtt); }
+static int plano_armar(unsigned handle, unsigned paso, unsigned *ggtt) {
+    struct intel_uncore *u = uncore_plano();
+    struct drm_file *f = taek_media_archivo();
+    if (!u || !f) return -EBUSY;
+    if (!paso || paso % 64) return -EINVAL;
+    unsigned an, al;
+    int ret = taek_media_plano_info(&an, &al);
+    if (ret) return ret;
+    unsigned k = 0;
+    while (k < plano.n && plano.handle[k] != handle) k++;
+    if (k == plano.n) {   /* un bufer nuevo: se fija para el display (como mucho dos) */
+        if (plano.n >= 2) return -ENOSPC;
+        struct drm_i915_gem_object *obj = i915_gem_object_lookup(f, handle);
+        if (!obj) return -ENOENT;
+        if (obj->base.size < (size_t)paso * al) { i915_gem_object_put(obj); return -EINVAL; }
+        struct i915_gtt_view normal = {.type = I915_GTT_VIEW_NORMAL};
+        struct i915_vma *vma = NULL;
+        struct i915_gem_ww_ctx ww;
+        for_i915_gem_ww(&ww, ret, true) {
+            ret = i915_gem_object_lock(obj, &ww);
+            if (ret) continue;
+            vma = i915_gem_object_pin_to_display_plane(obj, &ww, 256 * 1024, &normal, 0);
+            if (IS_ERR(vma)) { ret = PTR_ERR(vma); vma = NULL; }
+        }
+        if (ret) { i915_gem_object_put(obj); return ret; }
+        plano.obj[k] = obj; plano.vma[k] = vma; plano.handle[k] = handle; plano.ggtt[k] = i915_ggtt_offset(vma); plano.n++;
+    }
+    if (!plano.activo) {
+        plano.surf = __raw_uncore_read32(u, _MMIO(REG_PLANE_SURF));
+        plano.stride = __raw_uncore_read32(u, _MMIO(REG_PLANE_STRIDE));
+        plano.activo = 1; plano.cambios = 0; plano.esperas_vblank_us_max = 0; plano.esperas = 0; plano.esperas_us = 0;
+        pr_info("[GPU] plano: SURF %08x -> %08x, STRIDE %08x -> %08x (%ux%u)\n", plano.surf, plano.ggtt[k], plano.stride, paso / 64, an, al);
+    }
+    *ggtt = plano.ggtt[k];
+    /* STRIDE en unidades de 64 bytes para lineal; SURF arma la actualizacion en el proximo vblank. SURFLIVE dira cuando el
+     * hardware la tomo (taek_media_plano_esperar). */
+    __raw_uncore_write32(u, _MMIO(REG_PLANE_STRIDE), paso / 64);
+    __raw_uncore_write32(u, _MMIO(REG_PLANE_SURF), *ggtt);
+    plano.pendiente = *ggtt;
+    plano.cambios++;
+    return 0;
+}
+int taek_media_plano_restaurar(void) {
+    struct intel_uncore *u = uncore_plano();
+    if (!u || !plano.activo) return -EINVAL;
+    __raw_uncore_write32(u, _MMIO(REG_PLANE_STRIDE), plano.stride);
+    __raw_uncore_write32(u, _MMIO(REG_PLANE_SURF), plano.surf);
+    (void)__raw_uncore_read32(u, _MMIO(REG_PLANE_SURF));
+    msleep(60);   /* que el hardware tome la superficie del firmware antes de soltar la nuestra (varios vblank) */
+    u32 s = __raw_uncore_read32(u, _MMIO(REG_PLANE_SURF)), st = __raw_uncore_read32(u, _MMIO(REG_PLANE_STRIDE));
+    int bien = s == plano.surf && st == plano.stride;
+    pr_info("[GPU] plano restaurado: SURF %08x STRIDE %08x %s; cambios=%u esperas=%u (%u us) espera_vblank_max=%u us\n",
+            s, st, bien ? "iguales al firmware" : "DISTINTOS", plano.cambios, plano.esperas, plano.esperas_us, plano.esperas_vblank_us_max);
+    for (unsigned k = 0; k < plano.n; k++) { i915_vma_unpin(plano.vma[k]); i915_gem_object_put(plano.obj[k]); }
+    memset(&plano, 0, sizeof(plano));
+    return bien ? 0 : -EIO;
+}
+
 static unsigned pantalla_comparar(struct intel_uncore *u) {
     unsigned cambios = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(reg_pantalla); i++) {
@@ -180,7 +291,6 @@ static int ggtt_inventario(struct pci_dev *pdev, u32 superficie, u32 ocupa_bytes
 }
 
 static unsigned pantalla_viva(struct intel_uncore *u, const char *cuando);
-static struct drm_i915_private *i915_retenido;
 static u32 hola_semilla = 0x5a17c0de;
 
 /* Cierre del dispositivo. Al terminar, ninguna entrada de la GGTT fuera de la pantalla puede apuntar a
@@ -415,6 +525,7 @@ int taek_early_ejecutar(int modo, int simular_5917, int soltar, unsigned long fa
     int rc;
     /* Por fotograma: sin tocar el resultado de las ordenes de diagnostico. */
     if (modo == TAEK_EARLY_MEDIA_OP) return i915_retenido ? taek_media_op(&i915_retenido->drm, media_peticion) : -ENODEV;
+    if (modo == TAEK_EARLY_IRIS_OP) return i915_retenido ? taek_iris_op(&i915_retenido->drm, media_peticion) : -ENODEV;
     r->rc = 0; r->simulada = 0; r->platform = 0; r->subplatform = 0; r->step_gt = 0;
     r->pch_tipo = 0; r->pch_id = 0; r->gt_count = 0; r->mem_regiones_ok = 0;
     r->modo = modo; r->mmio_fallos = 0;
@@ -504,6 +615,30 @@ int taek_early_ejecutar(int modo, int simular_5917, int soltar, unsigned long fa
         r->vendor = d->vendor; r->device = d->device; r->revision = d->revision;
         rc = taek_media_probar(&i915_retenido->drm, 1 + (int)(modo - TAEK_EARLY_MEDIA_RT), t, sizeof(t), &pila);
         pr_info("[GPU] media: %s pila=%u rc=%d\n", t, pila, rc);
+        r->rc = rc;
+        fase(TAEK_EARLY_FIN);
+        return rc;
+    }
+    if (modo == TAEK_EARLY_IRIS_RT || modo == TAEK_EARLY_IRIS_INIT || modo == TAEK_EARLY_IRIS_CLEAR || modo == TAEK_EARLY_IRIS_TRIANGULO ||
+        modo == TAEK_EARLY_IRIS_TEXTURA || modo == TAEK_EARLY_IRIS_PANTALLA || modo == TAEK_EARLY_IRIS_VIDEO) {
+        char t[200] = "";
+        unsigned pila = 0;
+        if (!i915_retenido) { r->rc = -ENODEV; return -ENODEV; }
+        struct pci_dev *d = to_pci_dev(i915_retenido->drm.dev);
+        r->vendor = d->vendor; r->device = d->device; r->revision = d->revision;
+        u64 t0 = local_clock();
+        rc = taek_iris_probar(&i915_retenido->drm, 1 + (int)(modo - TAEK_EARLY_IRIS_RT), t, sizeof(t), &pila);
+        pr_info("[GPU] iris: %s pila=%u rc=%d ms=%llu\n", t, pila, rc, (local_clock() - t0) / 1000000);
+        r->rc = rc;
+        fase(TAEK_EARLY_FIN);
+        return rc;
+    }
+    if (modo == TAEK_EARLY_MEDIA_EXPONER) {   /* H194: orden propia de Media Driver (no es contigua a las MEDIA_*) */
+        char t[200] = "";
+        unsigned pila = 0;
+        if (!i915_retenido) { r->rc = -ENODEV; return -ENODEV; }
+        rc = taek_media_probar(&i915_retenido->drm, 8 /* TAEK_MEDIA_EXPONER */, t, sizeof(t), &pila);
+        pr_info("[GPU] media exponer: %s pila=%u rc=%d\n", t, pila, rc);
         r->rc = rc;
         fase(TAEK_EARLY_FIN);
         return rc;

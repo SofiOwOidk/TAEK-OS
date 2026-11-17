@@ -17,6 +17,12 @@ void consola_lote_iniciar(void);
 void consola_lote_finalizar(void);
 void consola_desplazar(int lineas);
 void consola_puntero_presentar(void);
+void consola_ceder_pantalla(int ceder);
+void consola_repintar_ahora(void);
+/* H151: captura de lo que imprime una orden (SYS_ORDEN) */
+void consola_captura_iniciar(char *b, uint32_t cap);
+uint32_t consola_captura_terminar(int *truncado);
+int consola_capturando(void);
 void consola_obtener_posicion(int *col,uint64_t *linea);
 uint64_t consola_linea_visible(unsigned fila);
 
@@ -36,5 +42,8 @@ void consola_imprimir_hex(uint64_t valor);
 char consola_leer_caracter(void);
 int consola_sondear_cancelacion(void);
 int  consola_leer_linea(char *buffer, int max_len);
+
+/* H211: solo para el informe de un colapso */
+void consola_cerrojo_forzar(void);
 
 #endif // CONTROLADORES_CONSOLA_H

@@ -10,16 +10,17 @@
 #include "../../base/memoria.h"
 #include "../../base/sha256.h"
 #include "../../base/tiempo.h"
+#include "red_cerrojo.h"   /* H211: cerrojo de la red (Fase C) */
 #define BLOQUE 32768
 #define LIMITE (UINT64_C(1024)*1024*1024)
-static int backend_fat32,destino_elegido;
+static int backend_fat32,destino_elegido,ultimo_exfat;
 static int usb_archivo_activo(void){return exfat_transfer_activo() || fat32_transfer_activo();}
 static const struct particion *usb_archivo_particion(void){return !destino_elegido?0:backend_fat32?fat32_transfer_particion():exfat_transfer_particion();}
 static uint64_t usb_archivo_libres(void){return backend_fat32?fat32_transfer_libres():exfat_transfer_libres();}
 static const char *usb_archivo_temporal(void){return backend_fat32?fat32_transfer_temporal():exfat_transfer_temporal();}
 static int usb_archivo_destino(const struct particion *p){
     if(usb_archivo_activo())return VOLUMEN_ELEGIR;
-    int fat=p && p->formato==VOLUMEN_FAT32;
+    int fat=p && p->formato==VOLUMEN_FAT32;ultimo_exfat=!fat;
     int r=fat?fat32_transfer_destino(p):exfat_transfer_destino(p);destino_elegido=!r;if(!r)backend_fat32=fat;return r;
 }
 static int usb_archivo_iniciar(const char *n,uint64_t t){
@@ -35,7 +36,7 @@ static uint16_t puerto=9154;
 static uint64_t tamano,offset;
 static char nombre[64];
 static int configurado,pendiente,en_usb,completo;
-int red_archivos_ram_obtener(const void **p,uint64_t *n,uint8_t digest[32]){
+int red_archivos_ram_obtener(const void **p,uint64_t *n,uint8_t digest[32]){ RED_EXCLUSIVA();
     if(!p || !n || !digest || !completo || pendiente || en_usb || !ram || offset!=tamano)return -1;
     *p=ram;*n=tamano;memcpy(digest,esperado,32);return 0;
 }
@@ -128,6 +129,9 @@ static void resultado(int r){
         consola_imprimir_linea(pendiente?". archivo reintentar | archivo cancelar":". Sin recepcion completada.");
     }
 }
+/* H214: sin RED_EXCLUSIVA. Su estado (ram, offset, nombre...) solo lo toca CPU 0, y lo que llama de la red ya toma el
+ * cerrojo por su cuenta. Con el cerrojo tomado toda la orden (H211-H213), el hilo de red de CPU 3 no podia bombear
+ * mientras CPU 0 escribia y releia el USB: 7,4 s sin atender la red al verificar 64 MiB. */
 void red_archivos_comando(const char *arg){
     char op[32],a[64],b[65];const char *p=palabra(arg,op,sizeof(op));if(!p)goto uso;
     if(igual(op,"listar")){
@@ -181,7 +185,12 @@ void red_archivos_comando(const char *arg){
     if(igual(op,"destino")){
         if(igual(p,"ninguno")){destino_elegido=0;completo=0;consola_imprimir_linea("Destino USB liberado; archivos publicados conservados.");return;}
         p=palabra(p,a,sizeof(a));if(!p)goto uso;p=palabra(p,b,sizeof(b));unsigned unidad,num;if(!p || *p || !numero(a,&unidad)||unidad>3||!numero(b,&num))goto uso;
-        int r=elegir(unidad,num);if(r){consola_imprimir_linea(volumen_error(r));return;}
+        ultimo_exfat=0;int r=elegir(unidad,num);
+        if(r){consola_imprimir_linea(volumen_error(r));
+            /* H154: el motivo concreto (p. ej. VolumeDirty) en vez de solo el mensaje generico. */
+            const char *m=ultimo_exfat?exfat_transfer_motivo():0;
+            if(m){consola_imprimir("  Motivo: ");consola_imprimir_linea(m);}
+            return;}
         const struct particion *dest=usb_archivo_particion();completo=0;consola_imprimir(backend_fat32?"Destino FAT32 / (nombre 8.3); generacion USB ":"Destino exFAT /; generacion USB ");consola_imprimir_dec(dest->generacion_msc);consola_imprimir("; inicio LBA ");consola_imprimir_dec(dest->inicio);consola_imprimir("; libres ");consola_imprimir_dec(usb_archivo_libres());consola_imprimir_linea(" B. Aun no se ha escrito.");return;
     }
     if(igual(op,"recibir") || igual(op,"ram")){
@@ -199,7 +208,7 @@ uso:
     consola_imprimir_linea("archivo verificar <archivo> [SHA-256 esperado] (solo lectura USB)");
 }
 
-int red_archivos_preparar_reinicio(void){
+int red_archivos_preparar_reinicio(void){ RED_EXCLUSIVA();
     if(pendiente || usb_archivo_activo())return VOLUMEN_ELEGIR;
     const struct particion *p=usb_archivo_particion();if(!p)return 0;
     uint8_t sector[512];int r=particion_leer(p,0,0,sector,0);if(r)return r;

@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include "hid_descriptor.h"
 #include "teclado.h"
 #include "xhci_bulk_plan.h"
 #include "usb_msc.h"
@@ -10,6 +11,9 @@
 #include "../base/tiempo.h"
 #include "../base/memoria.h"
 #include "../base/huevo.h"
+#include "../base/atencion.h"
+#include "../base/cerrojo.h"
+#include "../base/hilos.h"
 #ifndef TAEK_XHCI_TRAZA_IO
 #define TAEK_XHCI_TRAZA_IO 0
 #endif
@@ -235,9 +239,13 @@ struct xhci_ep_teclado {
     uint8_t  iface_num;     // Número de interfaz USB
     uint8_t  es_boot;       // Interfaz HID Boot Keyboard (subclase/protocolo 1/1)
     uint8_t  es_raton;      // Interfaz HID Boot Mouse (subclase/protocolo 1/2)
-    uint8_t  raton_boot_confirmado;
+    uint8_t  raton_boot_confirmado;  // Listo para entregar reportes de raton (boot o, desde H138, reporte)
     uint32_t raton_generacion;
     int      activo;
+    /* H138: como Linux y Windows, el raton se deja en protocolo reporte si su descriptor de reporte se entiende */
+    uint16_t hid_rep_lon;            // Largo del descriptor de reporte segun el descriptor HID de la interfaz
+    uint8_t  raton_reporte;          // 1: se decodifica con 'raton', no con los 3 bytes boot
+    struct hid_raton raton;
 
     // Anillo de transferencia DMA (Transfer Ring)
     volatile struct trb_xhci *ring;
@@ -266,13 +274,35 @@ static int mouse_buscar(void){
     for(unsigned e=0;e<XHCI_MAX_TECLADO_EPS;e++)if(mouse_compatible(e)){g_mouse_ep=(int)e;g_mouse_generacion_ep=g_teclado_eps[e].raton_generacion;return 1;}
     g_mouse_ep=-1;return 0;
 }
+/* H208, Fase B del gestor de hilos: un cerrojo para todo el estado del xHCI. Lo toma cada funcion publica al entrar
+ * y lo suelta al salir por cualquier return (cleanup). Es recursivo por CPU: una funcion publica puede llamar a otra.
+ * Quien espera una transferencia lo tiene tomado y bombea el anillo el mismo, como antes; el hilo de CPU 1 bombea
+ * solo cuando esta libre (cerrojo_intentar), asi nadie espera un evento que solo el otro puede recoger. */
+static cerrojo_t g_cerrojo_xhci = CERROJO("xhci");
+static void xhci_soltar_exclusivo(int *p) { (void)p; cerrojo_soltar(&g_cerrojo_xhci); }
+#define XHCI_EXCLUSIVO() int xhci_exclusivo_ __attribute__((cleanup(xhci_soltar_exclusivo), unused)) = (cerrojo_tomar(&g_cerrojo_xhci), 1)
+static int xhci_hilos_activos(void);   /* H210: 1 si los hilos de CPU 1 atienden el USB (al final del archivo) */
+
 int xhci_hid_mouse_tomar(void){
+    if(__atomic_load_n(&g_mouse_propietario,__ATOMIC_ACQUIRE))return -1;   /* H211: anillo3 lo intenta en cada vuelta si otro lo tiene */
+    XHCI_EXCLUSIVO();
     if(g_mouse_propietario)return -1;
     g_mouse_propietario=1;g_mouse_inicio=g_mouse_total=0;g_mouse_perdidos=0;return mouse_buscar();
 }
-void xhci_hid_mouse_liberar(void){g_mouse_propietario=0;g_mouse_inicio=g_mouse_total=0;g_mouse_ep=-1;}
+void xhci_hid_mouse_liberar(void){ XHCI_EXCLUSIVO();g_mouse_propietario=0;g_mouse_inicio=g_mouse_total=0;g_mouse_ep=-1;}
 uint64_t xhci_hid_mouse_perdidos(void){return g_mouse_perdidos;}
 int xhci_hid_mouse_leer(struct taek_hid_mouse_reporte *out){
+    /* H210: cola vacia y el mismo raton de siempre: se vuelve sin cerrojo (anillo3 lo pide 64 veces por vuelta).
+     * H211: tambien sin raton encontrado todavia (mouse_encolar lo busca solo cuando llega un reporte, con el cerrojo
+     * del hilo de eventos) y sin ser el dueño. Antes esos dos casos tomaban el cerrojo en cada llamada: 315 millones
+     * de tomas y 49 427 esperas del hilo de eventos en 220 s de video. */
+    if(xhci_hilos_activos() && out && !__atomic_load_n(&g_mouse_total,__ATOMIC_ACQUIRE)){
+        if(!__atomic_load_n(&g_mouse_propietario,__ATOMIC_ACQUIRE))return -1;
+        int ep=__atomic_load_n(&g_mouse_ep,__ATOMIC_ACQUIRE);
+        if(ep<0)return 0;
+        if(g_teclado_eps[ep].activo && g_teclado_eps[ep].raton_generacion==g_mouse_generacion_ep)return 0;
+    }
+    XHCI_EXCLUSIVO();
     if(!g_mouse_propietario || !out)return -1;
     if(g_mouse_ep>=0 && (!mouse_compatible((unsigned)g_mouse_ep) || g_teclado_eps[g_mouse_ep].raton_generacion!=g_mouse_generacion_ep)){
         g_mouse_inicio=g_mouse_total=0;g_mouse_ep=-1;return -2;
@@ -284,10 +314,49 @@ int xhci_hid_mouse_leer(struct taek_hid_mouse_reporte *out){
 static void mouse_encolar(struct xhci_ep_teclado *ep,const uint8_t *data,unsigned n){
     if(!g_mouse_propietario || !ep->raton_boot_confirmado || n<3 || n>8)return;
     if(g_mouse_ep<0)mouse_buscar();
-    if(g_mouse_ep<0 || ep!=&g_teclado_eps[g_mouse_ep] || ep->raton_generacion!=g_mouse_generacion_ep)return;
+    /* H138: vale cualquier raton confirmado, no solo el primero que se encontro (con dos receptores, el segundo no movia nada) */
+    if(!mouse_compatible((unsigned)(ep-g_teclado_eps)))return;
     if(g_mouse_total==MOUSE_COLA){g_mouse_inicio=(g_mouse_inicio+1)%MOUSE_COLA;g_mouse_total--;g_mouse_perdidos++;}
     struct taek_hid_mouse_reporte *r=&g_mouse_cola[(g_mouse_inicio+g_mouse_total)%MOUSE_COLA];
     memset(r,0,sizeof(*r));r->secuencia=++g_mouse_secuencia;r->dispositivo=ep->raton_generacion;r->longitud=(uint8_t)n;memcpy(r->datos,data,n);g_mouse_total++;
+}
+
+/* Un reporte de raton en formato boot: a quien tenga el raton (menu o modulo) o a los contadores de diagnostico */
+static void raton_entregar(struct xhci_ep_teclado *ep, const uint8_t *d, unsigned n) {
+    if (g_mouse_propietario) { mouse_encolar(ep, d, n); return; }
+    if (ep->raton_boot_confirmado && n >= 3) {
+        g_estado.reportes_raton_recibidos++;
+        g_estado.botones_raton = d[0];
+        g_estado.movimiento_raton_x += (int8_t)d[1];
+        g_estado.movimiento_raton_y += (int8_t)d[2];
+    }
+}
+
+/* Copia cruda de cada transferencia HID para 'raton crudo'. Solo lectura del bufer ya recibido. */
+#define CRUDO_COLA 64
+static struct xhci_hid_crudo g_crudo[CRUDO_COLA];
+static unsigned g_crudo_inicio, g_crudo_total;
+static int g_crudo_activo;
+static uint64_t g_crudo_perdidos;
+void xhci_hid_crudo_activar(int activo) { XHCI_EXCLUSIVO(); g_crudo_activo = activo; g_crudo_inicio = g_crudo_total = 0; g_crudo_perdidos = 0; }
+uint64_t xhci_hid_crudo_perdidos(void) { return g_crudo_perdidos; }
+int xhci_hid_crudo_leer(struct xhci_hid_crudo *out) { XHCI_EXCLUSIVO();
+    if (!g_crudo_total) return 0;
+    *out = g_crudo[g_crudo_inicio];
+    g_crudo_inicio = (g_crudo_inicio + 1) % CRUDO_COLA;
+    g_crudo_total--;
+    return 1;
+}
+static void crudo_guardar(const struct xhci_ep_teclado *ep, uint8_t cc, const uint8_t *d, unsigned n) {
+    if (!g_crudo_activo) return;
+    if (g_crudo_total == CRUDO_COLA) { g_crudo_inicio = (g_crudo_inicio + 1) % CRUDO_COLA; g_crudo_total--; g_crudo_perdidos++; }
+    struct xhci_hid_crudo *c = &g_crudo[(g_crudo_inicio + g_crudo_total) % CRUDO_COLA];
+    memset(c, 0, sizeof(*c));
+    c->ms = tiempo_obtener_milisegundos();
+    c->slot = ep->slot_id; c->dci = ep->ep_dci; c->cc = cc; c->len = (uint8_t)(n > 255 ? 255 : n);
+    c->iface = ep->iface_num; c->es_raton = ep->es_raton; c->confirmado = ep->raton_boot_confirmado;
+    for (unsigned i = 0; i < n && i < sizeof(c->datos); i++) c->datos[i] = d[i];
+    g_crudo_total++;
 }
 
 static void xhci_recontar_hid(void) {
@@ -334,6 +403,28 @@ static uint16_t g_slot_pid[XHCI_MAX_SLOTS + 1] = {0};
 static uint8_t *g_teclado_dev_ctx = NULL; // Puntero de conveniencia al último dev_ctx activo
 static uint64_t g_teclado_dev_ctx_fisica = 0;
 
+/* H139, hubs. Un dispositivo detras de un hub se direcciona con su "route string" (un nibble por nivel: el puerto
+ * de cada hub en el camino, xHCI 1.2 seccion 8.9) y su puerto raiz. Si es lento (Full o Low Speed) y cuelga de un
+ * hub de alta velocidad, el controlador habla con el a traves del traductor (TT) de ese hub: hay que decirle que
+ * hub y que puerto. xhci_configurar_puerto lee estos datos de g_enum; para un puerto raiz quedan en cero. */
+static struct {
+    uint32_t ruta;
+    uint8_t  profundidad;   // Hubs entre la raiz y el dispositivo
+    uint8_t  tt_slot, tt_puerto;
+    uint8_t  slot;          // Resultado: slot asignado (0 si fallo)
+} g_enum;
+
+#define XHCI_MAX_HUBS 4
+#define HUB_MAX_PUERTOS 15
+struct xhci_hub {
+    uint8_t  activo, slot, raiz, velocidad, puertos, es_ss, profundidad, tt_slot, tt_puerto;
+    uint32_t ruta;
+    uint8_t  hijo[HUB_MAX_PUERTOS + 1];   // Slot de lo que cuelga de cada puerto (0 = nada)
+};
+static struct xhci_hub g_hubs[XHCI_MAX_HUBS];
+static void xhci_hub_iniciar(uint8_t slot_id, uint8_t velocidad, uint8_t config_val, uint8_t raiz);
+static void xhci_hubs_sondear(void);
+
 static inline int xhci_conteo_endpoints_activos(void) {
     int c = 0;
     for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
@@ -347,6 +438,62 @@ static inline int xhci_conteo_endpoints_activos(void) {
 static char     g_buffer_teclado[TAM_BUFFER_TECLAS];
 static uint32_t g_buf_cabeza = 0;
 static uint32_t g_buf_cola = 0;
+
+/* H204, Fase 0 del gestor de hilos: contadores del anillo de eventos y bitacora de sucesos de los puertos raiz. */
+static struct xhci_fase0 g_fase0;
+static volatile uint32_t g_bombeo_profundidad;   /* Pasadas por el anillo en curso (mas de 1 = llamada anidada) */
+const struct xhci_fase0 *xhci_fase0(void) { return &g_fase0; }
+static void xhci_suceso(uint8_t puerto, uint32_t portsc, uint8_t tipo, uint8_t intento) {
+    struct xhci_suceso_puerto *s = &g_fase0.sucesos[g_fase0.sucesos_total % XHCI_SUCESOS];
+    s->ms = tiempo_obtener_milisegundos(); s->portsc = portsc;
+    s->puerto = puerto; s->tipo = tipo; s->intento = intento; s->reservado = 0;
+    g_fase0.sucesos_total++;
+}
+unsigned xhci_fase0_sucesos(struct xhci_suceso_puerto *out, unsigned max) { XHCI_EXCLUSIVO();
+    unsigned n = g_fase0.sucesos_total < XHCI_SUCESOS ? g_fase0.sucesos_total : XHCI_SUCESOS;
+    if (n > max) n = max;
+    for (unsigned i = 0; i < n; i++)
+        out[i] = g_fase0.sucesos[(g_fase0.sucesos_total - n + i) % XHCI_SUCESOS];
+    return n;
+}
+void xhci_fase0_cero(void) { XHCI_EXCLUSIVO();
+    uint32_t total = g_fase0.sucesos_total;
+    struct xhci_suceso_puerto copia[XHCI_SUCESOS];
+    for (unsigned i = 0; i < XHCI_SUCESOS; i++) copia[i] = g_fase0.sucesos[i];
+    memset(&g_fase0, 0, sizeof(g_fase0));
+    /* La bitacora de sucesos no se borra: cada uno lleva su hora */
+    g_fase0.sucesos_total = total;
+    for (unsigned i = 0; i < XHCI_SUCESOS; i++) g_fase0.sucesos[i] = copia[i];
+}
+/* Reintentos del reset de puerto (H204): el numero del proximo intento (0 = ninguno) y su hora */
+#define XHCI_REINTENTOS 3
+static struct { uint8_t intento; uint64_t cuando_ms; } g_reintento[XHCI_MAX_PUERTOS + 1];
+static void xhci_reintento_programar(uint8_t p, uint8_t intento) {
+    static const uint16_t espera_ms[XHCI_REINTENTOS] = { 100, 300, 700 };
+    if (p > XHCI_MAX_PUERTOS || intento < 1 || intento > XHCI_REINTENTOS) return;
+    g_reintento[p].intento = intento;
+    g_reintento[p].cuando_ms = tiempo_obtener_milisegundos() + espera_ms[intento - 1];
+}
+static void xhci_reintentos_atender(void);
+/* Una linea por suceso, con los bits de PORTSC que separan una caida electrica de un fallo de enlace:
+ * OCA/OCC sobrecorriente, PLS estado del enlace, CSC/PEC/PRC/PLC cambios pendientes. */
+static void xhci_suceso_imprimir(uint8_t p, uint32_t portsc, const char *que) {
+    consola_imprimir("[USB-F0] t="); consola_imprimir_dec(tiempo_obtener_milisegundos());
+    consola_imprimir(" ms puerto "); consola_imprimir_dec(p); consola_imprimir(" "); consola_imprimir(que);
+    consola_imprimir(" PORTSC="); consola_imprimir_hex(portsc);
+    consola_imprimir(" CCS="); consola_imprimir_dec(portsc & 1u);
+    consola_imprimir(" PED="); consola_imprimir_dec((portsc >> 1) & 1u);
+    consola_imprimir(" OCA="); consola_imprimir_dec((portsc >> 3) & 1u);
+    consola_imprimir(" PLS="); consola_imprimir_dec((portsc >> 5) & 0xFu);
+    consola_imprimir(" PP="); consola_imprimir_dec((portsc >> 9) & 1u);
+    consola_imprimir(" VEL="); consola_imprimir_dec((portsc >> 10) & 0xFu);
+    consola_imprimir(" CSC="); consola_imprimir_dec((portsc >> 17) & 1u);
+    consola_imprimir(" PEC="); consola_imprimir_dec((portsc >> 18) & 1u);
+    consola_imprimir(" OCC="); consola_imprimir_dec((portsc >> 20) & 1u);
+    consola_imprimir(" PRC="); consola_imprimir_dec((portsc >> 21) & 1u);
+    consola_imprimir(" PLC="); consola_imprimir_dec((portsc >> 22) & 1u);
+    consola_imprimir_linea("");
+}
 
 // --- TABLAS DE TRADUCCIÓN USB HID (BOOT PROTOCOL) A ASCII ---
 static const char g_hid_a_ascii_normal[128] = {
@@ -483,13 +630,22 @@ static int xhci_capturar_bulk_evento(const struct trb_xhci *evt) {
         g_captura_bulk.terminado=1;
     return 1;
 }
-static void xhci_bombear_eventos(void) {
+/* H204: noinline para que la direccion de retorno de una llamada anidada sea la de quien llamo de verdad. */
+static __attribute__((noinline)) void xhci_bombear_eventos(void) {
 #ifdef TAEK_XHCI_HOST_TEST
     extern void xhci_prueba_eventos(void);
     xhci_prueba_eventos();return;
 #endif
+    /* Fase 0: el hueco desde la pasada anterior y si esta pasada empieza dentro de otra. Se cuenta, no se corta:
+     * una llamada anidada que volviera sin bombear dejaria a su transferencia esperando hasta su tiempo limite. */
+    atencion_marcar(&atencion_usb);
+    if (g_bombeo_profundidad && !g_fase0.reentradas++)
+        g_fase0.reentrada_desde = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    g_bombeo_profundidad++;
+    uint32_t sacados = 0;
     struct trb_xhci evt;
     for (uint32_t i = 0; i < XHCI_TAM_ANILLO && xhci_extraer_evento(&evt); i++) {
+        sacados++;
         uint8_t tipo = (evt.control >> 10) & 0x3F;
         uint8_t slot = (evt.control >> 24) & 0xFF;
         uint8_t dci = (evt.control >> 16) & 0x1F;
@@ -525,12 +681,27 @@ static void xhci_bombear_eventos(void) {
             }
         } else if (tipo == 34) { // Port Status Change Event
             g_cambio_puerto_pendiente = 1;
+            /* H204: el Port ID va en los bits 31:24 del primer DWORD. PORTSC se lee ahora, antes de que el escaneo
+             * limpie los bits de cambio: un rebote corto (CCS 1-0-1 entre dos escaneos) solo queda aqui. */
+            uint8_t puerto = (uint8_t)((evt.parametro >> 24) & 0xFF);
+            g_fase0.cambios_puerto++;
+            if (puerto >= 1 && puerto <= g_estado.max_puertos)
+                xhci_suceso(puerto, mmio_leer32(g_op_base + REG_OP_PORTSC_BASE + (uint64_t)(puerto - 1) * 0x10),
+                            XHCI_SUCESO_EVENTO, 0);
         } else {
+            if (tipo == 37) {   /* Host Controller Event; el codigo 21 es Event Ring Full Error */
+                g_fase0.eventos_hc++;
+                if (cc == 21) g_fase0.anillo_lleno++;
+            }
             serial_imprimir("[xHCI] Evento no gestionado, tipo=");
             serial_imprimir_dec(tipo);
+            serial_imprimir(" codigo=");
+            serial_imprimir_dec(cc);
             serial_imprimir_linea("");
         }
     }
+    g_bombeo_profundidad--;
+    if (sacados > g_fase0.eventos_max) g_fase0.eventos_max = sacados;
 }
 
 // Volcado crudo hexadecimal y checksum de Input Context (para auditoría offline byte a byte)
@@ -651,7 +822,7 @@ static void xhci_negociar_cesion_bios(uint64_t virt_bar0, uint32_t xecp) {
 }
 
 // --- DIAGNÓSTICO FORENSE DEL CONTROLADOR XHCI ---
-void xhci_imprimir_diagnostico_completo(void) {
+void xhci_imprimir_diagnostico_completo(void) { XHCI_EXCLUSIVO();
     if (!g_estado.controlador_detectado) {
         consola_imprimir_linea_color("[!] xHCI: Controlador no detectado en el bus PCI.", COLOR_ERROR_DEFAULT);
         return;
@@ -1174,7 +1345,10 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                 serial_imprimir(" CC=");
                 serial_imprimir_dec(codigo);
                 serial_imprimir_linea("");
-            } else if (codigo == 1 || codigo == 13) { // 1 = Success, 13 = Short Packet
+            } else if (codigo != 1 && codigo != 13) {
+                crudo_guardar(ep, codigo, 0, 0);
+            }
+            if (ep && (codigo == 1 || codigo == 13)) { // 1 = Success, 13 = Short Packet
                 g_estado.reportes_hid_recibidos++;
                 uint32_t residual = evt->estado & 0xFFFFFF;
                 uint32_t tam_recibido = (residual <= ep->ep_max_pkt) ? (ep->ep_max_pkt - residual) : 0;
@@ -1183,6 +1357,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
                 uint8_t *buf = ep->bufer;
                 dma_sincronizar_dispositivo_a_cpu(buf, ep->ep_max_pkt);
+                crudo_guardar(ep, codigo, buf, tam_recibido);
                 int reporte_cambio = (tam_recibido != ep->ultimo_tam);
                 for (uint32_t i = 0; i < tam_recibido && i < sizeof(ep->ultimo_reporte); i++) {
                     if (buf[i] != ep->ultimo_reporte[i]) reporte_cambio = 1;
@@ -1210,14 +1385,33 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                 uint8_t mod = 0;
                 int shift = 0;
 
-                // Mouse HID Boot: botones, desplazamiento X/Y con signo y rueda opcional.
+                // Mouse HID: boot (botones, X/Y con signo, rueda) o, desde H138, protocolo reporte traducido a boot.
                 if (ep->es_raton) {
-                    if(g_mouse_propietario)mouse_encolar(ep,buf,tam_recibido);
-                    else if (ep->raton_boot_confirmado && tam_recibido >= 3) {
-                        g_estado.reportes_raton_recibidos++;
-                        g_estado.botones_raton = buf[0];
-                        g_estado.movimiento_raton_x += (int8_t)buf[1];
-                        g_estado.movimiento_raton_y += (int8_t)buf[2];
+                    /* H142: el receptor 248A:8367 anuncia reportes con ID 1, pero en la laptop manda 3 bytes sin ID
+                     * (botones, X, Y): el formato boot, seguramente porque el firmware lo dejo en protocolo boot antes
+                     * de ceder el USB. Con el ID esperado delante, '00 C1 2E' se tiraba como "otro reporte" y
+                     * '01 0A 17' se leia corrido. Un reporte de 3 o 4 bytes mas corto que el descrito se lee como boot. */
+                    unsigned descrito = ep->raton.id ? 1u + (ep->raton.bits + 7u) / 8u : (ep->raton.bits + 7u) / 8u;
+                    int boot_en_reporte = ep->raton_reporte && ep->raton.id && (tam_recibido == 3 || tam_recibido == 4) &&
+                                          tam_recibido < descrito;
+                    if (boot_en_reporte) {
+                        raton_entregar(ep, buf, tam_recibido);
+                    } else if (ep->raton_reporte) {
+                        int32_t dx, dy, rueda; uint32_t bot;
+                        if (hid_decodificar_raton(&ep->raton, buf, tam_recibido, &dx, &dy, &bot, &rueda) == 0) {
+                            /* Un raton de alta resolucion puede mover mas de 127 en un reporte: se reparte en varios */
+                            for (int k = 0; k < 8; k++) {
+                                int32_t px = dx > 127 ? 127 : dx < -127 ? -127 : dx;
+                                int32_t py = dy > 127 ? 127 : dy < -127 ? -127 : dy;
+                                int32_t pr = rueda > 127 ? 127 : rueda < -127 ? -127 : rueda;
+                                uint8_t boot[4] = { (uint8_t)(bot & 7u), (uint8_t)(int8_t)px, (uint8_t)(int8_t)py, (uint8_t)(int8_t)pr };
+                                raton_entregar(ep, boot, 4);
+                                dx -= px; dy -= py; rueda -= pr;
+                                if (!dx && !dy && !rueda) break;
+                            }
+                        }
+                    } else {
+                        raton_entregar(ep, buf, tam_recibido);
                     }
                 }
                 // CASO A: Endpoint Boot estándar (prioridad absoluta para no confundir modificadores con Report IDs)
@@ -1239,7 +1433,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                         }
 
                         if (!ya_estaba && scancode < 128) {
-                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
+                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : scancode == 0x50 ? TECLA_IZQUIERDA : scancode == 0x4F ? TECLA_DERECHA : scancode == 0x4C ? TECLA_SUPRIMIR : scancode == 0x3B ? TECLA_F2 : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
                             if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
                                 c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
                             }
@@ -1251,7 +1445,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                                     g_estado.ultimo_slot_tecla = ep->slot_id;
                                     g_estado.ultimo_puerto_tecla = ep->puerto_idx;
                                     g_estado.ultimo_caracter = (uint8_t)c;
-                                }
+                                } else g_fase0.teclas_perdidas++;   /* H204 */
                             }
                         }
                     }
@@ -1277,7 +1471,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                                                 g_estado.ultimo_slot_tecla = ep->slot_id;
                                                 g_estado.ultimo_puerto_tecla = ep->puerto_idx;
                                                 g_estado.ultimo_caracter = (uint8_t)c;
-                                            }
+                                            } else g_fase0.teclas_perdidas++;   /* H204 */
                                         }
                                     }
                                 }
@@ -1304,7 +1498,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                         }
 
                         if (!ya_estaba && scancode < 128) {
-                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
+                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : scancode == 0x50 ? TECLA_IZQUIERDA : scancode == 0x4F ? TECLA_DERECHA : scancode == 0x4C ? TECLA_SUPRIMIR : scancode == 0x3B ? TECLA_F2 : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
                             if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
                                 c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
                             }
@@ -1316,7 +1510,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                                     g_estado.ultimo_slot_tecla = ep->slot_id;
                                     g_estado.ultimo_puerto_tecla = ep->puerto_idx;
                                     g_estado.ultimo_caracter = (uint8_t)c;
-                                }
+                                } else g_fase0.teclas_perdidas++;   /* H204 */
                             }
                         }
                     }
@@ -1340,7 +1534,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                         }
 
                         if (!ya_estaba && scancode < 128) {
-                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
+                            char c = scancode == 0x52 ? (ctrl ? TECLA_CTRL_ARRIBA : TECLA_ARRIBA) : scancode == 0x51 ? (ctrl ? TECLA_CTRL_ABAJO : TECLA_ABAJO) : scancode == 0x50 ? TECLA_IZQUIERDA : scancode == 0x4F ? TECLA_DERECHA : scancode == 0x4C ? TECLA_SUPRIMIR : scancode == 0x3B ? TECLA_F2 : (shift ? g_hid_a_ascii_shift[scancode] : g_hid_a_ascii_normal[scancode]);
                             if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
                                 c = (c >= 'a' && c <= 'z') ? (c - 'a' + 1) : (c - 'A' + 1);
                             }
@@ -1352,7 +1546,7 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
                                     g_estado.ultimo_slot_tecla = ep->slot_id;
                                     g_estado.ultimo_puerto_tecla = ep->puerto_idx;
                                     g_estado.ultimo_caracter = (uint8_t)c;
-                                }
+                                } else g_fase0.teclas_perdidas++;   /* H204 */
                             }
                         }
                     }
@@ -1419,8 +1613,21 @@ static void xhci_procesar_evento_hid(const struct trb_xhci *evt) {
 
 static int sondeo_breve;
 void xhci_configurar_sondeo_breve(int activo){sondeo_breve=activo;}
+/* H210, Fase B2: con los hilos de CPU 1 encendidos, ellos bombean y escanean; CPU 0 no hace nada aqui. Las llamadas
+ * de siempre quedan como respaldo para cuando el hilo se apaga ('usb hilo apagar'). */
+static int xhci_hilos_activos(void);
+static void xhci_puertos_pasada(int breve);
 void xhci_sondeo(void) {
+    /* H210: con los hilos encendidos se vuelve sin tocar el cerrojo: CPU 0 lo pedia miles de veces por ms y el hilo
+     * de eventos lo encontraba ocupado (huecos de 10 ms) */
+    if (xhci_hilos_activos()) return;
+    XHCI_EXCLUSIVO();
     if (!g_estado.inicializado) return;
+    xhci_puertos_pasada(sondeo_breve);
+}
+/* El sondeo de siempre: escanear puertos, bombear el anillo, cambios pendientes, hubs y reintentos. breve: sin
+ * enumeracion ni resets (el reproductor lo pide mientras un lote tiene dependencias). */
+static void xhci_puertos_pasada(int sondeo_breve) {
 
     // Escanear cambios físicos en puertos raíz (Hotplug reactivo)
     // Se ejecuta de inmediato si el controlador reporta Port Change Detect (PCD) en USBSTS,
@@ -1441,14 +1648,22 @@ void xhci_sondeo(void) {
         g_cambio_puerto_pendiente = 0;
         xhci_escanear_cambios_puertos(1);
     }
+    if (!sondeo_breve) xhci_hubs_sondear();   /* H139: conexiones en los puertos de los hubs, cada 500 ms */
+    if (!sondeo_breve) xhci_reintentos_atender();   /* H204: reintentos de reset que ya tocan */
 }
 
 int xhci_hay_datos(void) {
+    /* H210: sin cerrojo si los hilos llenan el bufer: solo se comparan dos indices */
+    if (xhci_hilos_activos()) return __atomic_load_n(&g_buf_cabeza, __ATOMIC_ACQUIRE) != __atomic_load_n(&g_buf_cola, __ATOMIC_RELAXED);
+    XHCI_EXCLUSIVO();
     xhci_sondeo();
     return (g_buf_cabeza != g_buf_cola);
 }
 
 char xhci_leer_caracter(void) {
+    /* H210: si no hay nada, se vuelve sin cerrojo; si hay, se toma para sacar la tecla */
+    if (xhci_hilos_activos() && __atomic_load_n(&g_buf_cabeza, __ATOMIC_ACQUIRE) == __atomic_load_n(&g_buf_cola, __ATOMIC_RELAXED)) return 0;
+    XHCI_EXCLUSIVO();
     if (!g_estado.inicializado) return 0;
     xhci_sondeo();
     if (g_buf_cabeza == g_buf_cola) return 0;
@@ -1480,18 +1695,11 @@ static int xhci_transferencia_control(uint8_t slot_id, uint8_t tipo_peticion, ui
     g_estado.ultimo_largo_control = longitud;
     g_estado.transferencias_control++;
 
-    // Garantizar que haya al menos 4 posiciones libres para que los TRBs del TD (Setup, Data, Status)
-    // queden completamente contiguos y no se dividan a través del Link TRB sin bandera Chain.
-    if (ep0_idx >= XHCI_TAM_ANILLO - 4) {
-        volatile struct trb_xhci *link = &ep0_ring[ep0_idx];
-        link->parametro = ep0_ring_fisica;
-        link->estado    = 0;
-        link->control   = (TRB_TIPO_LINK << 10) | (1U << 1) /* TC */ | (ep0_cycle ? 1 : 0);
-        dma_sincronizar_cpu_a_dispositivo((const void *)link, sizeof(*link));
-        __asm__ volatile ("mfence" ::: "memory");
-        ep0_idx = 0;
-        ep0_cycle = !ep0_cycle;
-    }
+    /* H139: aqui habia un enlace anticipado (en la posicion 60, 61 o 62) para que Setup, Data y Status quedaran
+     * juntos. Dejaba posiciones sin escribir en esa vuelta; el anillo nace en ceros (ciclo 0), y en las vueltas de
+     * ciclo 0 esos ceros parecian TRB validos: el controlador seguia de largo y se salia del anillo. Aparecio al
+     * sondear hubs (cientos de transferencias por EP0). No hace falta: Setup, Data y Status son TD distintos
+     * (xHCI 1.2, 4.11.2.2) y un enlace entre ellos es legal. El enlace queda siempre en la ultima posicion. */
 
     // --- Setup Stage TRB ---
     volatile struct trb_xhci *setup = &ep0_ring[ep0_idx];
@@ -1595,12 +1803,49 @@ static int xhci_transferencia_control(uint8_t slot_id, uint8_t tipo_peticion, ui
     }
 
     serial_imprimir_linea("  [xHCI AVISO] Timeout en transferencia de control");
+    {
+        /* H139: que hay en la cabeza del anillo de eventos (un evento sin dueño detiene a todos los demas) */
+        volatile struct trb_xhci *cab = &g_event_ring[g_event_idx];
+        uint8_t ct = (cab->control >> 10) & 0x3F, cs = (cab->control >> 24) & 0xFF, cd = (cab->control >> 16) & 0x1F;
+        serial_imprimir("  [xHCI AVISO] Pedido slot="); serial_imprimir_dec(slot_id);
+        serial_imprimir(" | cabeza de eventos: tipo="); serial_imprimir_dec(ct);
+        serial_imprimir(" slot="); serial_imprimir_dec(cs); serial_imprimir(" dci="); serial_imprimir_dec(cd);
+        serial_imprimir(" cc="); serial_imprimir_dec((cab->estado >> 24) & 0xFF);
+        serial_imprimir(" ciclo_ok="); serial_imprimir_dec((cab->control & 1U) == g_event_cycle);
+        serial_imprimir(" comando_pendiente="); serial_imprimir_dec(g_evento_comando.listo);
+        serial_imprimir(" transfer_pendiente="); serial_imprimir_dec(cs <= XHCI_MAX_SLOTS ? g_eventos_transfer[cs][cd].listo : 99);
+        serial_imprimir_linea("");
+        if (g_slot_dev_ctx[slot_id]) {
+            /* Estado del slot (DW3 bits 31:27) y de EP0 (DW0 bits 2:0: 1 corre, 2 detenido por error, 3 parado, 4 error) */
+            dma_sincronizar_dispositivo_a_cpu(g_slot_dev_ctx[slot_id], 2 * g_tamano_contexto);
+            const uint32_t *sc = (const uint32_t *)g_slot_dev_ctx[slot_id];
+            const uint32_t *e0 = (const uint32_t *)(g_slot_dev_ctx[slot_id] + g_tamano_contexto);
+            serial_imprimir("  [xHCI AVISO] slot_estado="); serial_imprimir_dec(sc[3] >> 27);
+            serial_imprimir(" ep0_estado="); serial_imprimir_dec(e0[0] & 7);
+            serial_imprimir(" ep0_deq="); serial_imprimir_hex(((uint64_t)e0[3] << 32) | (e0[2] & ~0xFu));
+            serial_imprimir(" anillo_idx="); serial_imprimir_dec(g_slot_ep0_idx[slot_id]);
+            serial_imprimir(" usbsts="); serial_imprimir_hex(mmio_leer32(g_op_base + REG_OP_USBSTS));
+            serial_imprimir_linea("");
+            uint64_t base = g_slot_ep0_ring_fisica[slot_id], deq = ((uint64_t)e0[3] << 32) | (e0[2] & ~0xFu);
+            int64_t pos = (int64_t)(deq - base) / 16;
+            serial_imprimir("  [xHCI AVISO] anillo base="); serial_imprimir_hex(base);
+            serial_imprimir(" posicion del controlador="); serial_imprimir_dec((uint64_t)pos);
+            serial_imprimir(" ciclo_productor="); serial_imprimir_dec(g_slot_ep0_cycle[slot_id]);
+            serial_imprimir(" dcs="); serial_imprimir_dec(e0[2] & 1);
+            if (pos >= 0 && pos < XHCI_TAM_ANILLO) {
+                volatile struct trb_xhci *t = &g_slot_ep0_ring[slot_id][pos];
+                serial_imprimir(" TRB alli: tipo="); serial_imprimir_dec((t->control >> 10) & 0x3F);
+                serial_imprimir(" ciclo="); serial_imprimir_dec(t->control & 1);
+            }
+            serial_imprimir_linea("");
+        }
+    }
     g_estado.fallos_control++;
     return -1;
 }
 
 // Ejecuta una transferencia síncrona en un endpoint Bulk IN o Bulk OUT
-int xhci_bulk_limpiar_halt(uint8_t slot_id,uint8_t ep_dci){
+int xhci_bulk_limpiar_halt(uint8_t slot_id,uint8_t ep_dci){ XHCI_EXCLUSIVO();
     if(!g_estado.inicializado || !slot_id || slot_id>XHCI_MAX_SLOTS || ep_dci<2 || ep_dci>31)return -1;
     struct xhci_ep_bulk *ep=NULL;
     for(unsigned i=0;i<XHCI_MAX_BULK_EPS;i++)if(g_bulk_eps[i].activo && g_bulk_eps[i].slot_id==slot_id && g_bulk_eps[i].ep_dci==ep_dci){ep=&g_bulk_eps[i];break;}
@@ -1622,7 +1867,7 @@ int xhci_bulk_limpiar_halt(uint8_t slot_id,uint8_t ep_dci){
 #endif
     g_eventos_transfer[slot_id][ep_dci].listo=0;return 0;
 }
-int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms) {
+int xhci_transferencia_bulk(uint8_t slot_id, uint8_t ep_dci, void *buffer, uint64_t buffer_fisica, uint32_t longitud, int es_in, int timeout_ms) { XHCI_EXCLUSIVO();
     if (!g_estado.inicializado || slot_id == 0 || ep_dci == 0) return -1;
 
     // Fuera del alcance de un unico TRB (17 bits): repartir en varios.
@@ -1732,7 +1977,7 @@ int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
                                        uint32_t longitud, int es_in,
                                        uint32_t primer_tramo, int timeout_ms,
                                        uint64_t *ciclos_primer_evento,
-                                       uint64_t *ciclos_fin_evento) {
+                                       uint64_t *ciclos_fin_evento) { XHCI_EXCLUSIVO();
     if (ciclos_primer_evento) *ciclos_primer_evento = 0;
     if (ciclos_fin_evento) *ciclos_fin_evento = 0;
 
@@ -1822,7 +2067,7 @@ int xhci_transferencia_bulk_segmentada(uint8_t slot_id, uint8_t ep_dci,
 uint64_t xhci_telemetria_espera_ciclos(void) { return g_bulk_ciclos_espera; }
 uint64_t xhci_telemetria_sondeo_ciclos(void) { return g_bulk_ciclos_sondeo; }
 uint64_t xhci_telemetria_timbre_ciclos(void) { return g_ciclos_timbre; }
-void     xhci_telemetria_reiniciar(void) {
+void     xhci_telemetria_reiniciar(void) { XHCI_EXCLUSIVO();
     g_bulk_ciclos_espera = 0;
     g_bulk_ciclos_sondeo = 0;
     g_ciclos_timbre = 0;
@@ -1858,6 +2103,31 @@ static void xhci_liberar_slot(uint8_t slot_id,
     }
 }
 
+/* H138: lee el descriptor de reporte de una interfaz de raton (GET_DESCRIPTOR de clase 0x22, HID 1.11 7.1.1) y, si
+ * declara un raton relativo, lo deja en ep->raton. 1 si se usara el protocolo reporte; 0 para seguir con boot. Es lo
+ * que hacen Linux y Windows: algunos receptores aceptan SET_PROTOCOL(boot) y luego no mandan nada en ese modo. */
+static int xhci_raton_modo_reporte(uint8_t slot_id, uint8_t iface, struct xhci_ep_teclado *ep) {
+    uint64_t fis = 0;
+    uint8_t *buf = (uint8_t *)dma_asignar_bufer_contiguo(1024, 64, &fis);
+    if (!buf) return 0;
+    int r = xhci_transferencia_control(slot_id, 0x81, 0x06, 0x2200, iface, ep->hid_rep_lon, buf, fis);
+    int ok = 0;
+    if (!r) {
+        dma_sincronizar_dispositivo_a_cpu(buf, ep->hid_rep_lon);
+        ok = hid_buscar_raton(buf, ep->hid_rep_lon, &ep->raton) == 0 && ep->raton.relativo;
+    }
+    dma_liberar_bufer_contiguo(buf, fis, 1024);
+    consola_imprimir("    -> Raton interfaz ");
+    consola_imprimir_dec(iface);
+    if (r) { consola_imprimir(": sin descriptor de reporte (codigo "); consola_imprimir_dec((uint64_t)(uint32_t)r); consola_imprimir_linea("), modo boot"); return 0; }
+    if (!ok) { consola_imprimir_linea(": descriptor sin raton relativo, modo boot"); return 0; }
+    consola_imprimir(": modo reporte, ID "); consola_imprimir_dec(ep->raton.id);
+    consola_imprimir(", X "); consola_imprimir_dec(ep->raton.x.tam); consola_imprimir(" bits, Y ");
+    consola_imprimir_dec(ep->raton.y.tam); consola_imprimir(" bits, "); consola_imprimir_dec(ep->raton.n_botones);
+    consola_imprimir_linea(" botones");
+    return 1;
+}
+
 // --- CONFIGURACIÓN DE PUERTOS Y TECLADO USB HID ---
 static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     g_estado.etapa_enumeracion = 1;
@@ -1874,8 +2144,10 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     serial_imprimir_dec(velocidad);
     serial_imprimir_linea(")...");
 
-    // Si este puerto ya tenía un slot asignado previamente, liberarlo antes de reconfigurar
-    if (puerto_idx <= XHCI_MAX_PUERTOS && g_puerto_slot[puerto_idx] > 0) {
+    g_enum.slot = 0;
+    // Si este puerto ya tenía un slot asignado previamente, liberarlo antes de reconfigurar.
+    // Detras de un hub el puerto raiz es el del hub: su slot no se toca.
+    if (!g_enum.ruta && puerto_idx <= XHCI_MAX_PUERTOS && g_puerto_slot[puerto_idx] > 0) {
         uint8_t prev_slot = g_puerto_slot[puerto_idx];
         for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
             if (g_teclado_eps[e].activo && g_teclado_eps[e].slot_id == prev_slot) {
@@ -1961,8 +2233,9 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
 
     // Slot Context (offset g_tamano_contexto)
     uint32_t *slot_ctx = (uint32_t *)(in_ctx + g_tamano_contexto);
-    slot_ctx[0] = (1U << 27) | ((uint32_t)velocidad << 20); // 1 context entry, speed
+    slot_ctx[0] = (1U << 27) | ((uint32_t)velocidad << 20) | (g_enum.ruta & 0xFFFFF); // 1 context entry, speed, route string
     slot_ctx[1] = ((uint32_t)puerto_idx << 16);             // Root hub port
+    slot_ctx[2] = (uint32_t)g_enum.tt_slot | ((uint32_t)g_enum.tt_puerto << 8);   // TT del hub de alta velocidad, si hace falta
 
     // EP0 Context (offset 2 * g_tamano_contexto)
     uint32_t *ep0_ctx = (uint32_t *)(in_ctx + 2 * g_tamano_contexto);
@@ -2053,8 +2326,9 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         ctrl_ctx[1] = (1U << 0) | (1U << 1);
 
         uint32_t *eval_slot_ctx = (uint32_t *)(in_ctx + g_tamano_contexto);
-        eval_slot_ctx[0] = (1U << 27); // Context Entries = 1. Speed (bits 23:20) es RsvdZ en Evaluate Context!
+        eval_slot_ctx[0] = (1U << 27) | (g_enum.ruta & 0xFFFFF); // Context Entries = 1. Speed (bits 23:20) es RsvdZ en Evaluate Context!
         eval_slot_ctx[1] = ((uint32_t)puerto_idx << 16);             // Root hub port
+        eval_slot_ctx[2] = (uint32_t)g_enum.tt_slot | ((uint32_t)g_enum.tt_puerto << 8);
 
         uint32_t *eval_ep0_ctx = (uint32_t *)(in_ctx + 2 * g_tamano_contexto);
         eval_ep0_ctx[1] = (4U << 3) | (nuevo_max_paquete << 16) | (3U << 1); // EP Type 4 (Control), MaxPacket, CErr=3
@@ -2094,6 +2368,10 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     }
 
     struct usb_descriptor_dispositivo *dev_desc = (struct usb_descriptor_dispositivo *)desc_buf;
+    /* El mismo bufer se reutiliza para el descriptor de configuracion: VID y PID se copian ahora (H138: antes se
+     * leian despues y salia el consumo del dispositivo, p. ej. 0932:0004). */
+    const uint16_t vid_dispositivo = dev_desc->id_proveedor, pid_dispositivo = dev_desc->id_producto;
+    const uint8_t clase_disp = dev_desc->clase_dispositivo;   // 9 = hub (H139)
     g_estado.etapa_enumeracion = 3;
     g_estado.teclado_id_proveedor = dev_desc->id_proveedor;
     g_estado.teclado_id_producto  = dev_desc->id_producto;
@@ -2160,6 +2438,8 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     int iface_actual_es_boot = 0;
     int iface_actual_es_raton = 0;
     int iface_actual_es_msc = 0;
+    uint16_t iface_actual_rep_lon = 0;   // Del descriptor HID (0x21) de la interfaz actual
+    int es_hub = (clase_disp == 9);
 
     struct xhci_ep_teclado *eps_este_dispositivo[4] = {0};
     int num_eps_este_dispositivo = 0;
@@ -2177,8 +2457,12 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         if (len == 0 || offset + len > total_cfg_len) break;
         uint8_t dtype = desc_buf[offset + 1];
 
-        if (dtype == 4 && len >= 9) { // Interface Descriptor
+        if (dtype == 0x21 && len >= 9 && iface_actual_es_hid && desc_buf[offset + 6] == 0x22) {
+            // Descriptor HID: el primer descriptor de clase que declara es el de reporte, con su largo
+            iface_actual_rep_lon = (uint16_t)(desc_buf[offset + 7] | desc_buf[offset + 8] << 8);
+        } else if (dtype == 4 && len >= 9) { // Interface Descriptor
             iface_actual_num = desc_buf[offset + 2];
+            iface_actual_rep_lon = 0;
             uint8_t if_class    = desc_buf[offset + 5];
             uint8_t if_subclass = desc_buf[offset + 6];
             uint8_t if_protocol = desc_buf[offset + 7];
@@ -2200,6 +2484,13 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
                 iface_actual_es_msc = 0;
                 serial_imprimir_linea(iface_actual_es_raton ? " [HID Ratón Aceptado]" :
                                       " [HID Teclado Aceptado]");
+            } else if (if_class == 9) { // Hub (H139): se atiende aparte, sin endpoints aqui
+                iface_actual_es_hid = 0;
+                iface_actual_es_boot = 0;
+                iface_actual_es_raton = 0;
+                iface_actual_es_msc = 0;
+                es_hub = 1;
+                serial_imprimir_linea(" [Hub]");
             } else if (if_class == 8) { // Mass Storage Class (MSC)
                 iface_actual_es_hid = 0;
                 iface_actual_es_boot = 0;
@@ -2255,6 +2546,8 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
                         ep->es_boot = iface_actual_es_boot;
                         ep->es_raton = iface_actual_es_raton;
                         ep->raton_boot_confirmado=0;
+                        ep->hid_rep_lon = iface_actual_rep_lon;
+                        ep->raton_reporte = 0;
                         if(++g_mouse_generacion==0)g_mouse_generacion++;
                         ep->raton_generacion=g_mouse_generacion;
                         ep->activo = 0;
@@ -2315,6 +2608,22 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         }
 
         offset += len;
+    }
+
+    if (es_hub) {
+        /* Un hub se queda con su slot: se registran sus mapeos y se encienden y recorren sus puertos */
+        consola_imprimir_linea_color("    -> Hub USB detectado", COLOR_EXITO_DEFAULT);
+        if (!g_enum.ruta) { g_slot_puerto[slot_id] = puerto_idx; g_puerto_slot[puerto_idx] = slot_id; }
+        else g_slot_puerto[slot_id] = puerto_idx;
+        g_slot_vid[slot_id] = vid_dispositivo;
+        g_slot_pid[slot_id] = pid_dispositivo;
+        g_slot_dev_ctx[slot_id] = dev_ctx;
+        g_slot_dev_ctx_fisica[slot_id] = dev_ctx_fisica;
+        dma_liberar_bufer_contiguo(desc_buf, desc_buf_fisica, 1024);
+        dma_liberar_bufer_contiguo(in_ctx, in_ctx_fisica, 33 * g_tamano_contexto);
+        g_enum.slot = slot_id;
+        xhci_hub_iniciar(slot_id, velocidad, config_val, puerto_idx);
+        return;
     }
 
     if (num_eps_este_dispositivo == 0 && !es_dispositivo_msc) {
@@ -2590,7 +2899,16 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
             }
             if (interfaz_ya_configurada) continue;
 
-            if (eps_este_dispositivo[e]->es_boot || eps_este_dispositivo[e]->es_raton) {
+            struct xhci_ep_teclado *er = eps_este_dispositivo[e];
+            if (er->es_raton && er->hid_rep_lon && er->hid_rep_lon <= 1024 && xhci_raton_modo_reporte(slot_id, iface, er)) {
+                // Queda en protocolo reporte (el que tiene tras SET_CONFIGURATION): no se envia SET_PROTOCOL
+                for (int m = 0; m < num_eps_este_dispositivo; m++)
+                    if (eps_este_dispositivo[m]->iface_num == iface && eps_este_dispositivo[m]->es_raton) {
+                        eps_este_dispositivo[m]->raton = er->raton;
+                        eps_este_dispositivo[m]->raton_reporte = 1;
+                        eps_este_dispositivo[m]->raton_boot_confirmado = 1;
+                    }
+            } else if (eps_este_dispositivo[e]->es_boot || eps_este_dispositivo[e]->es_raton) {
                 // SET_PROTOCOL(Boot = 0)
                 int res_p = xhci_transferencia_control(slot_id, 0x21, 0x0B, 0x0000, (uint16_t)iface, 0, NULL, 0);
                 serial_imprimir("  [xHCI] SET_PROTOCOL(Boot=0) Iface=");
@@ -2666,8 +2984,8 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
             g_estado.teclado_ep_dci  = eps_este_dispositivo[primer_teclado]->ep_dci;
             g_estado.teclado_num_eps = (uint8_t)num_eps_este_dispositivo;
             g_estado.teclado_puerto  = puerto_idx;
-            g_estado.teclado_id_proveedor = dev_desc->id_proveedor;
-            g_estado.teclado_id_producto  = dev_desc->id_producto;
+            g_estado.teclado_id_proveedor = vid_dispositivo;
+            g_estado.teclado_id_producto  = pid_dispositivo;
         }
         g_estado.etapa_enumeracion = 8;
         xhci_recontar_hid();
@@ -2689,11 +3007,12 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
         serial_imprimir_linea(" Endpoint(s) armados para recepción!");
     }
 
-    // 12. Registrar ranura, mapeos y actualizar estado global
+    // 12. Registrar ranura, mapeos y actualizar estado global (detras de un hub, el puerto raiz es del hub)
     g_slot_puerto[slot_id] = puerto_idx;
-    g_puerto_slot[puerto_idx] = slot_id;
-    g_slot_vid[slot_id] = dev_desc->id_proveedor;
-    g_slot_pid[slot_id] = dev_desc->id_producto;
+    if (!g_enum.ruta) g_puerto_slot[puerto_idx] = slot_id;
+    g_enum.slot = slot_id;
+    g_slot_vid[slot_id] = vid_dispositivo;
+    g_slot_pid[slot_id] = pid_dispositivo;
     g_slot_dev_ctx[slot_id] = dev_ctx;
     g_slot_dev_ctx_fisica[slot_id] = dev_ctx_fisica;
 
@@ -2708,6 +3027,244 @@ static void xhci_configurar_puerto(uint8_t puerto_idx, uint32_t portsc) {
     // Guardar contexto activo de dispositivo para posterior liberación al desconectar
     g_teclado_dev_ctx = dev_ctx;
     g_teclado_dev_ctx_fisica = dev_ctx_fisica;
+}
+
+/* ======================================================================================================
+ * H139: HUBS USB (clase 9, USB 2.0 capitulo 11 y USB 3.2 capitulo 10)
+ *
+ * Un hub es un dispositivo mas: se enumera igual y luego se le habla por su EP0 con peticiones de clase:
+ *   - GET_DESCRIPTOR de hub (0x29 en USB 2, 0x2A en USB 3): cuantos puertos tiene y cuanto tarda en dar energia.
+ *   - SET_FEATURE(PORT_POWER) en cada puerto, y esperar.
+ *   - GET_STATUS de puerto: dos palabras, estado (bit 0 conectado, bit 1 habilitado, bit 9 Low Speed,
+ *     bit 10 High Speed) y cambios (bit 0 cambio de conexion, bit 4 reinicio terminado).
+ *   - SET_FEATURE(PORT_RESET), esperar el cambio de reinicio y borrarlo: el puerto queda habilitado y su
+ *     velocidad dice como direccionar al dispositivo.
+ * Al controlador hay que decirle que ese slot es un hub (bit Hub, numero de puertos y tiempo de su traductor) con
+ * un Configure Endpoint que solo cambia el contexto de slot, como hace Linux en xhci_update_hub_device.
+ * Los cambios de conexion se descubren preguntando cada 500 ms (el endpoint de interrupcion del hub no se usa).
+ * ====================================================================================================== */
+#define HUB_F_PORT_RESET          4
+#define HUB_F_PORT_POWER          8
+#define HUB_F_C_PORT_CONNECTION  16
+#define HUB_F_C_PORT_RESET       20
+#define HUB_F_C_BH_PORT_RESET    29
+
+static uint8_t *g_hub_buf;
+static uint64_t g_hub_buf_fis;
+
+static int hub_ctrl(uint8_t slot, uint8_t tipo, uint8_t pet, uint16_t valor, uint16_t indice, uint16_t lon) {
+    if (lon && !g_hub_buf) {
+        g_hub_buf = (uint8_t *)dma_asignar_bufer_contiguo(64, 64, &g_hub_buf_fis);
+        if (!g_hub_buf) return -1;
+    }
+    int r = xhci_transferencia_control(slot, tipo, pet, valor, indice, lon, lon ? g_hub_buf : NULL, lon ? g_hub_buf_fis : 0);
+    if (!r && lon) dma_sincronizar_dispositivo_a_cpu(g_hub_buf, lon);
+    return r;
+}
+static int hub_estado(const struct xhci_hub *h, uint8_t p, uint16_t *st, uint16_t *ch) {
+    int r = hub_ctrl(h->slot, 0xA3, 0x00, 0, p, 4);
+    if (r) return r;
+    *st = (uint16_t)(g_hub_buf[0] | g_hub_buf[1] << 8);
+    *ch = (uint16_t)(g_hub_buf[2] | g_hub_buf[3] << 8);
+    return 0;
+}
+
+/* Suelta un slot y todo lo suyo (endpoints, disco, mapeos). Si es un hub, primero lo que cuelga de el. */
+static void xhci_soltar_slot(uint8_t slot_id) {
+    if (!slot_id || slot_id > XHCI_MAX_SLOTS) return;
+    for (int h = 0; h < XHCI_MAX_HUBS; h++) {
+        if (!g_hubs[h].activo) continue;
+        if (g_hubs[h].slot == slot_id) {
+            g_hubs[h].activo = 0;                        /* Antes de bajar: evita volver a entrar aqui */
+            for (unsigned p = 1; p <= HUB_MAX_PUERTOS; p++)
+                if (g_hubs[h].hijo[p]) { uint8_t s = g_hubs[h].hijo[p]; g_hubs[h].hijo[p] = 0; xhci_soltar_slot(s); }
+        } else {
+            for (unsigned p = 1; p <= HUB_MAX_PUERTOS; p++) if (g_hubs[h].hijo[p] == slot_id) g_hubs[h].hijo[p] = 0;
+        }
+    }
+    for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
+        if (g_teclado_eps[e].slot_id == slot_id) {
+            g_teclado_eps[e].activo = 0;
+            g_teclado_eps[e].slot_id = 0;
+            g_teclado_eps[e].puerto_idx = 0;
+        }
+    }
+    for (int b = 0; b < XHCI_MAX_BULK_EPS; b++) {
+        if (g_bulk_eps[b].slot_id == slot_id) {
+            g_bulk_eps[b].activo = 0;
+            g_bulk_eps[b].slot_id = 0;
+        }
+    }
+    usb_msc_desregistrar_dispositivo(slot_id);
+    xhci_liberar_slot(slot_id, NULL, 0, g_slot_dev_ctx[slot_id], g_slot_dev_ctx_fisica[slot_id], NULL, 0);
+    g_slot_dev_ctx[slot_id] = NULL;
+    g_slot_dev_ctx_fisica[slot_id] = 0;
+    g_slot_puerto[slot_id] = 0;
+    g_slot_vid[slot_id] = 0;
+    g_slot_pid[slot_id] = 0;
+    xhci_recontar_hid();
+    if (g_estado.teclado_slot_id == slot_id) {
+        g_estado.teclado_slot_id = 0;
+        g_estado.teclado_puerto = 0;
+    }
+}
+
+/* Reinicia el puerto p del hub y enumera lo que haya, con su ruta y su traductor */
+static void hub_conectar(struct xhci_hub *h, uint8_t p) {
+    uint16_t st = 0, ch = 0;
+    consola_imprimir("  -> [HUB] Slot "); consola_imprimir_dec(h->slot);
+    consola_imprimir(" puerto "); consola_imprimir_dec(p); consola_imprimir_linea(": dispositivo conectado, reiniciando...");
+    if (h->profundidad + 1 > 5) { consola_imprimir_linea_color("     [!] Mas de 5 niveles de hubs: USB no lo permite.", COLOR_AVISO_DEFAULT); return; }
+    if (hub_ctrl(h->slot, 0x23, 0x03, HUB_F_PORT_RESET, p, 0)) { consola_imprimir_linea_color("     [!] El hub rechazo el reinicio del puerto.", COLOR_AVISO_DEFAULT); return; }
+    uint64_t t = tiempo_obtener_milisegundos();
+    int listo = 0;
+    while (tiempo_obtener_milisegundos() - t < 500) {
+        esperar_milisegundos(10);
+        if (!hub_estado(h, p, &st, &ch) && (ch & 0x10)) { listo = 1; break; }
+    }
+    hub_ctrl(h->slot, 0x23, 0x01, HUB_F_C_PORT_RESET, p, 0);
+    if (h->es_ss) hub_ctrl(h->slot, 0x23, 0x01, HUB_F_C_BH_PORT_RESET, p, 0);
+    hub_ctrl(h->slot, 0x23, 0x01, HUB_F_C_PORT_CONNECTION, p, 0);
+    if (!listo || hub_estado(h, p, &st, &ch) || !(st & 1) || !(st & 2)) {
+        consola_imprimir("     [!] El puerto no quedo habilitado (estado="); consola_imprimir_hex(st); consola_imprimir_linea(")");
+        return;
+    }
+    /* Velocidad con la numeracion de xHCI: 1 Full, 2 Low, 3 High, 4 Super */
+    uint8_t vel = h->es_ss ? 4 : (st & 0x0200) ? 2 : (st & 0x0400) ? 3 : 1;
+    esperar_milisegundos(20);                 /* Recuperacion tras el reinicio (USB 2.0, 7.1.7.5: 10 ms minimo) */
+
+    __typeof__(g_enum) guardado = g_enum;
+    g_enum.ruta = h->ruta | ((uint32_t)(p > 15 ? 15 : p) << (4 * h->profundidad));
+    g_enum.profundidad = (uint8_t)(h->profundidad + 1);
+    if (h->velocidad == 3 && vel <= 2) { g_enum.tt_slot = h->slot; g_enum.tt_puerto = p; }      /* Lento tras hub rapido */
+    else if (h->velocidad <= 2) { g_enum.tt_slot = h->tt_slot; g_enum.tt_puerto = h->tt_puerto; } /* Hub lento: hereda */
+    else { g_enum.tt_slot = 0; g_enum.tt_puerto = 0; }
+    xhci_configurar_puerto(h->raiz, (uint32_t)vel << 10);
+    h->hijo[p] = g_enum.slot;
+    g_enum = guardado;
+}
+
+static void hub_desconectar(struct xhci_hub *h, uint8_t p) {
+    uint8_t s = h->hijo[p];
+    h->hijo[p] = 0;
+    consola_imprimir("  -> [HUB] Slot "); consola_imprimir_dec(h->slot);
+    consola_imprimir(" puerto "); consola_imprimir_dec(p); consola_imprimir_linea(": dispositivo desconectado.");
+    xhci_soltar_slot(s);
+}
+
+static void xhci_hub_iniciar(uint8_t slot_id, uint8_t velocidad, uint8_t config_val, uint8_t raiz) {
+    struct xhci_hub *h = NULL;
+    for (int i = 0; i < XHCI_MAX_HUBS; i++) if (!g_hubs[i].activo) { h = &g_hubs[i]; break; }
+    if (!h) { consola_imprimir_linea_color("    [!] Sin espacio para mas hubs (4).", COLOR_AVISO_DEFAULT); return; }
+    memset(h, 0, sizeof(*h));
+    h->slot = slot_id; h->raiz = raiz; h->velocidad = velocidad; h->es_ss = velocidad >= 4;
+    h->ruta = g_enum.ruta; h->profundidad = g_enum.profundidad;
+    h->tt_slot = g_enum.tt_slot; h->tt_puerto = g_enum.tt_puerto;
+
+    if (hub_ctrl(slot_id, 0x00, 0x09, config_val, 0, 0)) { consola_imprimir_linea_color("    [!] El hub rechazo SET_CONFIGURATION.", COLOR_AVISO_DEFAULT); return; }
+    if (h->es_ss) hub_ctrl(slot_id, 0x20, 12, h->profundidad, 0, 0);   /* SET_HUB_DEPTH (USB 3): su nivel */
+    if (hub_ctrl(slot_id, 0xA0, 0x06, h->es_ss ? 0x2A00 : 0x2900, 0, h->es_ss ? 12 : 9)) {
+        consola_imprimir_linea_color("    [!] No se pudo leer el descriptor de hub.", COLOR_AVISO_DEFAULT);
+        return;
+    }
+    uint8_t n = g_hub_buf[2];
+    if (n > HUB_MAX_PUERTOS) n = HUB_MAX_PUERTOS;
+    h->puertos = n;
+    uint16_t caract = (uint16_t)(g_hub_buf[3] | g_hub_buf[4] << 8);
+    unsigned encendido_ms = g_hub_buf[5] * 2u;
+    uint32_t ttt = h->es_ss ? 0 : (caract >> 5) & 3;
+
+    /* Slot de hub: bit Hub, numero de puertos y tiempo del traductor. Solo el contexto de slot (A0). */
+    uint64_t in_fis = 0;
+    uint8_t *in = (uint8_t *)dma_asignar_bufer_contiguo(33 * g_tamano_contexto, 64, &in_fis);
+    if (in) {
+        for (uint32_t i = 0; i < 33 * g_tamano_contexto; i++) in[i] = 0;
+        uint32_t *ctrl = (uint32_t *)in;
+        ctrl[1] = 1U;
+        dma_sincronizar_dispositivo_a_cpu(g_slot_dev_ctx[slot_id], 32 * g_tamano_contexto);
+        const uint32_t *dev = (const uint32_t *)g_slot_dev_ctx[slot_id];
+        uint32_t *sc = (uint32_t *)(in + g_tamano_contexto);
+        sc[0] = (dev[0] & 0x000FFFFF) | (1U << 26) | (1U << 27);   /* Ruta, Hub, una entrada (EP0); Speed es RsvdZ */
+        sc[1] = (dev[1] & 0x00FFFFFF) | ((uint32_t)n << 24);
+        sc[2] = (dev[2] & ~(3U << 16)) | (ttt << 16);
+        sc[3] = 0;
+        dma_sincronizar_cpu_a_dispositivo(in, 33 * g_tamano_contexto);
+        struct trb_xhci evt;
+        int r = xhci_enviar_comando(in_fis, 0, (TRB_TIPO_CONFIG_EP << 10) | ((uint32_t)slot_id << 24), &evt);
+        dma_liberar_bufer_contiguo(in, in_fis, 33 * g_tamano_contexto);
+        if (r) { consola_imprimir("    [!] El controlador no acepto el slot como hub (codigo "); consola_imprimir_dec((uint64_t)(uint32_t)r); consola_imprimir_linea(")"); return; }
+    }
+
+    for (uint8_t p = 1; p <= n; p++) hub_ctrl(slot_id, 0x23, 0x03, HUB_F_PORT_POWER, p, 0);
+    /* Lo que el hub pide para dar energia, y despues el rebote de conexion (USB 2.0, 7.1.7.3: 100 ms) */
+    esperar_milisegundos((encendido_ms > 100 ? encendido_ms : 100) + 100);
+    h->activo = 1;
+
+    consola_imprimir("    -> [HUB] Slot "); consola_imprimir_dec(slot_id);
+    consola_imprimir(h->es_ss ? ": hub USB 3, " : velocidad == 3 ? ": hub USB 2 de alta velocidad, " : ": hub USB de velocidad completa, ");
+    consola_imprimir_dec(n); consola_imprimir(" puertos, nivel "); consola_imprimir_dec(h->profundidad);
+    consola_imprimir_linea(". Recorriendo puertos...");
+
+    for (uint8_t p = 1; p <= n && h->activo; p++) {
+        uint16_t st, ch;
+        if (hub_estado(h, p, &st, &ch)) continue;
+        if (ch & 1) hub_ctrl(slot_id, 0x23, 0x01, HUB_F_C_PORT_CONNECTION, p, 0);
+        if (st & 1) hub_conectar(h, p);
+    }
+}
+
+/* Cada 500 ms: cambios de conexion en los puertos de cada hub */
+static void xhci_hubs_sondear(void) {
+    static uint64_t ultimo;
+    static int ocupado;
+    if (ocupado) return;
+    uint64_t ahora = tiempo_obtener_milisegundos();
+    if (ahora - ultimo < 500) return;
+    ultimo = ahora;
+    ocupado = 1;
+    for (int i = 0; i < XHCI_MAX_HUBS; i++) {
+        struct xhci_hub *h = &g_hubs[i];
+        for (uint8_t p = 1; h->activo && p <= h->puertos; p++) {
+            uint16_t st, ch;
+            if (hub_estado(h, p, &st, &ch) || !(ch & 1)) continue;
+            hub_ctrl(h->slot, 0x23, 0x01, HUB_F_C_PORT_CONNECTION, p, 0);
+            if (h->hijo[p]) hub_desconectar(h, p);
+            if (st & 1) { esperar_milisegundos(100); hub_conectar(h, p); }
+        }
+    }
+    ocupado = 0;
+}
+
+void xhci_hub_listar(void) { XHCI_EXCLUSIVO();
+    int n = 0;
+    for (int i = 0; i < XHCI_MAX_HUBS; i++) {
+        struct xhci_hub *h = &g_hubs[i];
+        if (!h->activo) continue;
+        n++;
+        consola_imprimir("  [HUB] slot="); consola_imprimir_dec(h->slot);
+        consola_imprimir(" puerto raiz="); consola_imprimir_dec(h->raiz);
+        consola_imprimir(" VID="); consola_imprimir_hex(g_slot_vid[h->slot]); consola_imprimir(" PID="); consola_imprimir_hex(g_slot_pid[h->slot]);
+        consola_imprimir(h->es_ss ? " USB 3" : h->velocidad == 3 ? " USB 2 alta velocidad" : " velocidad completa");
+        consola_imprimir(" puertos="); consola_imprimir_dec(h->puertos);
+        consola_imprimir(" nivel="); consola_imprimir_dec(h->profundidad);
+        consola_imprimir(" ruta="); consola_imprimir_hex(h->ruta);
+        consola_imprimir_linea("");
+        for (uint8_t p = 1; p <= h->puertos; p++) {
+            uint16_t st = 0, ch = 0;
+            int r = hub_estado(h, p, &st, &ch);
+            consola_imprimir("        puerto "); consola_imprimir_dec(p);
+            if (r) { consola_imprimir_linea(": sin respuesta"); continue; }
+            consola_imprimir((st & 1) ? ": conectado" : ": libre");
+            if (st & 1) consola_imprimir(h->es_ss ? " (Super)" : (st & 0x0200) ? " (Low)" : (st & 0x0400) ? " (High)" : " (Full)");
+            uint8_t s = h->hijo[p];
+            if (s) {
+                consola_imprimir(" -> slot "); consola_imprimir_dec(s);
+                consola_imprimir(" VID="); consola_imprimir_hex(g_slot_vid[s]); consola_imprimir(" PID="); consola_imprimir_hex(g_slot_pid[s]);
+            } else if (st & 1) consola_imprimir(" (sin enumerar)");
+            consola_imprimir_linea("");
+        }
+    }
+    if (!n) consola_imprimir_linea("  [HUB] Ningun hub USB conectado.");
 }
 
 // Ejecuta el ciclo oficial de Reset USB 2.0 / 3.x según la especificación Intel xHCI 1.2
@@ -2781,7 +3338,7 @@ static int xhci_resetear_puerto(uint8_t p, uint32_t *portsc_out) {
 }
 
 // --- INICIALIZACIÓN GENERAL DEL CONTROLADOR ---
-int xhci_iniciar(void) {
+int xhci_iniciar(void) { XHCI_EXCLUSIVO();
     if (g_estado.inicializado) return 0;
     g_estado.ultimo_codigo_control = 0xFF;
     g_estado.ultimo_codigo_transfer = 0xFF;
@@ -3196,7 +3753,7 @@ int xhci_iniciar(void) {
 }
 
 // Obtiene el estado físico de un puerto raíz específico (1..max_puertos)
-int xhci_obtener_info_puerto(uint8_t puerto, uint32_t *portsc_out, int *conectado_out, int *habilitado_out, uint8_t *velocidad_out) {
+int xhci_obtener_info_puerto(uint8_t puerto, uint32_t *portsc_out, int *conectado_out, int *habilitado_out, uint8_t *velocidad_out) { XHCI_EXCLUSIVO();
     if (!g_estado.inicializado || puerto < 1 || puerto > g_estado.max_puertos) return -1;
     uint64_t reg_port = g_op_base + REG_OP_PORTSC_BASE + ((puerto - 1) * 0x10);
     uint32_t portsc = mmio_leer32(reg_port);
@@ -3208,7 +3765,7 @@ int xhci_obtener_info_puerto(uint8_t puerto, uint32_t *portsc_out, int *conectad
 }
 
 // Escanea cambios de conexión/desconexión en puertos raíz y emite notificaciones
-int xhci_escanear_cambios_puertos(int verbose) {
+int xhci_escanear_cambios_puertos(int verbose) { XHCI_EXCLUSIVO();
     if (!g_estado.inicializado) return 0;
 
     int cambios = 0;
@@ -3231,6 +3788,8 @@ int xhci_escanear_cambios_puertos(int verbose) {
             cambios++;
             g_puerto_estado_ccs[p] = 1;
             g_estado.puertos_conectados++;
+            xhci_suceso(p, portsc, XHCI_SUCESO_CONEXION, 0);
+            if (verbose) xhci_suceso_imprimir(p, portsc, "CONEXION");
 
             uint8_t vel = (portsc >> 10) & 0x0F;
             const char *nom_vel = "Desconocida";
@@ -3297,6 +3856,11 @@ int xhci_escanear_cambios_puertos(int verbose) {
                     consola_imprimir_dec(p);
                     consola_imprimir_linea_color(": Aviso - No se pudo habilitar el enlace tras el reset.", COLOR_AVISO_DEFAULT);
                 }
+                /* H204: antes el puerto quedaba muerto hasta volver a enchufar. Ahora se reintenta en pasadas
+                 * siguientes del sondeo (+100, +300 y +700 ms), sin esperar aqui. */
+                xhci_suceso(p, portsc, XHCI_SUCESO_SIN_ENLACE, 0);
+                if (verbose) xhci_suceso_imprimir(p, portsc, "SIN ENLACE tras el reset; reintento 1 en 100 ms");
+                xhci_reintento_programar(p, 1);
             }
         }
         // 2. Detección de Desconexión: el puerto pasó de conectado (1) a desconectado (0)
@@ -3304,6 +3868,9 @@ int xhci_escanear_cambios_puertos(int verbose) {
             cambios++;
             g_puerto_estado_ccs[p] = 0;
             if (g_estado.puertos_conectados > 0) g_estado.puertos_conectados--;
+            xhci_suceso(p, portsc, XHCI_SUCESO_DESCONEXION, 0);
+            if (verbose) xhci_suceso_imprimir(p, portsc, "DESCONEXION");
+            g_reintento[p].intento = 0;   /* H204: se fue el dispositivo; no hay enlace que reintentar */
 
             serial_imprimir("\n[xHCI HOTPLUG] Desconexión detectada en Puerto ");
             serial_imprimir_dec(p);
@@ -3323,33 +3890,8 @@ int xhci_escanear_cambios_puertos(int verbose) {
 
             uint8_t slot_id = (p <= XHCI_MAX_PUERTOS) ? g_puerto_slot[p] : 0;
             if (slot_id > 0 && slot_id <= XHCI_MAX_SLOTS) {
-                for (int e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
-                    if (g_teclado_eps[e].slot_id == slot_id) {
-                        g_teclado_eps[e].activo = 0;
-                        g_teclado_eps[e].slot_id = 0;
-                        g_teclado_eps[e].puerto_idx = 0;
-                    }
-                }
-                for (int b = 0; b < XHCI_MAX_BULK_EPS; b++) {
-                    if (g_bulk_eps[b].slot_id == slot_id) {
-                        g_bulk_eps[b].activo = 0;
-                        g_bulk_eps[b].slot_id = 0;
-                    }
-                }
-                usb_msc_desregistrar_dispositivo(slot_id);
-                xhci_liberar_slot(slot_id, NULL, 0, g_slot_dev_ctx[slot_id], g_slot_dev_ctx_fisica[slot_id], NULL, 0);
-                g_slot_dev_ctx[slot_id] = NULL;
-                g_slot_dev_ctx_fisica[slot_id] = 0;
-                g_slot_puerto[slot_id] = 0;
+                xhci_soltar_slot(slot_id);   /* Si era un hub, tambien lo que colgaba de el (H139) */
                 g_puerto_slot[p] = 0;
-                g_slot_vid[slot_id] = 0;
-                g_slot_pid[slot_id] = 0;
-
-                xhci_recontar_hid();
-                if (g_estado.teclado_slot_id == slot_id) {
-                    g_estado.teclado_slot_id = 0;
-                    g_estado.teclado_puerto = 0;
-                }
             }
 
             // Limpiar banderas de cambio residuales en el registro del puerto (CSC, PEC, PRC)
@@ -3360,13 +3902,51 @@ int xhci_escanear_cambios_puertos(int verbose) {
     return cambios;
 }
 
+/* H204, Fase 0: reintentos del reset de un puerto que quedo conectado y sin enlace. Cada uno corre en una pasada del
+ * sondeo cuando llega su hora; entre uno y otro, CPU 0 sigue con lo suyo. El reset en si sigue tardando lo que
+ * tarda (unos 100 ms de espera activa dentro de xhci_resetear_puerto), igual que el primero. */
+static void xhci_reintentos_atender(void) {
+    uint64_t ahora = tiempo_obtener_milisegundos();
+    for (uint8_t p = 1; p <= g_estado.max_puertos && p <= XHCI_MAX_PUERTOS; p++) {
+        uint8_t intento = g_reintento[p].intento;
+        if (!intento || ahora < g_reintento[p].cuando_ms) continue;
+        g_reintento[p].intento = 0;
+        uint64_t reg_port = g_op_base + REG_OP_PORTSC_BASE + ((uint64_t)(p - 1) * 0x10);
+        uint32_t portsc = mmio_leer32(reg_port);
+        if (!(portsc & PORTSC_CCS)) {
+            xhci_suceso_imprimir(p, portsc, "ya sin dispositivo; se cancela el reintento");
+            continue;   /* El escaneo vera la desconexion */
+        }
+        if (g_puerto_slot[p]) continue;   /* Algo lo configuro entretanto */
+        g_fase0.reintentos++;
+        if (!(portsc & PORTSC_PED)) xhci_resetear_puerto(p, &portsc);
+        if (portsc & PORTSC_PED) {
+            g_fase0.recuperados++;
+            xhci_suceso(p, portsc, XHCI_SUCESO_RECUPERADO, intento);
+            consola_imprimir("[USB-F0] Puerto "); consola_imprimir_dec(p);
+            consola_imprimir(": enlace recuperado en el reintento "); consola_imprimir_dec(intento);
+            consola_imprimir_linea(". Inicializando...");
+            esperar_milisegundos(50);   /* TRSTRCY, igual que tras el primer reset */
+            xhci_configurar_puerto(p, portsc);
+        } else if (intento < XHCI_REINTENTOS) {
+            xhci_suceso(p, portsc, XHCI_SUCESO_REINTENTO_FALLO, intento);
+            xhci_suceso_imprimir(p, portsc, intento == 1 ? "reintento 1 sin enlace; el 2 en 300 ms" : "reintento 2 sin enlace; el 3 en 700 ms");
+            xhci_reintento_programar(p, (uint8_t)(intento + 1));
+        } else {
+            g_fase0.perdidos++;
+            xhci_suceso(p, portsc, XHCI_SUCESO_PERDIDO, intento);
+            xhci_suceso_imprimir(p, portsc, "SIN ENLACE tras 3 reintentos: desenchufar y volver a enchufar");
+        }
+    }
+}
+
 // Re-escanea puertos en caliente (hotplug / encendido tardío de MCU)
-int xhci_escanear_puertos_pendientes(void) {
+int xhci_escanear_puertos_pendientes(void) { XHCI_EXCLUSIVO();
     return xhci_escanear_cambios_puertos(1);
 }
 
 // Fuerza un ciclo de reset oficial en un puerto específico y reconfigura
-int xhci_forzar_reset_puerto(uint8_t puerto) {
+int xhci_forzar_reset_puerto(uint8_t puerto) { XHCI_EXCLUSIVO();
     if (!g_estado.inicializado || puerto < 1 || puerto > g_estado.max_puertos) return -1;
     uint64_t reg_port = g_op_base + REG_OP_PORTSC_BASE + ((puerto - 1) * 0x10);
     uint32_t portsc = mmio_leer32(reg_port);
@@ -3395,20 +3975,8 @@ int xhci_forzar_reset_puerto(uint8_t puerto) {
                 g_bulk_eps[b].slot_id = 0;
             }
         }
-        usb_msc_desregistrar_dispositivo(slot_id);
-        xhci_liberar_slot(slot_id, NULL, 0, g_slot_dev_ctx[slot_id], g_slot_dev_ctx_fisica[slot_id], NULL, 0);
-        g_slot_dev_ctx[slot_id] = NULL;
-        g_slot_dev_ctx_fisica[slot_id] = 0;
-        g_slot_puerto[slot_id] = 0;
+        xhci_soltar_slot(slot_id);   /* Lo anterior queda cubierto aqui; si era un hub, tambien sus hijos (H139) */
         g_puerto_slot[puerto] = 0;
-        g_slot_vid[slot_id] = 0;
-        g_slot_pid[slot_id] = 0;
-
-        xhci_recontar_hid();
-        if (g_estado.teclado_slot_id == slot_id) {
-            g_estado.teclado_slot_id = 0;
-            g_estado.teclado_puerto = 0;
-        }
     }
 
     xhci_resetear_puerto(puerto, &portsc);
@@ -3432,4 +4000,105 @@ int xhci_forzar_reset_puerto(uint8_t puerto) {
     }
 
     return 0;
+}
+
+/* 'raton crudo': que endpoints HID hay armados y de quien son. */
+void xhci_hid_listar(void) { XHCI_EXCLUSIVO();
+    int n = 0;
+    for (unsigned e = 0; e < XHCI_MAX_TECLADO_EPS; e++) {
+        const struct xhci_ep_teclado *ep = &g_teclado_eps[e];
+        if (!ep->activo) continue;
+        n++;
+        consola_imprimir("  [HID] slot="); consola_imprimir_dec(ep->slot_id);
+        consola_imprimir(" puerto="); consola_imprimir_dec(ep->puerto_idx);
+        consola_imprimir(" VID="); consola_imprimir_hex(ep->slot_id <= XHCI_MAX_SLOTS ? g_slot_vid[ep->slot_id] : 0);
+        consola_imprimir(" PID="); consola_imprimir_hex(ep->slot_id <= XHCI_MAX_SLOTS ? g_slot_pid[ep->slot_id] : 0);
+        consola_imprimir(" interfaz="); consola_imprimir_dec(ep->iface_num);
+        consola_imprimir(" DCI="); consola_imprimir_dec(ep->ep_dci);
+        consola_imprimir(" paquete="); consola_imprimir_dec(ep->ep_max_pkt);
+        consola_imprimir(" intervalo="); consola_imprimir_dec(ep->ep_intervalo);
+        consola_imprimir(ep->es_raton ? (ep->raton_reporte ? " RATON modo reporte" : ep->raton_boot_confirmado ? " RATON boot confirmado" : " RATON sin confirmar") :
+                         ep->es_boot ? " TECLADO boot" : " HID");
+        if (ep->es_raton) { consola_imprimir(" descriptor="); consola_imprimir_dec(ep->hid_rep_lon); }
+        consola_imprimir_linea("");
+    }
+    if (!n) consola_imprimir_linea("  [HID] Ningun endpoint HID armado.");
+    consola_imprimir("  [HID] Duenio del raton: "); consola_imprimir_linea(g_mouse_propietario ? "tomado (menu o modulo)" : "libre");
+}
+
+/* ------------------------------------------------------------------ H208, Fase B: hilo de eventos en CPU 1
+ * Bombea el anillo de eventos cada ~2 ms (hilo_dormir_ms(1) con tictac de 1 ms), con prioridad de tiempo real, aunque
+ * CPU 0 este ocupada en una descarga o abriendo un video. Si el cerrojo lo tiene CPU 0 (una transferencia en curso, que
+ * bombea ella misma), no espera: vuelve en la proxima vuelta. Apagado, el hilo duerme en un evento y CPU 1 no lleva
+ * tictac por el. El escaneo de puertos, los resets y la enumeracion siguen en CPU 0 (xhci_sondeo), como antes. */
+static evento_t g_ev_hilo_xhci = EVENTO("xhci_hilo");
+static hilo_t *g_hilo_xhci;
+static volatile int g_hilo_xhci_modo;
+static uint64_t g_hilo_bombeos, g_hilo_ocupado;
+
+static void hilo_xhci_eventos(void *u) {
+    (void)u;
+    for (;;) {
+        if (!__atomic_load_n(&g_hilo_xhci_modo, __ATOMIC_ACQUIRE)) { hilo_esperar(&g_ev_hilo_xhci); continue; }
+        if (g_estado.inicializado) {
+            /* H210: CPU 0 toma el cerrojo por microsegundos (leer una tecla); se insiste hasta ~50 us. Si sigue ocupado
+             * es una transferencia, que bombea ella misma: se vuelve en la proxima vuelta */
+            int tomado = 0;
+            uint64_t limite = rdtsc() + tiempo_ciclos_por_ms() / 20u;
+            while (!(tomado = cerrojo_intentar(&g_cerrojo_xhci)) && rdtsc() < limite) __asm__ volatile("pause");
+            if (tomado) {
+                xhci_bombear_eventos();
+                g_hilo_bombeos++;
+                cerrojo_soltar(&g_cerrojo_xhci);
+            } else {
+                g_hilo_ocupado++;
+            }
+        }
+        hilo_dormir_ms(1);
+    }
+}
+
+/* H210, Fase B2: el resto de lo que hacia xhci_sondeo en CPU 0 (escanear puertos, hubs, reintentos de reset y
+ * enumerar), cada 10 ms en CPU 1 con prioridad normal. Las esperas de un reset o de una enumeracion siguen siendo
+ * activas y con el cerrojo tomado, como antes en CPU 0: mientras duran, el hilo de eventos (misma CPU) espera, pero las
+ * transferencias de la enumeracion bombean el anillo ellas mismas. */
+static evento_t g_ev_hilo_puertos = EVENTO("xhci_puertos");
+static hilo_t *g_hilo_puertos;
+static uint64_t g_puertos_pasadas;
+static void hilo_xhci_puertos(void *u) {
+    (void)u;
+    for (;;) {
+        if (!__atomic_load_n(&g_hilo_xhci_modo, __ATOMIC_ACQUIRE)) { hilo_esperar(&g_ev_hilo_puertos); continue; }
+        if (g_estado.inicializado && cerrojo_intentar(&g_cerrojo_xhci)) {
+            xhci_puertos_pasada(0);
+            g_puertos_pasadas++;
+            cerrojo_soltar(&g_cerrojo_xhci);
+        }
+        hilo_dormir_ms(10);
+    }
+}
+static int xhci_hilos_activos(void) {
+    return __atomic_load_n(&g_hilo_xhci_modo, __ATOMIC_ACQUIRE) && g_hilo_xhci && g_hilo_puertos;
+}
+uint64_t xhci_hilo_puertos_pasadas(void) { return g_puertos_pasadas; }
+
+int xhci_hilo(int encender) {
+    if (encender && !g_hilo_xhci) {
+        g_hilo_xhci = hilo_crear(hilo_xhci_eventos, 0, "xhci_eventos", 1, HILO_TIEMPO_REAL, 0);
+        if (!g_hilo_xhci) return -1;
+    }
+    if (encender && !g_hilo_puertos) {
+        g_hilo_puertos = hilo_crear(hilo_xhci_puertos, 0, "xhci_puertos", 1, HILO_NORMAL, 0);
+        if (!g_hilo_puertos) return -1;
+    }
+    int antes = g_hilo_xhci_modo;
+    __atomic_store_n(&g_hilo_xhci_modo, encender ? 1 : 0, __ATOMIC_RELEASE);
+    if (encender && !antes) { evento_senalar(&g_ev_hilo_xhci); evento_senalar(&g_ev_hilo_puertos); }
+    return g_hilo_xhci_modo;
+}
+
+void xhci_hilo_estado(int *modo, uint64_t *bombeos, uint64_t *ocupado) {
+    if (modo) *modo = g_hilo_xhci_modo && g_hilo_xhci;
+    if (bombeos) *bombeos = g_hilo_bombeos;
+    if (ocupado) *ocupado = g_hilo_ocupado;
 }

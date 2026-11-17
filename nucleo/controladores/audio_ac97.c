@@ -21,7 +21,7 @@ static uint64_t g_base_fisica  = 0;
 static uint64_t g_base_virtual = 0;
 static int g_iniciado = 0;
 static int g_usar_hda = 0;
-static int g_volumen_db = -24;
+static int g_volumen_db = -35;   /* H208: volumen por defecto del sistema, a pedido del usuario (antes -24) */
 static int g_silenciado = 0;
 
 // Variables de estado del flujo de audio
@@ -64,11 +64,11 @@ int audio_ac97_iniciar(uint64_t base_fisica_kernel, uint64_t base_virtual_kernel
     escribir_puerto_w(g_nambar + 0x00, 0x0001);
     esperar_io();
 
-    // Fijar volumen maestro a ~24 dB de atenuación de confort (16 * 1.5 dB = 24 dB, sin mute)
-    escribir_puerto_w(g_nambar + 0x02, 0x1010);
+    // H208: volumen maestro a -34,5 dB (23 pasos de 1,5 dB, el más cercano a los -35 dB del sistema, sin mute)
+    escribir_puerto_w(g_nambar + 0x02, 0x1717);
 
-    // Fijar volumen PCM Out a ~24 dB de atenuación (sin mute)
-    escribir_puerto_w(g_nambar + 0x18, 0x1010);
+    // Volumen PCM Out igual (sin mute)
+    escribir_puerto_w(g_nambar + 0x18, 0x1717);
 
     // 44,1 kHz sólo es válido si el códec anuncia y acepta VRA.
     if (!(leer_puerto_w(g_nambar + 0x28) & 0x0001)) {

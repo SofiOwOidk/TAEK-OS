@@ -1,5 +1,6 @@
 #include "dma.h"
 #include "memoria.h"
+#include "cerrojo.h"
 #include "huevo.h"
 #include "../arquitectura/x86_64/serial.h"
 
@@ -18,6 +19,10 @@ static uint64_t g_dma_bitmap[MAX_PALABRAS_BITMAP];
 // Sólo el primer frame de cada asignación contiene su tamaño solicitado.
 // Permite rechazar free parcial, tamaño equivocado y double free.
 static uint32_t g_dma_tamano_asignacion[MAX_PAGINAS_DMA];
+
+/* H205, Fase 0.5 del gestor de hilos: un cerrojo para los dos mapas de bits (arena DMA y arena de la GPU). Cubre
+ * solo la busqueda y el marcado; poner a cero el bufer, que puede tardar milisegundos, queda fuera. */
+static cerrojo_t g_cerrojo_dma = CERROJO("dma");
 
 static inline int bitmap_probar_bit(uint32_t bit) {
     if (bit >= g_dma_total_paginas) return 1;
@@ -88,13 +93,17 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
     if (alineacion < TAMANO_PAGINA) alineacion = TAMANO_PAGINA;
 
     uint32_t pags_necesarias = (uint32_t)((bytes + TAMANO_PAGINA - 1) / TAMANO_PAGINA);
+    uint64_t f_cerrojo = cerrojo_tomar_irq(&g_cerrojo_dma);
     for (uint32_t i = 0; i + pags_necesarias <= g_dma_total_paginas; i++) {
         uint64_t phys_candidato = g_dma_base_fisica + (uint64_t)i * TAMANO_PAGINA;
         if (phys_candidato % alineacion != 0) continue;
+        /* H207: palabra entera ocupada: saltarla de una vez */
+        if (!(i % 64) && g_dma_bitmap[i / 64] == ~UINT64_C(0)) { i += 63; continue; }
         int bloque_libre = 1;
         for (uint32_t j = 0; j < pags_necesarias; j++) {
             if (bitmap_probar_bit(i + j)) {
                 bloque_libre = 0;
+                i += j;   /* H207: ningun bloque que empiece antes de la pagina ocupada cabe */
                 break;
             }
         }
@@ -115,6 +124,7 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
 
             uint64_t phys = g_dma_base_fisica + ((uint64_t)i * TAMANO_PAGINA);
             *dir_fisica = phys;
+            cerrojo_soltar_irq(&g_cerrojo_dma, f_cerrojo);   /* Las paginas ya son de quien llama */
 
             uint64_t hhdm = memoria_obtener_hhdm_offset();
             void *virt = (void *)(phys + hhdm);
@@ -125,11 +135,19 @@ void *dma_asignar_bufer_contiguo(uint64_t bytes, uint64_t alineacion, uint64_t *
         }
     }
 
+    cerrojo_soltar_irq(&g_cerrojo_dma, f_cerrojo);
     serial_imprimir_linea("[DMA ALERTA] Memoria contigua en arena DMA agotada o fragmentada.");
     return NULL;
 }
 
+static int dma_liberar_sc(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes);
 int dma_liberar_bufer_contiguo(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes) {
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_dma);
+    int r = dma_liberar_sc(dir_virtual, dir_fisica, bytes);
+    cerrojo_soltar_irq(&g_cerrojo_dma, f);
+    return r;
+}
+static int dma_liberar_sc(void *dir_virtual, uint64_t dir_fisica, uint64_t bytes) {
     if (bytes == 0 || !dir_virtual || g_dma_total_paginas == 0 ||
         dir_fisica < g_dma_base_fisica || dir_fisica >= (g_dma_base_fisica + g_dma_tamano_bytes) ||
         ((dir_fisica - g_dma_base_fisica) % TAMANO_PAGINA) != 0 ||
@@ -227,7 +245,14 @@ static void gpu_iniciar(void) {
 }
 static inline int gpu_ocupada(uint32_t p) { return (g_gpu_bitmap[p / 64] >> (p % 64)) & 1; }
 
+static uint64_t dma_gpu_asignar_sc(uint32_t paginas);
 uint64_t dma_gpu_asignar(uint32_t paginas) {
+    uint64_t f = cerrojo_tomar_irq(&g_cerrojo_dma);
+    uint64_t r = dma_gpu_asignar_sc(paginas);
+    cerrojo_soltar_irq(&g_cerrojo_dma, f);
+    return r;
+}
+static uint64_t dma_gpu_asignar_sc(uint32_t paginas) {
     gpu_iniciar();
     if (!paginas || paginas > g_gpu_total) return 0;
     for (uint32_t i = 0; i + paginas <= g_gpu_total; i++) {
@@ -249,7 +274,14 @@ int dma_gpu_es_suya(uint64_t f) {
     return g_gpu_total && f >= g_gpu_base && f < g_gpu_base + (uint64_t)g_gpu_total * TAMANO_PAGINA;
 }
 
+static int dma_gpu_liberar_sc(uint64_t f, uint32_t paginas);
 int dma_gpu_liberar(uint64_t f, uint32_t paginas) {
+    uint64_t fl = cerrojo_tomar_irq(&g_cerrojo_dma);
+    int r = dma_gpu_liberar_sc(f, paginas);
+    cerrojo_soltar_irq(&g_cerrojo_dma, fl);
+    return r;
+}
+static int dma_gpu_liberar_sc(uint64_t f, uint32_t paginas) {
     if (!dma_gpu_es_suya(f) || (f - g_gpu_base) % TAMANO_PAGINA) return -1;
     uint32_t i = (uint32_t)((f - g_gpu_base) / TAMANO_PAGINA);
     if (!paginas || g_gpu_bloque[i] != paginas) {

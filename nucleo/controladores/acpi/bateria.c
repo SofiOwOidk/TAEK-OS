@@ -308,6 +308,36 @@ static void una_bateria(aml *a, int d, int conectado) {
     }
 }
 
+/* Lo mismo que muestra el comando, para quien solo quiere el porcentaje: _BST y _BIF/_BIX de la primera bateria. */
+int bateria_resumen(int32_t *pct, int32_t *estado, int32_t *cargador) {
+    *pct = -1; *estado = 0; *cargador = -1;
+    if (preparar()) return -1;
+    aml *a = g_aml;
+    aml_permitir_escritura_ec(a, 1);
+    *cargador = cargadores(a);
+    int d = aml_siguiente_hid(a, -1, EISA_BATERIA, 0);
+    int r = -1;
+    if (d >= 0) {
+        uint64_t lleno = DESCONOCIDO;
+        int es_bix = 1, bi = aml_hijo(a, d, "_BIX");
+        if (bi < 0) { es_bix = 0; bi = aml_hijo(a, d, "_BIF"); }
+        aml_valor v;
+        if (bi >= 0 && !aml_evaluar(a, bi, 0, 0, &v) && v.tipo == AML_PAQUETE && v.n >= 9) lleno = elem(&v, es_bix ? 3 : 2);
+        int bs = aml_hijo(a, d, "_BST");
+        if (bs >= 0 && !aml_evaluar(a, bs, 0, 0, &v) && v.tipo == AML_PAQUETE && v.n >= 4) {
+            uint64_t est = elem(&v, 0), resto = elem(&v, 2);
+            if (est != DESCONOCIDO) *estado = (int32_t)(est & 7);
+            if (resto != DESCONOCIDO && lleno && lleno != DESCONOCIDO) {
+                uint64_t p = resto * 100 / lleno;
+                *pct = p > 100 ? 100 : (int32_t)p;
+                r = 0;
+            }
+        }
+    }
+    aml_permitir_escritura_ec(a, 0);
+    return r;
+}
+
 void bateria_comando(void) {
     consola_imprimir_linea_color("--- BATERÍA ---", COLOR_AVISO_DEFAULT);
     if (preparar()) {
@@ -367,9 +397,174 @@ static uint32_t decimal(const char **p) {
     while (**p >= '0' && **p <= '9') v = v * 10 + (uint32_t)(*(*p)++ - '0');
     return v;
 }
+/* Todo lo de la bateria para una pantalla, de los mismos metodos del comando. Sin numero de serie. */
+void bateria_detalle(struct taek_equipo *t) {
+    t->bat_pct = -1; t->bat_cargador = -1;
+    t->bat_resto = t->bat_lleno = t->bat_diseno = t->bat_tasa = t->bat_mv = t->bat_ciclos = (uint32_t)DESCONOCIDO;
+    if (preparar()) return;
+    aml *a = g_aml;
+    aml_permitir_escritura_ec(a, 1);
+    t->bat_cargador = cargadores(a);
+    int d = aml_siguiente_hid(a, -1, EISA_BATERIA, 0);
+    if (d >= 0 && aml_sta(a, d) >= 0) {
+        int64_t sta = aml_sta(a, d);
+        t->bat_presente = (sta & 0x10) != 0;
+        int bi = aml_hijo(a, d, "_BIX"), es_bix = bi >= 0;
+        if (bi < 0) bi = aml_hijo(a, d, "_BIF");
+        aml_valor v;
+        if (t->bat_presente && bi >= 0 && !aml_evaluar(a, bi, 0, 0, &v) && v.tipo == AML_PAQUETE && v.n >= 9) {
+            unsigned o = es_bix ? 1 : 0;
+            t->bat_unidad_mah = elem(&v, o) == 1;
+            t->bat_diseno = (uint32_t)elem(&v, o + 1);
+            t->bat_lleno = (uint32_t)elem(&v, o + 2);
+            if (es_bix) t->bat_ciclos = (uint32_t)elem(&v, 8);
+            unsigned b = es_bix ? 16 : 9;
+            const char *s;
+            if ((s = elem_txt(&v, b))) { unsigned k = 0; while (s[k] && k + 1 < sizeof(t->bat_modelo)) { t->bat_modelo[k] = s[k]; k++; } t->bat_modelo[k] = 0; }
+            if ((s = elem_txt(&v, b + 2))) { unsigned k = 0; while (s[k] && k + 1 < sizeof(t->bat_tipo)) { t->bat_tipo[k] = s[k]; k++; } t->bat_tipo[k] = 0; }
+        }
+        int bs = aml_hijo(a, d, "_BST");
+        if (t->bat_presente && bs >= 0 && !aml_evaluar(a, bs, 0, 0, &v) && v.tipo == AML_PAQUETE && v.n >= 4) {
+            uint64_t est = elem(&v, 0);
+            if (est != DESCONOCIDO) t->bat_estado = (int32_t)(est & 7);
+            t->bat_tasa = (uint32_t)elem(&v, 1);
+            t->bat_resto = (uint32_t)elem(&v, 2);
+            t->bat_mv = (uint32_t)elem(&v, 3);
+            if (t->bat_resto != (uint32_t)DESCONOCIDO && t->bat_lleno && t->bat_lleno != (uint32_t)DESCONOCIDO) {
+                uint64_t p = (uint64_t)t->bat_resto * 100 / t->bat_lleno;
+                t->bat_pct = p > 100 ? 100 : (int32_t)p;
+            }
+        }
+    }
+    aml_permitir_escritura_ec(a, 0);
+}
+
+/* Texto de un _HID o _CID: cadena tal cual, o entero con el codigo EISA de tres letras y cuatro cifras. */
+static int id_texto(const aml_valor *v, char *s, unsigned tam) {
+    static const char h[] = "0123456789ABCDEF";
+    if (v->tipo == AML_CADENA && v->v.cadena) {
+        unsigned i = 0;
+        while (v->v.cadena[i] && i + 1 < tam) { s[i] = v->v.cadena[i]; i++; }
+        s[i] = 0;
+        return i != 0;
+    }
+    if (v->tipo != AML_ENTERO || tam < 8) return 0;
+    uint32_t e = (uint32_t)v->v.entero;
+    uint32_t b = (e & 0xFF) << 8 | ((e >> 8) & 0xFF);
+    s[0] = (char)('@' + ((b >> 10) & 31)); s[1] = (char)('@' + ((b >> 5) & 31)); s[2] = (char)('@' + (b & 31));
+    s[3] = h[(e >> 20) & 15]; s[4] = h[(e >> 16) & 15]; s[5] = h[(e >> 28) & 15]; s[6] = h[(e >> 24) & 15]; s[7] = 0;
+    return 1;
+}
+int acpi_id_texto(const aml_valor *v, char *s, unsigned tam) { return id_texto(v, s, tam); }
+aml *acpi_interprete(void) { return preparar() ? 0 : g_aml; }
+
+static int empieza(const char *s, const char *p) { while (*p) if (*s++ != *p++) return 0; return 1; }
+static int id_de_puntero(const char *s) {
+    static const char *const prefijos[] = { "PNP0F", "PNP0C50", "ACPI0C50", "SYN", "ELAN", "ELN", "ATML", "MSFT", "CYAP", "ALP", "DLL", "DELL", "FTE", "ETD", "HPQ", "LEN", "ASUE", "TPD", "WCOM" };
+    for (unsigned i = 0; i < sizeof(prefijos) / sizeof(prefijos[0]); i++) if (empieza(s, prefijos[i])) return 1;
+    return 0;
+}
+/* Solo lectura: que dice el firmware del touchpad o raton integrado, y si los controladores I2C del chipset se ven por PCI. */
+static void acpi_punteros(void) {
+    if (preparar()) { consola_imprimir("  No se pudo leer el firmware: "); consola_imprimir_linea(g_error); return; }
+    aml *a = g_aml;
+    unsigned vistos = 0, total = 0;
+    static const char *const nombres[] = { "_HID", "_CID" };
+    for (unsigned k = 0; k < 2; k++) {
+        for (int d = aml_siguiente_nombre(a, -1, nombres[k]); d >= 0; d = aml_siguiente_nombre(a, d, nombres[k])) {
+            aml_valor v;
+            char id[32], ruta[96];
+            total++;
+            if (aml_evaluar(a, d, 0, 0, &v) || !id_texto(&v, id, sizeof(id)) || !id_de_puntero(id)) continue;
+            aml_ruta(a, d, ruta, sizeof(ruta));
+            consola_imprimir("  [PUNTERO] "); consola_imprimir(nombres[k]); consola_imprimir(" "); consola_imprimir(id);
+            consola_imprimir(" en "); consola_imprimir(ruta);
+            /* _STA del dispositivo: bit 0 presente, bit 1 activo. Quita el nombre final para llegar al padre. */
+            unsigned largo = 0;
+            while (ruta[largo]) largo++;
+            if (largo > 5) {
+                ruta[largo - 5] = 0;
+                int padre = aml_buscar(a, ruta);
+                if (padre >= 0) { consola_imprimir(" _STA="); int64_t st = aml_sta(a, padre); if (st < 0) consola_imprimir("error"); else consola_imprimir_dec((uint64_t)st); }
+            }
+            consola_imprimir_linea("");
+            vistos++;
+        }
+    }
+    consola_imprimir("  [PUNTERO] identificadores revisados="); consola_imprimir_dec(total);
+    consola_imprimir(" de puntero="); consola_imprimir_dec(vistos); consola_imprimir_linea("");
+    for (int i = 0; i < pci_obtener_conteo(); i++) {
+        const struct dispositivo_pci *q = pci_obtener_dispositivo(i);
+        /* Sunrise Point: I2C 9D60-9D65 */
+        if (q && q->id_proveedor == 0x8086 && q->id_dispositivo >= 0x9D60 && q->id_dispositivo <= 0x9D65) {
+            consola_imprimir("  [PUNTERO] I2C PCI 8086:"); consola_imprimir_hex(q->id_dispositivo); consola_imprimir_linea("");
+        }
+    }
+    consola_imprimir_linea("  [PUNTERO] FIN");
+}
+
+/* 'acpi evaluar <ruta> [enteros]': lo que devuelve un objeto o metodo del firmware. Es seguro porque el interprete
+ * no escribe al equipo: memoria en sombra, puertos y PCI lo detienen, y el controlador embebido queda cerrado. */
+static void valor_imprimir(const aml_valor *v, unsigned prof) {
+    switch (v->tipo) {
+    case AML_ENTERO: consola_imprimir("entero "); consola_imprimir_hex(v->v.entero); break;
+    case AML_CADENA: consola_imprimir("cadena \""); consola_imprimir(v->v.cadena ? v->v.cadena : ""); consola_imprimir("\""); break;
+    case AML_BUFFER:
+        consola_imprimir("buffer de "); consola_imprimir_dec(v->n); consola_imprimir(" bytes:");
+        for (uint32_t i = 0; i < v->n && i < 96; i++) { consola_imprimir(" "); hex2(v->v.buffer[i]); }
+        if (v->n > 96) consola_imprimir(" ...");
+        break;
+    case AML_PAQUETE:
+        consola_imprimir("paquete de "); consola_imprimir_dec(v->n); consola_imprimir(" { ");
+        for (uint32_t i = 0; i < v->n && i < 16 && prof < 3; i++) { valor_imprimir(&v->v.paquete[i], prof + 1); consola_imprimir("; "); }
+        consola_imprimir("}");
+        break;
+    default: consola_imprimir("tipo "); consola_imprimir_dec(v->tipo); break;
+    }
+}
+static uint64_t numero(const char **p) {
+    const char *s = *p;
+    while (*s == ' ') s++;
+    uint64_t v = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+        for (;; s++) {
+            int d = (*s >= '0' && *s <= '9') ? *s - '0' : (*s >= 'a' && *s <= 'f') ? *s - 'a' + 10 : (*s >= 'A' && *s <= 'F') ? *s - 'A' + 10 : -1;
+            if (d < 0) break;
+            v = v * 16 + (uint64_t)d;
+        }
+    } else while (*s >= '0' && *s <= '9') v = v * 10 + (uint64_t)(*s++ - '0');
+    *p = s;
+    return v;
+}
+static void acpi_evaluar(const char *p) {
+    if (preparar()) { consola_imprimir("  No se pudo leer el firmware: "); consola_imprimir_linea(g_error); return; }
+    while (*p == ' ') p++;
+    char ruta[96]; unsigned k = 0;
+    while (*p && *p != ' ' && k + 1 < sizeof(ruta)) ruta[k++] = *p++;
+    ruta[k] = 0;
+    if (!k) { consola_imprimir_linea("  Uso: acpi evaluar <ruta absoluta> [enteros]   ej.: acpi evaluar \\GPDI"); return; }
+    aml_valor args[4]; unsigned na = 0;
+    while (na < 4) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        args[na].tipo = AML_ENTERO; args[na].n = 0; args[na].ruta_ambito = 0; args[na].v.entero = numero(&p);
+        na++;
+    }
+    int nodo = aml_buscar(g_aml, ruta);
+    if (nodo < 0) { consola_imprimir("  [ACPI] No existe "); consola_imprimir_linea(ruta); return; }
+    aml_valor v;
+    consola_imprimir("  [ACPI] "); consola_imprimir(ruta); consola_imprimir(" = ");
+    if (aml_evaluar(g_aml, nodo, args, na, &v)) { consola_imprimir("no se pudo evaluar: "); consola_imprimir_linea(aml_motivo(g_aml)); return; }
+    valor_imprimir(&v, 0);
+    consola_imprimir_linea("");
+}
+
 void acpi_comando(const char *arg) {
     const uint8_t *t; uint32_t n;
+    if (arg[0] == 'e' && arg[1] == 'v') { const char *q = arg; while (*q && *q != ' ') q++; acpi_evaluar(q); return; }
     if (arg[0] == 'e' && arg[1] == 'c') { diagnostico_ec(); return; }
+    if (arg[0] == 'p') { acpi_punteros(); return; }
     if (arg[0] == 't') {
         char f[5];
         for (unsigned i = 0; !acpi_tabla_listar(i, f, &t, &n); i++) {

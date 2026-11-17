@@ -3,6 +3,7 @@
 // Alcance: progresivo, 4:2:0 de 8 bits, POC tipo 0 y 2, sin FMO, ASO ni SP/SI. Lo que quede fuera se devuelve como error con nombre.
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_drmcommon.h>
 #include <smmintrin.h>
 #include <cpuid.h>
 #include "taek_media.h"
@@ -13,6 +14,8 @@ int snprintf(char *, size_t, const char *, ...);
 void *memset(void *, int, size_t);
 void *memcpy(void *, const void *, size_t);
 int printf(const char *, ...);
+void *malloc(size_t);
+size_t strlen(const char *);
 }
 
 namespace {
@@ -722,6 +725,47 @@ int tomar(taek_video_peticion *r) {
     return 0;
 }
 
+/* H195: el siguiente fotograma como superficie para Iris, sin copiar pixeles. Cada superficie se exporta una vez y su handle
+ * para Iris se guarda. El fotograma vuelve libre al salir: el kernel lo presenta (Iris lo dibuja y espera) antes de la siguiente
+ * muestra, y el plano escanea el bufer de Iris, no la superficie. */
+struct ExpSup { VASurfaceID sup; unsigned handle, pitch, off_y, off_uv; uint64_t bytes, mod; };
+ExpSup exportadas[2 * NUM_SUP];
+unsigned n_exportadas;
+int tomar_gpu(taek_video_peticion *r) {
+    Pendiente *p = siguiente_salida();
+    const Sps *s = sps_activo;
+    if (!p || !s) FALLA(TAEK_VIDEO_FALLO, "nada que tomar");
+    ExpSup *x = nullptr;
+    for (unsigned i = 0; i < n_exportadas; i++) if (exportadas[i].sup == p->sup) x = &exportadas[i];
+    if (!x) {
+        if (n_exportadas >= 2 * NUM_SUP) FALLA(TAEK_VIDEO_FALLO, "demasiadas superficies exportadas");
+        VADRMPRIMESurfaceDescriptor d;
+        memset(&d, 0, sizeof(d));
+        if (!ctx->vtable->vaExportSurfaceHandle) FALLA(TAEK_VIDEO_INCOMPATIBLE, "driver sin vaExportSurfaceHandle");
+        VA(ctx->vtable->vaExportSurfaceHandle(ctx, p->sup, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                              VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &d));
+        if (d.num_objects != 1 || d.num_layers != 1 || d.layers[0].num_planes != 2 || d.layers[0].pitch[1] != d.layers[0].pitch[0])
+            FALLA(TAEK_VIDEO_INCOMPATIBLE, "superficie exportada con forma inesperada");
+        ExpSup e{p->sup, 0, d.layers[0].pitch[0], d.layers[0].offset[0], d.layers[0].offset[1], 0, d.objects[0].drm_format_modifier};
+        unsigned long long b = 0;
+        int rc = taek_media_handle_iris((unsigned)d.objects[0].fd & ~(unsigned)TAEK_PRIME_FALSO, &e.handle, &b);
+        if (rc) FALLA(TAEK_VIDEO_FALLO, "handle para Iris = %d", rc);
+        e.bytes = b;
+        exportadas[n_exportadas] = e;
+        x = &exportadas[n_exportadas++];
+    }
+    r->iris_handle = x->handle; r->iris_pitch = x->pitch; r->iris_off_y = x->off_y; r->iris_off_uv = x->off_uv;
+    r->iris_bytes = x->bytes; r->iris_modificador = x->mod;
+    r->recorte_x = s->recorte_x; r->recorte_y = s->recorte_y;
+    r->ancho = s->ancho; r->alto = s->alto; r->poc = p->poc; r->pts_salida = p->pts; r->rango_completo = s->rango_completo; r->matriz_color = s->matriz_color;
+    p->usada = false;
+    return 0;
+}
+void soltar_exportadas() {
+    for (unsigned i = 0; i < n_exportadas; i++) taek_media_soltar_handle(exportadas[i].handle);
+    n_exportadas = 0;
+}
+
 uint8_t *entrada; size_t entrada_cap;
 unsigned muestra_actual, inyectar_tipo, inyectar_muestra;
 
@@ -814,10 +858,12 @@ extern "C" int taek_h264_op(struct taek_video_peticion *r) {
         case TAEK_VIDEO_ABRIR: rc = abrir(r); break;
         case TAEK_VIDEO_MUESTRA: rc = muestra(r); break;
         case TAEK_VIDEO_TOMAR: rc = tomar(r); r->listos = calc_listos(); break;
+        case TAEK_VIDEO_TOMAR_GPU: rc = tomar_gpu(r); r->listos = calc_listos(); break;
         case TAEK_VIDEO_DRENAR: drenando = true; r->listos = calc_listos(); rc = 0; break;
         case TAEK_VIDEO_CERRAR:
             r->ns_gpu = med.ns_gpu; r->ns_copia = med.ns_copia; r->decodificados = med.decodificados; r->cortes = med.cortes;
             reiniciar_estado();
+            soltar_exportadas();   /* H195: antes de destruir las superficies */
             rc = cerrar_sesion();
             break;
         default: snprintf(motivo_txt, sizeof(motivo_txt), "orden %u desconocida", r->orden); break;
@@ -840,6 +886,8 @@ uint64_t hash_linea(uint64_t h, const uint8_t *p, unsigned pitch, unsigned w, un
     for (unsigned y = 0; y < f; y++) { copia_fila(linea, p + (size_t)y * pitch, w); h = hash_fnv(h, linea, w); }
     return h;
 }
+bool exponer_activo, exponer_hecho;   /* H194 */
+int exponer_rc = -1;
 struct Estad { unsigned decodificados, iguales, distintos, primer_mal_valido; int primer_mal; uint64_t hash_mal, hash_esp; unsigned pitch; unsigned salidos; };
 Estad est;
 int hash_siguiente() {
@@ -853,6 +901,41 @@ int hash_siguiente() {
     h = hash_linea(h, m + im.offsets[0], im.pitches[0], s->ancho, s->alto);
     h = hash_linea(h, m + im.offsets[1], im.pitches[1], s->ancho, s->alto / 2);
     est.pitch = im.pitches[0];
+    if (exponer_activo && !exponer_hecho) {
+        /* H194: el primer cuadro (ya comparado con FFmpeg por su hash) se deja a Iris: la frontera crea un handle para el
+         * objeto GEM que hay detras de este mapa. Va tambien una copia recortada para la referencia de la CPU. */
+        exponer_hecho = true;
+        static taek_video_exportado e;
+        memset(&e, 0, sizeof(e));
+        unsigned w = s->ancho, a = s->alto;
+        uint8_t *cy = static_cast<uint8_t *>(malloc((size_t)w * a)), *cuv = static_cast<uint8_t *>(malloc((size_t)w * (a / 2)));
+        if (cy && cuv) {
+            const uint8_t *py = m + im.offsets[0] + (size_t)s->recorte_y * im.pitches[0] + s->recorte_x;
+            const uint8_t *puv = m + im.offsets[1] + (size_t)(s->recorte_y / 2) * im.pitches[1] + s->recorte_x;
+            for (unsigned y = 0; y < a; y++) copia_fila(cy + (size_t)y * w, py + (size_t)y * im.pitches[0], w);
+            for (unsigned y = 0; y < a / 2; y++) copia_fila(cuv + (size_t)y * w, puv + (size_t)y * im.pitches[1], w);
+        }
+        e.ancho = w; e.alto = a; e.recorte_x = s->recorte_x; e.recorte_y = s->recorte_y;
+        e.rango_completo = s->rango_completo; e.matriz_color = s->matriz_color;
+        e.y = cy; e.uv = cuv; e.hash = h;
+        /* El mapa de vaDeriveImage puede ser una copia sombra destileada: el objeto real, su paso, sus offsets y su tiling
+         * salen de vaExportSurfaceHandle (DRM_PRIME_2, capas compuestas: una capa con los planos Y y UV). */
+        VADRMPRIMESurfaceDescriptor desc;
+        memset(&desc, 0, sizeof(desc));
+        VAStatus xs = ctx->vtable->vaExportSurfaceHandle
+            ? ctx->vtable->vaExportSurfaceHandle(ctx, p->sup, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                                 VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &desc)
+            : VA_STATUS_ERROR_UNIMPLEMENTED;
+        if (!cy || !cuv) exponer_rc = -12;
+        else if (xs != VA_STATUS_SUCCESS) exponer_rc = -100 - (int)xs;
+        else if (desc.num_objects != 1 || desc.num_layers != 1 || desc.layers[0].num_planes != 2) exponer_rc = -30;
+        else {
+            e.pitch = desc.layers[0].pitch[0]; e.off_y = desc.layers[0].offset[0]; e.off_uv = desc.layers[0].offset[1];
+            e.modificador = desc.objects[0].drm_format_modifier;
+            if (desc.layers[0].pitch[1] != desc.layers[0].pitch[0]) exponer_rc = -31;
+            else exponer_rc = taek_media_exponer((unsigned)desc.objects[0].fd & ~(unsigned)TAEK_PRIME_FALSO, &e);
+        }
+    }
     rc = sin_imagen(im);
     if (rc) return rc;
     p->usada = false;
@@ -913,6 +996,17 @@ extern "C" int taek_h264_decodificar(unsigned maximo, unsigned corromper, char *
     if (r) return r;
     if (corromper) return est.distintos ? 0 : -5;   // El control negativo solo pasa si detecta la diferencia.
     return med.decodificados && !est.distintos ? 0 : -5;
+}
+
+/* H194: el IDR del vector, comparado con FFmpeg, queda expuesto para Iris (ver hash_siguiente). */
+extern "C" int taek_h264_exponer(char *t, size_t n) {
+    exponer_activo = true; exponer_hecho = false; exponer_rc = -1;
+    int r = taek_h264_decodificar(1, 0, t, n);
+    exponer_activo = false;
+    size_t l = strlen(t);
+    snprintf(t + l, n - l, " exponer=%d", exponer_hecho ? exponer_rc : -2);
+    if (r) return r;
+    return exponer_hecho ? exponer_rc : -5;
 }
 
 extern "C" int taek_h264_caps(char *t, size_t n) {

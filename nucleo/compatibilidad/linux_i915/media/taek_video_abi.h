@@ -11,7 +11,13 @@ enum taek_video_orden {
     TAEK_VIDEO_MUESTRA,      /* datos/n/pts/longitud_nal: una unidad de acceso del MP4. Devuelve listos. */
     TAEK_VIDEO_TOMAR,        /* Copia el siguiente fotograma, en orden de presentacion, a y/u/v. */
     TAEK_VIDEO_DRENAR,       /* Fin del flujo: todo lo pendiente pasa a listos. */
-    TAEK_VIDEO_CERRAR        /* Libera superficies y contexto. El driver sigue iniciado para el siguiente video. */
+    TAEK_VIDEO_CERRAR,       /* Libera superficies y contexto. El driver sigue iniciado para el siguiente video. */
+    /* H195: presentacion por Iris, sin copias. TOMAR_GPU da la superficie NV12 del siguiente fotograma (handle para Iris, sin
+     * copiar pixeles); PRESENTAR_IRIS la dibuja escalada en el plano de pantalla (doble bufer, espera del vblank);
+     * IRIS_FIN repone el plano del firmware y suelta lo importado. */
+    TAEK_VIDEO_TOMAR_GPU,
+    TAEK_VIDEO_PRESENTAR_IRIS,
+    TAEK_VIDEO_IRIS_FIN
 };
 
 enum taek_video_resultado {
@@ -42,5 +48,16 @@ struct taek_video_peticion {
     int64_t pts_salida;
     uint64_t ns_gpu, ns_copia, decodificados, cortes;
     char motivo[96];
+    /* H195: superficie para Iris (salida de TOMAR_GPU) y rectangulo destino en pantalla (entrada de PRESENTAR_IRIS; ancho 0 =
+     * pantalla completa conservando la proporcion). */
+    uint32_t iris_handle, iris_pitch, iris_off_y, iris_off_uv, recorte_x, recorte_y;
+    uint64_t iris_bytes, iris_modificador;
+    int32_t dest_x, dest_y, dest_ancho, dest_alto;
+    uint64_t ns_iris;
+    /* H196: capa del programa (OSD) para PRESENTAR_IRIS. ARGB premultiplicado, osd_w x osd_h en (osd_x, osd_y) de pantalla.
+     * Iris la vuelve a subir solo si cambia osd_version. */
+    const uint32_t *osd_px;
+    uint32_t osd_x, osd_y, osd_w, osd_h, osd_version;
+    int32_t osd_visible;
 };
 #endif

@@ -144,6 +144,7 @@ static void *ioremap_interno(phys_addr_t offset, size_t size, uint64_t atributos
         if (res != 0) {
             // Rollback: desmapear lo ya mapeado y devolver el cursor virtual.
             for (uint64_t q = 0; q < p; q += 4096) paginacion_desmapear(virt_inicio + q);
+            paginacion_tlb_sincronizar();   /* H205 */
             g_cursor_ioremap_virtual = virt_inicio;
             return NULL;
         }
@@ -184,6 +185,7 @@ void iounmap(void *addr) {
             for (uint64_t p = 0; p < g_tabla_ioremap[i].tamano; p += 4096) {
                 paginacion_desmapear(virt + p);
             }
+            paginacion_tlb_sincronizar();   /* H205 */
             g_tabla_ioremap[i].activo = 0;
             if (g_conteo_mapeos_ioremap > 0) g_conteo_mapeos_ioremap--;
             return;

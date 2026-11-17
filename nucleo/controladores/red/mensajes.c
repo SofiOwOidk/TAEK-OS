@@ -1,5 +1,6 @@
 #include "red.h"
 #include "../../base/memoria.h"
+#include "red_cerrojo.h"   /* H211: cerrojo de la red (Fase C) */
 
 // Sesiones TCP cortas; recibir consulta una cola del PC y confirma su consumo.
 static uint8_t g_destino[4] = {192, 168, 18, 146};
@@ -17,14 +18,14 @@ static uint32_t leer32(const uint8_t *p) {
            ((uint32_t)p[2] << 8) | p[3];
 }
 
-void red_mensajes_destino(const uint8_t ip[4], uint16_t puerto) {
+void red_mensajes_destino(const uint8_t ip[4], uint16_t puerto) { RED_EXCLUSIVA();
     if (ip && puerto) {
         // No mezclar confirmaciones entre receptores diferentes.
         if (memcmp(ip, g_destino, 4) || puerto != g_puerto) g_pendiente = 0;
         memcpy(g_destino, ip, 4); g_puerto = puerto;
     }
 }
-void red_mensajes_obtener_destino(uint8_t ip[4], uint16_t *puerto) {
+void red_mensajes_obtener_destino(uint8_t ip[4], uint16_t *puerto) { RED_EXCLUSIVA();
     if (ip) memcpy(ip, g_destino, 4);
     if (puerto) *puerto = g_puerto;
 }
@@ -44,7 +45,7 @@ static int intercambiar(uint32_t op, const char *texto, uint32_t n,
     return 0;
 }
 
-int red_mensaje_transmitir(const char *mensaje) {
+int red_mensaje_transmitir(const char *mensaje) { RED_EXCLUSIVA();
     if (!mensaje) return -1;
     uint32_t n = 0;
     while (mensaje[n] && n <= RED_MENSAJE_MAX) {
@@ -60,7 +61,7 @@ int red_mensaje_transmitir(const char *mensaje) {
     return r;
 }
 
-int red_mensaje_recibir(char *salida, uint32_t capacidad) {
+int red_mensaje_recibir(char *salida, uint32_t capacidad) { RED_EXCLUSIVA();
     if (!salida || capacidad < RED_MENSAJE_MAX + 1) return -1;
     salida[0] = 0;
     if (__atomic_test_and_set(&g_ocupada, __ATOMIC_ACQUIRE)) return -16;

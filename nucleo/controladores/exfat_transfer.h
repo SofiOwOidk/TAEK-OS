@@ -2,6 +2,8 @@
 #define EXFAT_TRANSFER_H
 #include "particiones.h"
 int exfat_transfer_destino(const struct particion *);
+/* H154: motivo legible del ultimo rechazo de exfat_transfer_destino (NULL si no hubo). */
+const char *exfat_transfer_motivo(void);
 uint64_t exfat_transfer_libres(void);
 int exfat_transfer_iniciar(const char *,uint64_t);
 int exfat_transfer_escribir(uint64_t,const void *,unsigned);

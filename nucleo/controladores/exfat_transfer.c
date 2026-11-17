@@ -1,6 +1,8 @@
 /* Escritor acotado de archivos nuevos: exFAT, raiz existente, extent contiguo.
- * Metadatos de un archivo caben en un sector. No promete atomicidad frente a
- * cortes de energia. Dirty y reservas se conservan ante I/O ambiguo. */
+ * Metadatos de un archivo caben en un sector; si tras el fin de directorio no caben,
+ * siguen en el sector siguiente y la cola del actual queda libre (tipo 0x05).
+ * No promete atomicidad frente a cortes de energia. Dirty y reservas se conservan
+ * ante I/O ambiguo. */
 #include "exfat_transfer.h"
 #include "fat_lector.h"
 #include "usb_msc.h"
@@ -8,8 +10,8 @@
 #include "../base/memoria.h"
 #include "../base/sha256.h"
 static struct fat_lector_volumen vol;
-static uint8_t sector[512],dir_original[512],dir_actual[512],buffer[32768];
-static uint64_t libres,total,escritos,dir_sector;
+static uint8_t sector[512],dir_original[512],dir_actual[512],cola_original[512],cola_actual[512],buffer[32768];
+static uint64_t libres,total,escritos,dir_sector,cola_sector;
 static uint32_t primero,cantidad;
 static unsigned ranura,entradas;
 static int activo,fallo;
@@ -56,35 +58,60 @@ static void entrada(const char *nombre,uint64_t valida){
     for(unsigned i=0;i<entradas;i++){memset(p+i*32,0,32);p[i*32]=1;}
     memset(p,0,n*32);p[0]=0x85;p[1]=(uint8_t)(n-1);b16(p+4,0x20);
     p[32]=0xc0;p[33]=3;p[35]=(uint8_t)len;uint16_t hash=0;
-    for(unsigned i=0;i<len;i++){uint16_t u=vol.upcase[(uint8_t)nombre[i]];hash=(uint16_t)(((hash<<15)|(hash>>1))+(u&255));hash=(uint16_t)(((hash<<15)|(hash>>1))+(u>>8));unsigned off=64+(i/15)*32;p[off]=0xc1;b16(p+off+2+(i%15)*2,(uint8_t)nombre[i]);}
+    for(unsigned i=0;i<len;i++){uint16_t u=vol.upcase[(uint8_t)nombre[i]];hash=(uint16_t)((((uint32_t)hash<<15)|(hash>>1))+(u&255));hash=(uint16_t)((((uint32_t)hash<<15)|(hash>>1))+(u>>8));unsigned off=64+(i/15)*32;p[off]=0xc1;b16(p+off+2+(i%15)*2,(uint8_t)nombre[i]);}
     b16(p+36,hash);b64(p+40,valida);b32(p+52,primero);b64(p+56,total);
-    uint16_t sum=0;for(unsigned i=0;i<n*32;i++)if(i!=2 && i!=3)sum=(uint16_t)(((sum<<15)|(sum>>1))+p[i]);b16(p+2,sum);
+    uint16_t sum=0;for(unsigned i=0;i<n*32;i++)if(i!=2 && i!=3)sum=(uint16_t)((((uint32_t)sum<<15)|(sum>>1))+p[i]);b16(p+2,sum);
 }
+/* La longitud del directorio raiz no es la real: su fin lo da la cadena FAT, y
+ * fat_lector_sector devuelve 1 al agotarla. Solo lee: nada se escribe hasta iniciar. */
 static int buscar_ranura(void){
     struct fat_lector_nodo raiz;struct fat_lector_cursor c;
     int r=fat_lector_resolver(&vol,"/",&raiz,0);if(r)return r;fat_lector_cursor_iniciar(&c,&raiz);
-    int terminado=0;
+    cola_sector=0;
     for(uint64_t offset=0;offset<raiz.longitud;offset+=512){
+        uint64_t lba;r=fat_lector_sector(&vol,&c,offset,&lba);if(r)return r==1?VOLUMEN_NO_SOPORTADO:r;
         int64_t n=fat_lector_leer(&vol,&c,offset,dir_original,512,0);if(n!=512)return n<0?(int)n:VOLUMEN_NO_SOPORTADO;
-        unsigned seguidas=0;
+        unsigned seguidas=0,marcador=16;
         for(unsigned i=0;i<16;i++){
-            if(!dir_original[i*32])terminado=1;
-            if(terminado || !(dir_original[i*32]&128))seguidas++;else seguidas=0;
-            if(seguidas==entradas){ranura=i+1-entradas;dir_sector=lba_cluster(c.cluster)+offset%vol.bytes_cluster/512;
+            if(!dir_original[i*32] && marcador==16)marcador=i;
+            if(marcador<16 || !(dir_original[i*32]&128))seguidas++;else seguidas=0;
+            if(seguidas==entradas){ranura=i+1-entradas;dir_sector=lba;
                 memcpy(dir_actual,dir_original,512);
                 // Si se consume el marcador de fin, limpiar el resto de este sector.
-                if(terminado)memset(dir_actual+ranura*32,0,512-ranura*32);
+                if(marcador<16)memset(dir_actual+ranura*32,0,512-ranura*32);
                 return 0;}
         }
-        if(terminado)return VOLUMEN_NO_SOPORTADO;
+        if(marcador==16)continue;
+        // Tras el marcador no cabe: el conjunto va al principio del sector siguiente, que
+        // nunca se llena (7 entradas como maximo), asi que el nuevo fin sigue en ese sector.
+        uint64_t siguiente;r=fat_lector_sector(&vol,&c,offset+512,&siguiente);if(r)return r==1?VOLUMEN_NO_SOPORTADO:r;
+        memcpy(cola_original,dir_original,512);memcpy(cola_actual,dir_original,512);
+        n=fat_lector_leer(&vol,&c,offset+512,dir_original,512,0);if(n!=512)return n<0?(int)n:VOLUMEN_NO_SOPORTADO;
+        for(unsigned i=marcador;i<16;i++){memset(cola_actual+i*32,0,32);cola_actual[i*32]=5;}
+        memset(dir_actual,0,512);ranura=0;dir_sector=siguiente;cola_sector=lba;
+        return 0;
     }return VOLUMEN_NO_SOPORTADO;
 }
+static const char *motivo;
+const char *exfat_transfer_motivo(void){return motivo;}
 int exfat_transfer_destino(const struct particion *p){
+    motivo=0;
     if(activo)return VOLUMEN_ELEGIR;fat_lector_desmontar(&vol);libres=0;fallo=0;
-    if(!p || p->formato!=VOLUMEN_EXFAT)return VOLUMEN_NO_SOPORTADO;
+    if(!p || p->formato!=VOLUMEN_EXFAT){motivo="la particion no es exFAT";return VOLUMEN_NO_SOPORTADO;}
     int r=fat_lector_montar(&vol,p);if(r)return r;
     uint8_t a[512],b[512];r=particion_leer(p,0,1,a,0);if(!r)r=particion_leer(p,12,1,b,0);
-    if(r || vol.respaldo || (u16(a+106)&7) || (u16(b+106)&7) || memcmp(a+64,b+64,42) || a[110]!=1){fat_lector_desmontar(&vol);return r?r:VOLUMEN_NO_SOPORTADO;}
+    if(r || vol.respaldo || (u16(a+106)&7) || (u16(b+106)&7) || memcmp(a+64,b+64,42) || a[110]!=1){
+        /* H154: misma guarda de siempre (no se fuerza nada); solo se dice cual condicion fallo.
+         * VolumeFlags (offset 106): bit0 ActiveFat, bit1 VolumeDirty, bit2 MediaFailure. */
+        if(r)motivo=0;
+        else if(vol.respaldo)motivo="se monto desde el sector de arranque de respaldo; el principal no es valido";
+        else if(u16(a+106)&2)motivo="VolumeDirty activo (offset 0x6A). Expulsar el USB de forma segura en Windows o revisarlo con chkdsk";
+        else if(u16(a+106)&4)motivo="MediaFailure activo en VolumeFlags";
+        else if(u16(a+106)&1)motivo="ActiveFat=1 (segunda FAT activa; no admitido)";
+        else if(u16(b+106)&7)motivo="VolumeFlags del sector de respaldo (LBA 12) distintos de cero";
+        else if(memcmp(a+64,b+64,42))motivo="el sector de arranque principal y el de respaldo difieren";
+        else motivo="NumberOfFats distinto de 1";
+        fat_lector_desmontar(&vol);return r?r:VOLUMEN_NO_SOPORTADO;}
     for(uint64_t pagina=0;pagina<(vol.clusters+UINT64_C(4095))/4096;pagina++){
         uint64_t lba;r=bitmap(pagina,buffer,&lba);if(r){fat_lector_desmontar(&vol);return r;}
         for(unsigned i=0;i<4096 && pagina*4096+i<vol.clusters;i++)if(!(buffer[i/8]&(1u<<(i%8))))libres+=vol.bytes_cluster;
@@ -113,7 +140,10 @@ int exfat_transfer_iniciar(const char *nombre,uint64_t bytes){
     }if(!primero)return VOLUMEN_NO_SOPORTADO;
     // Probar flush antes de modificar el medio.
     r=sync();if(r)return r;r=dirty(1);if(r)return r;activo=1;
-    r=reserva(1);if(r)return r;entrada(temporal,0);r=escribir(dir_sector,1,dir_actual);if(!r)r=sync();return r;
+    r=reserva(1);if(r)return r;entrada(temporal,0);r=escribir(dir_sector,1,dir_actual);if(!r)r=sync();if(r)return r;
+    // Con el conjunto ya en el medio, el marcador deja de estar antes que el.
+    if(cola_sector){r=escribir(cola_sector,1,cola_actual);if(!r)r=sync();if(!r)consola_imprimir_linea("[EXFAT] Directorio: el archivo sigue en el sector siguiente.");}
+    return r;
 }
 int exfat_transfer_escribir(uint64_t offset,const void *datos,unsigned n){
     if(!activo || fallo || offset!=escritos || offset%512 || !n || n>sizeof(buffer) || n>total-offset || (n%512 && offset+n!=total))return VOLUMEN_CORRUPTO;
@@ -140,6 +170,8 @@ int exfat_transfer_publicar(const uint8_t esperado[32]){
 }
 int exfat_transfer_cancelar(void){
     if(!activo)return 0;if(fallo)return VOLUMEN_TRANSPORTE;
-    int r=escribir(dir_sector,1,dir_original);if(!r)r=sync();if(!r)r=reserva(0);if(!r)r=dirty(0);
+    // Primero vuelve el marcador: el conjunto del sector siguiente deja de verse antes de quitarlo.
+    int r=0;if(cola_sector){r=escribir(cola_sector,1,cola_original);if(!r)r=sync();}
+    if(!r)r=escribir(dir_sector,1,dir_original);if(!r)r=sync();if(!r)r=reserva(0);if(!r)r=dirty(0);
     if(!r)activo=0;return r;
 }

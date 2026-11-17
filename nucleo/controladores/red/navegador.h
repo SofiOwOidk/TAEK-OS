@@ -14,4 +14,10 @@
  */
 void navegador_abrir_url(const char *url_o_host);
 
+/* H143: solo la descarga, para programas de Anillo 3. url: entrada y, a la salida, la URL final tras las redirecciones
+ * (cap bytes). Deja en *cuerpo y *n el cuerpo ya sin cabeceras ni trozos (en un bufer propio del navegador, valido
+ * hasta la siguiente descarga) y en *estado el codigo HTTP. 0 bien; si no, 1 URL, 2 red (*detalle: su codigo),
+ * 3 respuesta, 4 redireccion. */
+int navegador_descargar(char *url, size_t cap, const char **cuerpo, size_t *n, int *estado, int *detalle);
+
 #endif // CONTROLADORES_RED_NAVEGADOR_H

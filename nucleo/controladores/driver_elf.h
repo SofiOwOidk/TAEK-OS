@@ -3,7 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #define DRIVER_ELF_SECCIONES 128
-#define DRIVER_ELF_MAX (24u*1024u*1024u)
+#define DRIVER_ELF_MAX (64u*1024u*1024u)   /* H190: el modulo i915 lleva Iris (Mesa, ~20 MiB) ademas de Media Driver */
+#define DRIVER_ARCHIVO_MAX (96u*1024u*1024u)   /* H190: archivo .chad con sus relocaciones (i915 + Media + Iris: ~36 MB) */
 struct driver_elf_seccion {
     uint32_t nombre,tipo;
     uint64_t flags,direccion,offset,tamano;

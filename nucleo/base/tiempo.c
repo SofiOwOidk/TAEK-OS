@@ -1,4 +1,6 @@
 #include "tiempo.h"
+#include "atencion.h"
+#include "cerrojo.h"
 #include "../arquitectura/x86_64/puertos.h"
 
 static uint64_t g_ciclos_por_ms = 0;
@@ -60,10 +62,13 @@ void esperar_milisegundos(uint32_t ms) {
     if (g_ciclos_por_ms == 0) {
         tiempo_iniciar();
     }
+    int cpu0 = !cpu_actual();                                   /* H215, E1: espera activa de CPU 0 */
+    uint64_t t = cpu0 ? atencion_espera_inicio() : 0;
     uint64_t fin = rdtsc_interno() + ((uint64_t)ms * g_ciclos_por_ms);
     while (rdtsc_interno() < fin) {
         __asm__ volatile ("pause");
     }
+    if (cpu0) atencion_espera_fin(t, 1);
 }
 
 uint64_t tiempo_obtener_milisegundos(void) {
@@ -88,9 +93,12 @@ void esperar_microsegundos(uint32_t us) {
     // Evitar división cero en CPUs extremadamente lentas (<1 MHz calibradas)
     uint64_t ciclos_por_us = g_ciclos_por_ms / 1000;
     if (ciclos_por_us == 0) ciclos_por_us = 1;
+    int cpu0 = !cpu_actual();                                   /* H215, E1: espera activa de CPU 0 */
+    uint64_t t = cpu0 ? atencion_espera_inicio() : 0;
     uint64_t fin = rdtsc_interno() + ((uint64_t)us * ciclos_por_us);
     while (rdtsc_interno() < fin) {
         __asm__ volatile ("pause");
     }
+    if (cpu0) atencion_espera_fin(t, 1);
 }
 

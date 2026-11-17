@@ -19,6 +19,8 @@ struct taek_early_ops {
     unsigned long (*fb_fisica)(void);
     /* Objetos GEM: admiten mas de 32 bits. 0 si no hay esa arena; entonces se usa paginas_asignar. */
     unsigned long (*paginas_objeto_asignar)(unsigned);
+    /* Opcional (H192): copia al framebuffer real (ver taek_kernel_api.pantalla_copiar). NULL con un kernel anterior. */
+    int (*pantalla_copiar)(const void *,unsigned,unsigned,unsigned,int,int);
 };
 /* Solo raiz, antes de usar memoria o PCI. */
 int taek_early_frontera_iniciar(const struct taek_early_ops *);
@@ -56,7 +58,16 @@ enum taek_early_modo {
     TAEK_EARLY_GT_CARGA,      /* Miles de escrituras seguidas y espera a que la GPU quede ociosa */
     TAEK_EARLY_GT_LOTE,       /* Batch buffer en contexto propio con PPGTT, por motor */
     TAEK_EARLY_GT_CUELGUE,    /* Batch en bucle por motor: debe detectarlo y resetearlo i915 */
-    TAEK_EARLY_GT_CERRAR      /* Desmontaje original del dispositivo: despues se puede reabrir */
+    TAEK_EARLY_GT_CERRAR,     /* Desmontaje original del dispositivo: despues se puede reabrir */
+    TAEK_EARLY_IRIS_RT,       /* M27: constructores de Iris (Mesa) */
+    TAEK_EARLY_IRIS_INIT,     /* M27: pantalla y contexto Gallium de Iris sobre el dispositivo retenido */
+    TAEK_EARLY_IRIS_CLEAR,    /* M27: dos clear por el motor de render, leidos y comparados por la CPU */
+    TAEK_EARLY_IRIS_TRIANGULO,/* M28: triangulo con shaders NIR propios, comparado con una rasterizacion de la CPU */
+    TAEK_EARLY_IRIS_TEXTURA,  /* M28: textura muestreada (verificada) y animacion presentada en la pantalla real */
+    TAEK_EARLY_IRIS_PANTALLA, /* H193: el plano de pantalla escanea una superficie de Iris (sin copia) y se restaura */
+    TAEK_EARLY_IRIS_VIDEO,    /* H194: Iris importa el NV12 de Media Driver por handle y lo convierte a RGB en un shader */
+    TAEK_EARLY_MEDIA_EXPONER, /* H194: Media Driver decodifica el IDR del vector y deja su superficie a Iris */
+    TAEK_EARLY_IRIS_OP        /* H195: una orden del reproductor para Iris (presentar un fotograma, terminar) */
 };
 /* Solo identidad simulada: ruta DMA declarada directa para ejercitar el codigo. Sin ella, QEMU
  * no tiene DMAR, la ruta es desconocida y el probe debe fallar cerrado. */

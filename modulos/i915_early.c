@@ -65,7 +65,12 @@ static int mmio_d(unsigned long v,unsigned long n){return k->mmio_desmapear(v,n)
 static unsigned long ciclos(void){return k->ciclos_por_ms();}
 static int dma_dir(void){return k->dma_directo_gpu();}
 static unsigned long fb_f(void){return k->fb_fisica();}
-static const struct taek_early_ops early_ops={sizeof(early_ops),TAEK_EARLY_VERSION,pag,pag_l,pci,message,colapso,barra,mmio_m,mmio_d,ciclos,dma_dir,fb_f,pag_o};
+/* H192: presentacion en pantalla, solo si el kernel trae el servicio. */
+static int pantalla(const void *p,unsigned w,unsigned h,unsigned paso,int x,int y){
+ if(k->bytes<TAEK_KERNEL_API_PANTALLA_BYTES || !k->pantalla_copiar)return -1;
+ return k->pantalla_copiar(p,w,h,paso,x,y);
+}
+static const struct taek_early_ops early_ops={sizeof(early_ops),TAEK_EARLY_VERSION,pag,pag_l,pci,message,colapso,barra,mmio_m,mmio_d,ciclos,dma_dir,fb_f,pag_o,pantalla};
 static unsigned long fallo_n;
 static int modo;
 static void supervisor(void *arg){(void)arg;result=taek_early_ejecutar(modo,simular,soltar,fallo_n);done=1;}
@@ -118,6 +123,8 @@ static int video_control(uint32_t orden,uint64_t arg){
  if(orden==TAEK_VIDEO_PREPARAR){int r=preparar_gpu();if(r)video_muerto=1;return r;}
  if(!media_listo || !p)return TAEK_VIDEO_FALLO;
  fallo_n=0;simular=0;soltar=0;modo=TAEK_EARLY_MEDIA_OP;
+ /* H195: la presentacion por Iris va por su propia entrada, con la misma peticion. */
+ if(orden==TAEK_VIDEO_PRESENTAR_IRIS || orden==TAEK_VIDEO_IRIS_FIN)modo=TAEK_EARLY_IRIS_OP;
  taek_early_media_peticion(p);
  /* Abrir y cerrar reservan y sueltan superficies; un fotograma tarda milisegundos. */
  int rc=correr(orden==TAEK_VIDEO_ABRIR || orden==TAEK_VIDEO_CERRAR?30000:5000);
@@ -175,6 +182,23 @@ static int command(const char *arg){
  else if(equal(arg,"media-idr")){modo=TAEK_EARLY_MEDIA_IDR;soltar=0;}
  else if(equal(arg,"media-mal")){modo=TAEK_EARLY_MEDIA_MAL;soltar=0;}
  else if(equal(arg,"media-video")){modo=TAEK_EARLY_MEDIA_VIDEO;soltar=0;}
+ else if(equal(arg,"iris-video")){
+  /* H194: GT, Media Driver iniciado, IDR del vector expuesto y luego Iris. */
+  soltar=0;
+  if(!gt_listo){modo=TAEK_EARLY_GT;if(correr(60000) || mask || result){k->imprimir_linea("[I915] iris-video: la GT no arranco");return -4;}gt_listo=1;}
+  if(!media_listo){modo=TAEK_EARLY_MEDIA_INIT;if(correr(60000) || mask || result){k->imprimir_linea("[I915] iris-video: Media Driver no inicio");return -4;}media_listo=1;}
+  modo=TAEK_EARLY_MEDIA_EXPONER;if(correr(60000) || mask || result){k->imprimir_linea("[I915] iris-video: Media Driver no expuso el cuadro");return -4;}
+  modo=TAEK_EARLY_IRIS_VIDEO;
+ }
+ else if(equal(arg,"iris-rt") || equal(arg,"iris-init") || equal(arg,"iris-clear") || equal(arg,"iris-triangulo") || equal(arg,"iris-textura") || equal(arg,"iris-pantalla")){
+  /* M27: Iris necesita el dispositivo retenido con la GT en marcha, como Media Driver. */
+  if(!gt_listo){
+   modo=TAEK_EARLY_GT;soltar=0;
+   if(correr(60000) || mask || result){k->imprimir_linea("[I915] iris: la GT no arranco");return -4;}
+   gt_listo=1;
+  }
+  modo=arg[5]=='p'?TAEK_EARLY_IRIS_PANTALLA:arg[5]=='r'?TAEK_EARLY_IRIS_RT:arg[5]=='i'?TAEK_EARLY_IRIS_INIT:arg[5]=='t'?(arg[6]=='e'?TAEK_EARLY_IRIS_TEXTURA:TAEK_EARLY_IRIS_TRIANGULO):TAEK_EARLY_IRIS_CLEAR;soltar=0;
+ }
  else if(equal(arg,"gt-carga")){modo=TAEK_EARLY_GT_CARGA;soltar=0;}
  else if(equal(arg,"gt-lote")){modo=TAEK_EARLY_GT_LOTE;soltar=0;}
  else if(equal(arg,"gt-cuelgue")){modo=TAEK_EARLY_GT_CUELGUE;soltar=0;}

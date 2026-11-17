@@ -91,6 +91,7 @@ static void *acpi_mapear_memoria_fisica(uint64_t phys_addr, uint64_t bytes) {
     for (uint64_t p = 0; p < pags; p++) {
         if (paginacion_mapear(virt_base + p * 4096, phys_alineada + p * 4096, PAGINA_PRESENTE)) {
             for (uint64_t j = 0; j < p; ++j) paginacion_desmapear(virt_base + j * 4096);
+            paginacion_tlb_sincronizar();   /* H205 */
             return NULL;
         }
     }
@@ -294,6 +295,7 @@ fallo_mapas:
     for (unsigned i = 0; i < g_estado_iommu.conteo_drhd; ++i)
         if (g_estado_iommu.drhd[i].mmio_virtual)
             paginacion_desmapear(g_estado_iommu.drhd[i].mmio_virtual);
+    paginacion_tlb_sincronizar();   /* H205 */
 fallo:
     g_estado_iommu.modo_operacion = IOMMU_MODO_DESCONOCIDO;
     g_estado_iommu.inventario_completo = 0;

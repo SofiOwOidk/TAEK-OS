@@ -19,5 +19,8 @@ struct puntero_gdt {
 
 void gdt_iniciar(void);
 void gdt_destruir_tss_e_ist(void);
+/* H213, Fase D: pila de nucleo (RSP0 del TSS) a la que entra una interrupcion o una llamada desde Anillo 3 en una CPU
+ * auxiliar (1 a 3). Cada hilo de programa tiene la suya; 0 vuelve a la pila propia de esa CPU. */
+void gdt_fijar_rsp0(unsigned cpu, uint64_t rsp0);
 
 #endif // ARQUITECTURA_X86_64_GDT_H

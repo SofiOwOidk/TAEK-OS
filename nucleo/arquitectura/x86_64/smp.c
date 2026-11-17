@@ -2,6 +2,8 @@
 #include "../../../boot/limine/limine.h"
 #include "../../base/paginacion.h"
 #include "../../base/tiempo.h"
+#include "../../base/cerrojo.h"
+#include "../../base/hilos.h"
 #include "gdt.h"
 #include "idt.h"
 #include "fpu.h"
@@ -20,6 +22,11 @@ typedef struct {
     uint64_t ticks_por_ms;
     x86_64_capacidades_simd capacidades;
     uint8_t espacio[65536];
+    uint64_t ocupado;   /* H151: ciclos trabajando en lotes; el resto duerme con hlt. Al final: el ensamblador no lo ve */
+    hilo_t *hilo_lotes; /* H207: el hilo que atiende los lotes en esta CPU (NULL: los atiende la raiz, como antes) */
+    /* H215, Fase E1: carga real. La raiz es lo unico que duerme (hlt); lo demas (lotes, hilos, interrupciones) es
+     * trabajo. dormido_desde != 0 mientras esta en hlt, para no contar como trabajo un sueno largo todavia abierto. */
+    volatile uint64_t tsc_inicio, dormido, dormido_desde;
 } datos_cpu;
 static datos_cpu cpus[TRABAJOS_MAX_CPU] __attribute__((aligned(64)));
 static trabajos_lote lote;
@@ -31,7 +38,8 @@ static uint64_t cr3;
 extern void smp_entrada(struct limine_smp_info *);
 extern void gdt_iniciar_cpu(unsigned);
 extern void idt_cargar_cpu(void);
-static void ipi(struct marco_interrupcion *m){(void)m;}
+/* H205: la IPI 81 despierta a una CPU dormida y, de paso, le hace vaciar su TLB si quedo atras de la epoca. */
+static void ipi(struct marco_interrupcion *m){(void)m;paginacion_tlb_atender();}
 static void despertar(unsigned id) {
     const struct estado_apic *a=apic_obtener_estado();
     if(a->es_x2apic) {
@@ -42,8 +50,37 @@ static void despertar(unsigned id) {
         apic_escribir(0x310,id<<24);apic_escribir(0x300,81);
     }
 }
+/* H207, Fase A2 (paso 1) del gestor de hilos: un lote en esta CPU. Lo corre el hilo 'lotes' o, si no hay, la raiz. */
+static evento_t g_ev_lote[TRABAJOS_MAX_CPU] = { EVENTO("lotes"), EVENTO("lotes"), EVENTO("lotes"), EVENTO("lotes") };
+static void lote_en_esta_cpu(datos_cpu *c, unsigned e) {
+    /* Mapeos sólo cambian entre lotes. Recarga antes de leer sus buffers. */
+    uint64_t cr4;__asm__ volatile("mov %%cr4,%0":"=r"(cr4));
+    if(cr4&(1u<<7)) {
+        uint64_t sin_global=cr4&~(UINT64_C(1)<<7);
+        __asm__ volatile("mov %0,%%cr4;mov %1,%%cr4"::"r"(sin_global),"r"(cr4):"memory");
+    }
+    __asm__ volatile("mov %0,%%cr3; sti"::"r"(cr3):"memory");
+    paginacion_tlb_atender();   /* H205: deja al dia la epoca de esta CPU */
+    if(c->indice<trabajos_cpu_activas()){
+        unsigned a0,d0,a1,d1;
+        __asm__ volatile("rdtsc":"=a"(a0),"=d"(d0));
+        while(trabajos_tomar(&lote,c->indice)){}
+        __asm__ volatile("rdtsc":"=a"(a1),"=d"(d1));
+        __atomic_add_fetch(&c->ocupado,(((uint64_t)d1<<32)|a1)-(((uint64_t)d0<<32)|a0),__ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&c->epoca_vista,e,__ATOMIC_RELEASE);
+}
+static void trabajador_lotes(void *u) {
+    datos_cpu *c=u;
+    for(;;) {
+        hilo_esperar(&g_ev_lote[c->indice]);
+        unsigned e=__atomic_load_n(&epoca,__ATOMIC_ACQUIRE);
+        if(e!=c->epoca_vista)lote_en_esta_cpu(c,e);
+    }
+}
 void smp_trabajador(datos_cpu *c) {
     __asm__ volatile("mov %0,%%cr3"::"r"(cr3):"memory");
+    cpu_identidad_iniciar(c->indice);   /* H205: antes de tomar cualquier cerrojo */
     gdt_iniciar_cpu(c->indice);x86_64_fpu_iniciar();idt_cargar_cpu();
     if(taek_tls_cpu_iniciar(c->indice))for(;;)__asm__ volatile("cli; hlt");
     if(i915_scheduler_registrar_cpu(c->indice,c->lapic))for(;;)__asm__ volatile("cli; hlt");
@@ -63,24 +100,45 @@ void smp_trabajador(datos_cpu *c) {
     /* A1.6: calibra el TSC de esta CPU contra el PIT para poder comparar
      * relojes entre participantes. No altera el valor global del BSP. */
     c->ticks_por_ms=tiempo_calibrar_ticks_por_ms();
+    hilos_cpu_iniciar(c->indice);   /* H206: calibra el temporizador APIC de esta CPU para el tictac de los hilos */
+    {unsigned a,d;__asm__ volatile("rdtsc":"=a"(a),"=d"(d));c->tsc_inicio=((uint64_t)d<<32)|a;}   /* H215 */
     __atomic_store_n(&c->listo,1,__ATOMIC_RELEASE);
     for(;;) {
         __asm__ volatile("cli":::"memory");
         unsigned e=__atomic_load_n(&epoca,__ATOMIC_ACQUIRE);
         if(__atomic_load_n(&parar,__ATOMIC_ACQUIRE))break;
-        if(e==c->epoca_vista){__asm__ volatile("sti; hlt":::"memory");continue;}
-        /* Mapeos sólo cambian entre lotes. Recarga antes de leer sus buffers. */
-        uint64_t cr4;__asm__ volatile("mov %%cr4,%0":"=r"(cr4));
-        if(cr4&(1u<<7)) {
-            uint64_t sin_global=cr4&~(UINT64_C(1)<<7);
-            __asm__ volatile("mov %0,%%cr4;mov %1,%%cr4"::"r"(sin_global),"r"(cr4):"memory");
-        }
-        __asm__ volatile("mov %0,%%cr3; sti"::"r"(cr3):"memory");
-        if(c->indice<trabajos_cpu_activas())while(trabajos_tomar(&lote,c->indice)){}
-        __atomic_store_n(&c->epoca_vista,e,__ATOMIC_RELEASE);
+        /* H207: sin hilo 'lotes', la raiz atiende el lote como antes (respaldo) */
+        if(!c->hilo_lotes && e!=c->epoca_vista){lote_en_esta_cpu(c,e);continue;}
+        /* H206: la raiz corre un turno de un hilo listo; si no hay ninguno, duerme hasta la proxima IRQ */
+        if(hilos_raiz(c->indice))continue;
+        unsigned a0,d0,a1,d1;
+        __asm__ volatile("rdtsc":"=a"(a0),"=d"(d0));
+        uint64_t t0=((uint64_t)d0<<32)|a0;
+        c->dormido_desde=t0;
+        __asm__ volatile("sti; hlt":::"memory");
+        __asm__ volatile("rdtsc":"=a"(a1),"=d"(d1));
+        c->dormido+=(((uint64_t)d1<<32)|a1)-t0;   /* H215: incluye la IRQ que la desperto (microsegundos) */
+        c->dormido_desde=0;
     }
     __atomic_store_n(&c->detenido,1,__ATOMIC_RELEASE);
     for(;;)__asm__ volatile("cli; hlt");
+}
+/* H206: hay un lote publicado que esta CPU todavia no atendio (su raiz tiene que volver a correr) */
+int trabajos_pendiente_en(unsigned i){
+    return i<cantidad && !cpus[i].hilo_lotes && __atomic_load_n(&ocupado,__ATOMIC_ACQUIRE) && __atomic_load_n(&cpus[i].epoca_vista,__ATOMIC_ACQUIRE)!=__atomic_load_n(&epoca,__ATOMIC_ACQUIRE);
+}
+/* H206: IPI 81 a una CPU: la despierta si duerme y, si corre un hilo, le da ocasion de cambiarlo */
+void trabajos_ipi_cpu(unsigned i){
+    if(i>=cantidad || i==cpu_actual())return;
+    despertar(i?cpus[i].lapic:bsp_id);
+}
+/* H205: IPI 81 a todas las CPU arrancadas menos la que llama */
+void trabajos_ipi_demas(void) {
+    unsigned yo=cpu_actual();
+    for(unsigned i=0;i<cantidad;i++){
+        if(i==yo)continue;
+        despertar(i?cpus[i].lapic:bsp_id);
+    }
 }
 unsigned trabajos_cpu_activas(void){unsigned n=__atomic_load_n(&seleccion_cpu,__ATOMIC_RELAXED);return cantidad<n?cantidad:n;}
 int trabajos_bsp_calcula(void){return bsp_calcula;}
@@ -89,6 +147,18 @@ int trabajos_configurar_distribucion(unsigned n,int bsp) {
     __atomic_store_n(&seleccion_cpu,n,__ATOMIC_RELAXED);bsp_calcula=bsp || n==1;return 1;
 }
 unsigned trabajos_cpu_arrancadas(void){return arrancadas;}
+/* H151: ciclos de trabajo de una CPU auxiliar (1..3), para la carga por nucleo de la interfaz.
+ * H215, Fase E1: antes eran solo los lotes de video; desde los hilos (H206-H213) eso dejaba fuera USB, audio, red e
+ * hilos de los programas. Ahora es todo el tiempo que no durmio en hlt. */
+uint64_t trabajos_ocupado_ciclos(unsigned cpu){
+    if(!(cpu>0 && cpu<cantidad) || !cpus[cpu].tsc_inicio)return 0;
+    datos_cpu *c=&cpus[cpu];
+    uint64_t desde=c->dormido_desde, dormido=c->dormido;
+    unsigned a,d;__asm__ volatile("rdtsc":"=a"(a),"=d"(d));
+    uint64_t ahora=((uint64_t)d<<32)|a, total=ahora-c->tsc_inicio;
+    if(desde && ahora>desde)dormido+=ahora-desde;
+    return total>dormido?total-dormido:0;
+}
 unsigned trabajos_cpu_detectadas(void){return detectadas;}
 uint64_t trabajos_ticks_por_ms(unsigned cpu){
     if(cpu==0)return tiempo_ciclos_por_ms();
@@ -108,6 +178,7 @@ int trabajos_iniciar(void) {
     if(!peticion.response || !a->activo || vmx_esta_activo())return 0;
     struct limine_smp_response *r=peticion.response;
     detectadas=(unsigned)r->cpu_count;bsp_id=r->bsp_lapic_id;cr3=paginacion_obtener_cr3();
+    cpu_identidad_iniciar(0);   /* H205 */
     if(limite_cpu<2)return 0;
     unsigned x,b,c,d, max, desplazamiento=0;
     __asm__ volatile("cpuid":"=a"(max),"=b"(b),"=c"(c),"=d"(d):"a"(0),"c"(0));
@@ -162,6 +233,11 @@ int trabajos_iniciar(void) {
             }
         }
     }
+    /* H207: un hilo 'lotes' por CPU auxiliar. Si alguno no se puede crear, esa CPU sigue con la raiz. */
+    for(unsigned k=1;k<cantidad;k++){
+        cpus[k].hilo_lotes=hilo_crear(trabajador_lotes,&cpus[k],"lotes",k,HILO_NORMAL,0);
+        if(!cpus[k].hilo_lotes){serial_imprimir("SMP: sin hilo de lotes en CPU ");serial_imprimir_dec(k);serial_imprimir_linea("; la raiz los atiende");}
+    }
     return cantidad>1;
 }
 int trabajos_ejecutar(trabajo_fn f,void *p,unsigned n,void (*servicio)(void *),void *u) {
@@ -170,7 +246,8 @@ int trabajos_ejecutar(trabajo_fn f,void *p,unsigned n,void (*servicio)(void *),v
     trabajos_preparar(&lote,f,p,n);
     unsigned e=__atomic_add_fetch(&epoca,1,__ATOMIC_RELEASE);
     unsigned participantes=trabajos_cpu_activas();
-    for(unsigned i=1;i<participantes;i++)despertar(cpus[i].lapic);
+    /* H207: la senal despierta al hilo 'lotes' (y manda la IPI si su CPU duerme); sin hilo, la IPI como antes */
+    for(unsigned i=1;i<participantes;i++){if(cpus[i].hilo_lotes)evento_senalar(&g_ev_lote[i]);else despertar(cpus[i].lapic);}
     while(!trabajos_terminados(&lote)) {
         if(bsp_calcula)trabajos_tomar(&lote,0);if(servicio)servicio(u);
         __asm__ volatile("pause");

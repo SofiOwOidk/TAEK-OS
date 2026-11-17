@@ -15,6 +15,7 @@
 #include <drm/drm_device.h>
 #include <drm/drm_file.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_gem.h>
 #include "../media/taek_media.h"
 
 extern void taek_early_trampa(const char *) __attribute__((noreturn));
@@ -107,11 +108,21 @@ int taek_media_abrir_drm(void) {
     return FD_DRM;
 }
 int taek_media_cerrar_drm(int fd) { return fd == FD_DRM ? 0 : -EBADF; }
+/* H193: el drm_file compartido (Media e Iris), para buscar un objeto GEM por su handle al fijarlo en pantalla. */
+struct drm_file *taek_media_archivo(void) { return abierto; }
 int taek_media_ioctl(int fd, unsigned long o, void *a) {
     if (fd != FD_DRM || !abierto) return -EBADF;
     if (_IOC_TYPE(o) != DRM_IOCTL_BASE) return -ENOTTY;
     /* Cada orden del modulo corre en una tarea nueva: todas son el mismo "proceso". */
     if (!current->signal) current->signal = &senales;
+    /* H194: PRIME_HANDLE_TO_FD (vaExportSurfaceHandle). TAEK no tiene dma-buf ni tabla de descriptores: el "descriptor" codifica
+     * el handle y solo sirve dentro de este drm_file (ver taek_media_exponer). No se toma ninguna referencia. */
+    if (_IOC_NR(o) == 0x2d) {
+        struct { u32 handle, flags; s32 fd; } *p = a;
+        p->fd = (s32)(TAEK_PRIME_FALSO | p->handle);
+        traza[0x2d].veces++;
+        return 0;
+    }
     long r = drm_ioctl(&archivo, o, (unsigned long)a);
     unsigned nr = _IOC_NR(o) & (NR_MAX - 1);
     traza[nr].veces++;
@@ -146,6 +157,49 @@ void *taek_media_mmap(void *d, size_t b, int p, int f, int fd, long off) {
         if (!mapas[i].u) { mapas[i].u = u; mapas[i].b = b; mapas[i].off = off; mapas[i].o = o; mapas[i].gtt = gtt; return u; }
     taek_media_trampa("tabla de mapas llena");
 }
+/* H194: Iris toma la superficie NV12 de Media Driver. Con el handle que dio vaExportSurfaceHandle se crea OTRO handle del mismo
+ * objeto en el mismo drm_file (ahi el handle es la identidad del objeto: no hace falta dma-buf). Asi, cuando Iris lo cierre, el
+ * de Media Driver sigue vivo. El handle anterior de Iris, si lo habia, se suelta. */
+static struct taek_video_exportado exportado;
+static int hay_exportado;
+int taek_media_exponer(unsigned hm, struct taek_video_exportado *e) {
+    if (!abierto) return -ENODEV;
+    struct drm_gem_object *g = drm_gem_object_lookup(abierto, hm);
+    if (!g) return -ENOENT;
+    if (hay_exportado) { drm_gem_handle_delete(abierto, exportado.handle); hay_exportado = 0; }
+    u32 h = 0;
+    int r = drm_gem_handle_create(abierto, g, &h);
+    size_t bytes = g->size;
+    drm_gem_object_put(g);
+    if (r) return r;
+    exportado = *e;
+    exportado.handle = h;
+    exportado.bytes = bytes;
+    hay_exportado = 1;
+    e->handle = h; e->bytes = bytes;
+    pr_info("[MEDIA] superficie NV12 exportada: handle media=%u iris=%u bytes=%zu pitch=%u off_y=%u off_uv=%u modificador=%llx %ux%u\n",
+            hm, h, bytes, e->pitch, e->off_y, e->off_uv, e->modificador, e->ancho, e->alto);
+    return 0;
+}
+int taek_media_handle_iris(unsigned hm, unsigned *hi, unsigned long long *bytes) {
+    if (!abierto) return -ENODEV;
+    struct drm_gem_object *g = drm_gem_object_lookup(abierto, hm);
+    if (!g) return -ENOENT;
+    u32 h = 0;
+    int r = drm_gem_handle_create(abierto, g, &h);
+    *bytes = g->size;
+    drm_gem_object_put(g);
+    if (!r) *hi = h;
+    return r;
+}
+/* Si Iris ya lo cerro (GEM_CLOSE al soltar su importacion), drm_gem_handle_delete devuelve -EINVAL sin efecto. */
+void taek_media_soltar_handle(unsigned h) { if (abierto) drm_gem_handle_delete(abierto, h); }
+int taek_media_exportado(struct taek_video_exportado *e) {
+    if (!hay_exportado) return -ENOENT;
+    *e = exportado;
+    return 0;
+}
+
 int taek_media_munmap(void *d, size_t b) {
     for (unsigned i = 0; i < MAPAS_MAX; i++)
         if (mapas[i].u == d) {
@@ -191,6 +245,63 @@ int taek_media_probar(struct drm_device *drm, int orden, char *t, size_t n, unsi
     kfree(pila);
     for (unsigned i = 0; i < NR_MAX; i++)
         if (traza[i].veces) pr_info("[MEDIA] traza ioctl nr=%#x veces=%u errores=%u\n", i, traza[i].veces, traza[i].errores);
+    return r;
+}
+
+/* M27: Iris (Mesa) usa los mismos servicios taek_media_* y el mismo drm_file; su entrada es otra. Su pila (2 MiB) se conserva
+ * entre ordenes porque sus hilos verdes guardan su estado en pilas propias, no en esta. */
+extern int taek_iris_entrada(int orden, char *texto, size_t bytes);
+#define TAEK_IRIS_OP_REPRODUCTOR 8   /* = TAEK_IRIS_OP de iris/taek_iris.h */
+/* H192: Iris presenta en la pantalla real (copia de la CPU, la hace el kernel con su mapa y su paso de fila). */
+extern int taek_early_pantalla_copiar(const void *p, unsigned w, unsigned h, unsigned paso, int x, int y);
+int taek_media_pantalla(const void *p, unsigned w, unsigned h, unsigned paso, int x, int y) {
+    return taek_early_pantalla_copiar(p, w, h, paso, x, y);
+}
+static int llamar_iris(char *tope, int orden, char *t, size_t n) {
+    register int r asm("eax");
+    asm volatile("mov %%rsp, %%rbx\n\t"
+                 "mov %[tope], %%rsp\n\t"
+                 "movabs $taek_iris_entrada, %%rax\n\t"
+                 "call *%%rax\n\t"
+                 "mov %%rbx, %%rsp\n\t"
+                 : "=a"(r), "+D"(orden), "+S"(t), "+d"(n)
+                 : [tope] "r"(tope)
+                 : "rbx", "rcx", "r8", "r9", "r10", "r11", "memory", "cc");
+    return r;
+}
+static char *pila_iris;
+static int preparar_pila_iris(void) {
+    if (pila_iris) return 0;
+    pila_iris = kmalloc(PILA_BYTES, GFP_KERNEL);
+    if (!pila_iris) return -ENOMEM;
+    memset(pila_iris, PILA_MARCA, PILA_BYTES);
+    return 0;
+}
+/* H195: una orden del reproductor (PRESENTAR_IRIS, IRIS_FIN) con su peticion, como taek_media_op. */
+int taek_iris_op(struct drm_device *drm, void *peticion) {
+    if (preparar_pila_iris()) return -ENOMEM;
+    dispositivo = drm;
+    int r = llamar_iris((char *)a_usuario(pila_iris) + PILA_BYTES - 64, TAEK_IRIS_OP_REPRODUCTOR, peticion, 0);
+    for (unsigned i = 0; i < 64; i++)
+        if (pila_iris[i] != PILA_MARCA) taek_media_trampa("pila de Iris desbordada");
+    return r;
+}
+int taek_iris_probar(struct drm_device *drm, int orden, char *t, size_t n, unsigned *pila_usada) {
+    if (preparar_pila_iris()) return -ENOMEM;
+    char *pila = pila_iris;
+    char *texto = kzalloc(n, GFP_KERNEL);
+    if (!texto) return -ENOMEM;
+    dispositivo = drm;
+    for (unsigned i = 0; i < NR_MAX; i++) traza[i].veces = traza[i].errores = 0;
+    int r = llamar_iris((char *)a_usuario(pila) + PILA_BYTES - 64, orden, a_usuario(texto), n);
+    memcpy(t, texto, n);
+    kfree(texto);
+    unsigned libre = 0;
+    while (libre < PILA_BYTES && pila[libre] == PILA_MARCA) libre++;
+    *pila_usada = PILA_BYTES - libre;
+    if (!libre) taek_media_trampa("pila de Iris desbordada");
+    for (unsigned i = 0; i < NR_MAX; i++)
+        if (traza[i].veces) pr_info("[IRIS] traza ioctl nr=%#x veces=%u errores=%u\n", i, traza[i].veces, traza[i].errores);
     return r;
 }
 

@@ -6,6 +6,7 @@
 #include "iommu.h"
 #include "pantalla.h"
 #include "usb_msc.h"
+#include "red/red.h"
 #include "../arquitectura/x86_64/pci.h"
 #include "../base/memoria.h"
 #include "../base/tiempo.h"
@@ -220,6 +221,62 @@ static void discos(void) {
         consola_imprimir(" ");
         consola_imprimir_dec(d->capacidad_bytes / (1024 * 1024 * 1024));
         consola_imprimir_linea(" GiB");
+    }
+}
+
+static void txt(char *d, size_t n, const char *o) {
+    size_t i = 0;
+    if (o && sm_valido(o)) while (o[i] && i + 1 < n) { d[i] = o[i]; i++; }
+    d[i] = 0;
+}
+
+/* Para pantallas: lo mismo que el informe, ya separado. Sin series, UUID ni etiquetas de activo. */
+void equipo_resumen(struct taek_equipo *t) {
+    memset(t, 0, sizeof(*t));
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0));
+    t->cpu_familia = (a >> 8) & 15; t->cpu_modelo = (a >> 4) & 15; t->cpu_paso = a & 15;
+    if (t->cpu_familia == 6 || t->cpu_familia == 15) t->cpu_modelo |= ((a >> 16) & 15) << 4;
+    if (t->cpu_familia == 15) t->cpu_familia += (a >> 20) & 255;
+    smbios_abrir();
+    if (g_sm) for (const uint8_t *e = sm_siguiente(0); e; e = sm_siguiente(e)) {
+        uint32_t resto = (uint32_t)(g_sm + g_sm_n - e);
+        if (e[0] == 1 && e[1] >= 8) { txt(t->fabricante, sizeof(t->fabricante), sm_txt(e, resto, e[4])); txt(t->modelo, sizeof(t->modelo), sm_txt(e, resto, e[5])); }
+        if (e[0] == 3 && e[1] >= 6 && chasis(e[5])) txt(t->formato, sizeof(t->formato), chasis(e[5]));
+        if (e[0] == 0 && e[1] >= 9) {
+            char f[32], v[16];
+            txt(f, sizeof(f), sm_txt(e, resto, e[4])); txt(v, sizeof(v), sm_txt(e, resto, e[5]));
+            size_t n = 0;
+            for (size_t i = 0; f[i] && n + 1 < sizeof(t->firmware); i++) t->firmware[n++] = f[i];
+            if (f[0] && v[0] && n + 1 < sizeof(t->firmware)) t->firmware[n++] = ' ';
+            for (size_t i = 0; v[i] && n + 1 < sizeof(t->firmware); i++) t->firmware[n++] = v[i];
+            t->firmware[n] = 0;
+            txt(t->fecha_firmware, sizeof(t->fecha_firmware), sm_txt(e, resto, e[8]));
+        }
+        if (e[0] == 17 && e[1] >= 0x15) {
+            uint16_t tam = (uint16_t)(e[0xc] | e[0xd] << 8);
+            if (!tam || tam == 0xffff) continue;
+            uint64_t mb = tam == 0x7fff && e[1] >= 0x20 ? (uint64_t)((uint32_t)e[0x1c] | (uint32_t)e[0x1d] << 8 | (uint32_t)e[0x1e] << 16 | (uint32_t)e[0x1f] << 24) : (tam & 0x8000 ? (tam & 0x7fffu) / 1024u : tam);
+            t->ram_instalada_mib += (uint32_t)mb;
+            t->ram_modulos++;
+            if (tipo_ram(e[0x12])) txt(t->ram_tipo, sizeof(t->ram_tipo), tipo_ram(e[0x12]));
+            if (e[1] >= 0x17) { uint16_t mhz = (uint16_t)(e[0x15] | e[0x16] << 8); if (mhz && mhz != 0xffff) t->ram_mts = mhz; }
+        }
+    }
+    const struct red_info *r = red_obtener_info();
+    if (r && r->modelo) txt(t->red, sizeof(t->red), r->modelo);
+    for (uint8_t i = 0; i < USB_MSC_MAX_DISPOSITIVOS && t->ndiscos < 4; i++) {
+        const struct usb_msc_dispositivo *q = usb_msc_obtener_dispositivo(i);
+        if (!q || !q->activo || !q->listo) continue;
+        struct taek_disco *o = &t->discos[t->ndiscos++];
+        size_t n = 0;
+        for (size_t k = 0; q->fabricante[k] && n + 1 < sizeof(o->nombre); k++) o->nombre[n++] = q->fabricante[k];
+        while (n && o->nombre[n - 1] == ' ') n--;
+        if (n + 1 < sizeof(o->nombre)) o->nombre[n++] = ' ';
+        for (size_t k = 0; q->producto[k] && n + 1 < sizeof(o->nombre); k++) o->nombre[n++] = q->producto[k];
+        while (n && o->nombre[n - 1] == ' ') n--;
+        o->nombre[n] = 0;
+        o->gib = (uint32_t)(q->capacidad_bytes / (1024 * 1024 * 1024));
     }
 }
 

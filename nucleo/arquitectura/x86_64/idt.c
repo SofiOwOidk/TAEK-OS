@@ -1,6 +1,8 @@
 #include "idt.h"
+#include "anillo3.h"
 #include "../../base/huevo.h"
 #include "serial.h"
+#include "../../base/hilos.h"
 #include "../../compatibilidad/linux_i915/cpu_runtime.h"
 
 extern void *tabla_trampas[256];
@@ -66,6 +68,8 @@ void idt_iniciar(void) {
         g_manejadores_irq[i] = 0;
         idt_configurar_puerta(i, (uint64_t)tabla_trampas[i]);
     }
+    /* La unica puerta que Ring 3 puede invocar con int. */
+    g_idt[ANILLO3_VECTOR_LLAMADA].atributos = 0xEE;
 
     __asm__ volatile ("lidt %0" : : "m"(g_puntero_idt));
 }
@@ -84,6 +88,20 @@ int idt_liberar_manejador(uint8_t vector,manejador_irq_fn manejador){
 }
 
 void despachador_interrupciones(struct marco_interrupcion *marco) {
+    const int desde_usuario = (marco->cs & 3) == 3;
+    if (desde_usuario) {
+        anillo3_al_entrar();
+        if (marco->num_interrupcion == ANILLO3_VECTOR_LLAMADA) {
+            anillo3_llamada(marco);
+            anillo3_al_salir();   /* H213: FS del hilo de programa; en CPU 1-3 termina el hilo si su programa acabo */
+            return;
+        }
+        /* NMI, doble fallo y machine check no son culpa del programa: los atiende El Huevo. */
+        if (marco->num_interrupcion < 32 && marco->num_interrupcion != 2 &&
+            marco->num_interrupcion != 8 && marco->num_interrupcion != 18) {
+            anillo3_fallo(marco);
+        }
+    }
     unsigned cpu=i915_scheduler_cpu_actual();
     if(cpu<I915_MAX_CPU)__atomic_fetch_add(&g_profundidad_irq[cpu],1,__ATOMIC_RELAXED);
     if (marco->num_interrupcion < 32) {
@@ -101,6 +119,11 @@ void despachador_interrupciones(struct marco_interrupcion *marco) {
     // Notificar al subsistema APIC para estadísticas y EOI
     apic_despachar_irq(marco);
     if(cpu<I915_MAX_CPU)__atomic_fetch_sub(&g_profundidad_irq[cpu],1,__ATOMIC_RELAXED);
+    /* H206: con EOI y profundidad en orden, el tictac puede cambiar de hilo aqui (solo CPU 1-3). H213, Fase D: tambien
+     * si interrumpio a un hilo de programa en Anillo 3 (su marco queda en su propia pila de nucleo, RSP0 por hilo). */
+    hilos_tras_irq(1);
+    /* Ya con EOI y profundidad en orden: el reloj puede terminar aqui un programa colgado. */
+    if (desde_usuario) { anillo3_tras_irq(); anillo3_al_salir(); }
 }
 
 void idt_corromper_para_harakiri(void) {

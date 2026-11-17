@@ -1,4 +1,6 @@
 #include "multimedia/imagen/imagen.h"
+#include "../arquitectura/x86_64/anillo3.h"
+#include "../arquitectura/x86_64/anillo3_abi.h"
 #include "terminal.h"
 #include "consola.h"
 #include "teclado.h"
@@ -16,6 +18,12 @@
 #include "../base/huevo.h"
 #include "../base/energia.h"
 #include "../base/tiempo.h"
+#include "../base/atencion.h"
+#include "../arquitectura/x86_64/thread_director.h"   /* H215, experimental */
+#include "../base/cerrojo.h"
+#include "../base/cola_entrada.h"
+#include "../base/hilos.h"
+#include "../base/trabajos.h"
 #include "../base/version.h"
 #include "../base/memoria.h"
 #include "../base/dma.h"
@@ -26,6 +34,10 @@
 #include "../arquitectura/x86_64/apic.h"
 #include "iommu.h"
 #include "xhci.h"
+#include "entrada.h"
+#include "red/red_cerrojo.h"
+#include "hid_i2c.h"
+#include "ps2.h"
 #include "usb_msc.h"
 #include "usb_msc_telemetria.h"
 #include "fat32.h"
@@ -34,6 +46,7 @@
 #include "vfs.h"
 #include "archivo_comando.h"
 #include "red/red.h"
+#include "red/wifi_rtw88.h"
 #include "red/remoto.h"
 #include "red/stream.h"
 #include "red/archivos.h"
@@ -1087,6 +1100,366 @@ static void ejecutar_comando_dmesg(void) {
     consola_imprimir_linea("");
     consola_imprimir_linea_color("================================================================================", COLOR_AVISO_DEFAULT);
     consola_imprimir_linea_color("Tip: Puedes capturar este log en vivo conectando un cable USB-Serial a 115200 baudios.", COLOR_TEXTO_DEFAULT);
+}
+
+/* H204, Fase 0 del gestor de hilos: 'latencia' muestra cuanto tarda CPU 0 en volver a atender al USB, la red y el
+ * sonido, y las llamadas al sistema mas largas; 'latencia cero' pone los maximos a cero antes de una prueba. */
+static void imprimir_hueco(const char *nombre, const struct atencion_medida *m) {
+    consola_imprimir(nombre);
+    consola_imprimir("max "); consola_imprimir_dec(m->max_ms); consola_imprimir(" ms");
+    if (m->max_ms) {
+        consola_imprimir(" (de "); consola_imprimir(atencion_sys_nombre(m->max_sys_ini));
+        consola_imprimir(" a "); consola_imprimir(atencion_sys_nombre(m->max_sys_fin));
+        consola_imprimir(", t="); consola_imprimir_dec(m->max_cuando_ms); consola_imprimir(" ms)");
+    }
+    consola_imprimir(" | pasadas "); consola_imprimir_dec(m->pasadas);
+    consola_imprimir_linea("");
+}
+static void ejecutar_comando_latencia(int cero) {
+    if (cero) {
+        atencion_cero(); xhci_fase0_cero();
+        consola_imprimir("[LATENCIA] Maximos y contadores a cero en t="); consola_imprimir_dec(atencion_cero_ms);
+        consola_imprimir_linea(" ms.");
+        return;
+    }
+    const struct xhci_fase0 *x = xhci_fase0();
+    uint64_t ahora = tiempo_obtener_milisegundos();
+    consola_imprimir_linea_color("--- LATENCIA DE CPU0 (H204, Fase 0 del gestor de hilos) ---", COLOR_AVISO_DEFAULT);
+    consola_imprimir("  Desde       : ");
+    if (atencion_cero_ms) { consola_imprimir("cero hace "); consola_imprimir_dec(ahora - atencion_cero_ms); consola_imprimir_linea(" ms"); }
+    else { consola_imprimir("el arranque, hace "); consola_imprimir_dec(ahora); consola_imprimir_linea(" ms"); }
+    imprimir_hueco("  USB anillo  : ", &atencion_usb);
+    consola_imprimir("  USB detalle : anidadas "); consola_imprimir_dec(x->reentradas);
+    consola_imprimir(" | eventos por pasada max "); consola_imprimir_dec(x->eventos_max);
+    consola_imprimir(" de "); consola_imprimir_dec(XHCI_TAM_ANILLO);
+    consola_imprimir(" | HC "); consola_imprimir_dec(x->eventos_hc);
+    consola_imprimir(" | anillo lleno "); consola_imprimir_dec(x->anillo_lleno);
+    consola_imprimir_linea("");
+    consola_imprimir("  Puertos     : cambios "); consola_imprimir_dec(x->cambios_puerto);
+    consola_imprimir(" | reintentos "); consola_imprimir_dec(x->reintentos);
+    consola_imprimir(" | recuperados "); consola_imprimir_dec(x->recuperados);
+    consola_imprimir(" | perdidos "); consola_imprimir_dec(x->perdidos);
+    consola_imprimir_linea("");
+    consola_imprimir("  HID perdido : raton "); consola_imprimir_dec(xhci_hid_mouse_perdidos());
+    consola_imprimir(" | teclas "); consola_imprimir_dec(x->teclas_perdidas);
+    consola_imprimir_linea("");
+    imprimir_hueco("  Red         : ", &atencion_red);
+    if (audio_hda_esta_operativo()) {
+        consola_imprimir("  HDA         : max "); consola_imprimir_dec(audio_hda_obtener_estado()->max_intervalo_sin_atencion_ms);
+        consola_imprimir(" ms (desde que arranco el sonido) | saltos tardios "); consola_imprimir_dec(audio_hda_saltos_tardios());
+        consola_imprimir_linea("");
+    }
+    /* H215, Fase E1: carga real desde 'latencia cero', en % con un decimal */
+    {
+        struct atencion_carga k; atencion_carga(&k);
+        consola_imprimir("  Carga real  : CPU0 trabajo "); consola_imprimir_dec(k.cpu0_trabajo / 10); consola_imprimir(".");
+        consola_imprimir_dec(k.cpu0_trabajo % 10); consola_imprimir("% + espera activa "); consola_imprimir_dec(k.cpu0_espera / 10);
+        consola_imprimir("."); consola_imprimir_dec(k.cpu0_espera % 10); consola_imprimir("%");
+        for (unsigned i = 1; i < k.cpus && i < 4; i++) {
+            consola_imprimir(" | CPU"); consola_imprimir_dec(i); consola_imprimir(" "); consola_imprimir_dec(k.ocupado[i] / 10);
+            consola_imprimir("."); consola_imprimir_dec(k.ocupado[i] % 10); consola_imprimir("%");
+        }
+        consola_imprimir(" (en "); consola_imprimir_dec(k.ms); consola_imprimir_linea(" ms)");
+    }
+    /* Las seis llamadas mas largas */
+    consola_imprimir("  SYS largas  :");
+    uint32_t hecho = 0;
+    for (int k = 0; k < 6; k++) {
+        int mejor = -1;
+        for (uint32_t i = 0; i < ATENCION_SYS_MAX; i++)
+            if (!(hecho & (1u << i)) && atencion_sys_max_us[i] && (mejor < 0 || atencion_sys_max_us[i] > atencion_sys_max_us[mejor])) mejor = (int)i;
+        if (mejor < 0) break;
+        hecho |= 1u << mejor;
+        consola_imprimir(" "); consola_imprimir(atencion_sys_nombre((uint32_t)mejor));
+        consola_imprimir(" "); consola_imprimir_dec(atencion_sys_max_us[mejor] / 1000);
+        consola_imprimir("."); consola_imprimir_dec((atencion_sys_max_us[mejor] % 1000) / 100);
+        consola_imprimir(" ms");
+    }
+    if (!hecho) consola_imprimir(" ninguna todavia");
+    consola_imprimir_linea("");
+    /* Los ultimos huecos grandes, con su hora, para cruzarlos con lo que dice la consola en ese momento */
+    struct atencion_hueco h[ATENCION_HUECOS];
+    unsigned nh = atencion_huecos_copiar(h, ATENCION_HUECOS);
+    consola_imprimir("  Huecos de "); consola_imprimir_dec(ATENCION_HUECO_MIN_MS); consola_imprimir(" ms o mas: ");
+    consola_imprimir_dec(atencion_huecos_total);
+    consola_imprimir_linea(nh ? " desde el arranque; los ultimos:" : " desde el arranque.");
+    for (unsigned i = 0; i < nh; i++) {
+        consola_imprimir("    t="); consola_imprimir_dec(h[i].fin_ms);
+        consola_imprimir(h[i].que == ATENCION_USB ? " USB " : " red ");
+        consola_imprimir_dec(h[i].ms); consola_imprimir(" ms, de ");
+        consola_imprimir(atencion_sys_nombre(h[i].sys_ini)); consola_imprimir(" a ");
+        consola_imprimir_linea(atencion_sys_nombre(h[i].sys_fin));
+    }
+    struct xhci_suceso_puerto s[XHCI_SUCESOS];
+    unsigned n = xhci_fase0_sucesos(s, XHCI_SUCESOS);
+    consola_imprimir("  Sucesos de puerto: "); consola_imprimir_dec(x->sucesos_total);
+    consola_imprimir_linea(n ? " desde el arranque; los ultimos:" : " desde el arranque.");
+    static const char *const tipo[] = { "?", "evento", "conexion", "desconexion", "sin enlace", "recuperado", "reintento fallido", "perdido" };
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t ps = s[i].portsc;
+        consola_imprimir("    t="); consola_imprimir_dec(s[i].ms);
+        consola_imprimir(" p"); consola_imprimir_dec(s[i].puerto);
+        consola_imprimir(" "); consola_imprimir(tipo[s[i].tipo < 8 ? s[i].tipo : 0]);
+        if (s[i].intento) { consola_imprimir(" #"); consola_imprimir_dec(s[i].intento); }
+        consola_imprimir(" CCS="); consola_imprimir_dec(ps & 1u);
+        consola_imprimir(" PED="); consola_imprimir_dec((ps >> 1) & 1u);
+        consola_imprimir(" OCA="); consola_imprimir_dec((ps >> 3) & 1u);
+        consola_imprimir(" PLS="); consola_imprimir_dec((ps >> 5) & 0xFu);
+        consola_imprimir(" CSC="); consola_imprimir_dec((ps >> 17) & 1u);
+        consola_imprimir(" PEC="); consola_imprimir_dec((ps >> 18) & 1u);
+        consola_imprimir(" OCC="); consola_imprimir_dec((ps >> 20) & 1u);
+        consola_imprimir(" PLC="); consola_imprimir_dec((ps >> 22) & 1u);
+        consola_imprimir_linea("");
+    }
+    if (x->reentradas) {
+        consola_imprimir("  Primera llamada anidada al anillo, retorno a ");
+        consola_imprimir_hex(x->reentrada_desde);
+        consola_imprimir_linea(" (buscarla con nm en nucleo.elf)");
+    }
+}
+
+/* H205, Fase 0.5 del gestor de hilos: 'cerrojos' muestra cuanto estuvo tomado cada cerrojo y la invalidacion de TLB;
+ * 'cerrojos prueba' hace trabajar a las 4 CPU a la vez sobre el monton, el PMM, el DMA, la consola y la cola de
+ * entrada, y comprueba que un mapeo cambiado por CPU 0 llega a las demas. */
+struct prueba_cerrojos {
+    uint32_t fallos, heap, paginas, dma, teclas, lecturas;
+    uint32_t por_cpu[4], impreso[4];
+    volatile uint64_t *va; uint64_t firma, hhdm;
+};
+static void prueba_cerrojos_region(void *u, unsigned region, unsigned cpu) {
+    struct prueba_cerrojos *p = u;
+    __atomic_fetch_add(&p->por_cpu[cpu & 3], 1, __ATOMIC_RELAXED);
+    for (unsigned k = 0; k < 40; k++) {
+        uint64_t n = 48 + ((region * 131u + k * 977u) % 3000u);
+        uint8_t *m = asignar_memoria(n);
+        if (!m) { __atomic_fetch_add(&p->fallos, 1, __ATOMIC_RELAXED); continue; }
+        uint8_t v = (uint8_t)(region * 7u + k + cpu * 61u);
+        memset(m, v, n);
+        int mal = m[n - 1] != v;
+        for (uint64_t i = 0; i < n; i += 97) if (m[i] != v) mal = 1;
+        liberar_memoria(m);
+        __atomic_fetch_add(mal ? &p->fallos : &p->heap, 1, __ATOMIC_RELAXED);
+    }
+    for (unsigned k = 0; k < 4; k++) {
+        uint64_t f = pmm_asignar_pagina_fisica();
+        if (!f) { __atomic_fetch_add(&p->fallos, 1, __ATOMIC_RELAXED); continue; }
+        volatile uint64_t *q = (volatile uint64_t *)(f + p->hhdm);
+        q[0] = f ^ region; q[511] = ~f;
+        int mal = q[0] != (f ^ region) || q[511] != ~f;
+        pmm_liberar_pagina_fisica(f);
+        __atomic_fetch_add(mal ? &p->fallos : &p->paginas, 1, __ATOMIC_RELAXED);
+    }
+    uint64_t fis = 0;
+    uint8_t *d = dma_asignar_bufer_contiguo(8192, 4096, &fis);
+    if (!d) __atomic_fetch_add(&p->fallos, 1, __ATOMIC_RELAXED);
+    else {
+        d[0] = (uint8_t)region; d[8191] = (uint8_t)~region;
+        int mal = d[0] != (uint8_t)region || d[8191] != (uint8_t)~region;
+        if (dma_liberar_bufer_contiguo(d, fis, 8192)) mal = 1;
+        __atomic_fetch_add(mal ? &p->fallos : &p->dma, 1, __ATOMIC_RELAXED);
+    }
+    if (!cola_entrada_encolar(ENTRADA_SERIE, (char)('A' + (cpu & 3)))) __atomic_fetch_add(&p->teclas, 1, __ATOMIC_RELAXED);
+    if (!__atomic_exchange_n(&p->impreso[cpu & 3], 1, __ATOMIC_RELAXED)) {
+        consola_imprimir("[CERROJOS] imprime la CPU "); consola_imprimir_dec(cpu); consola_imprimir_linea("");
+    }
+}
+static void prueba_leer_region(void *u, unsigned region, unsigned cpu) {
+    struct prueba_cerrojos *p = u; (void)region;
+    __atomic_fetch_add(&p->por_cpu[cpu & 3], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(*p->va == p->firma ? &p->lecturas : &p->fallos, 1, __ATOMIC_RELAXED);
+}
+static void imprimir_us(uint64_t ciclos) {
+    uint64_t por_ms = tiempo_ciclos_por_ms();
+    uint64_t decimas = por_ms ? ciclos * 10000u / por_ms : 0;   /* decimas de microsegundo */
+    consola_imprimir_dec(decimas / 10); consola_imprimir("."); consola_imprimir_dec(decimas % 10); consola_imprimir(" us");
+}
+static void ejecutar_comando_cerrojos(int prueba) {
+    if (prueba) {
+        static struct prueba_cerrojos p, q;
+        unsigned cpus = trabajos_cpu_arrancadas();
+        memset(&p, 0, sizeof(p)); p.hhdm = memoria_obtener_hhdm_offset();
+        cerrojo_cero();
+        consola_imprimir_linea_color("--- PRUEBA DE CERROJOS (H205, Fase 0.5) ---", COLOR_AVISO_DEFAULT);
+        int r1 = trabajos_ejecutar(prueba_cerrojos_region, &p, 64, 0, 0);
+        unsigned sacadas = 0; while (cola_entrada_tomar(0)) sacadas++;
+        int integro = memoria_verificar_integridad();
+        consola_imprimir("  Estres 64 regiones: lote "); consola_imprimir(r1 ? "completo" : "NO CORRIO");
+        consola_imprimir(" | por CPU");
+        for (unsigned i = 0; i < 4; i++) { consola_imprimir(" "); consola_imprimir_dec(p.por_cpu[i]); }
+        consola_imprimir_linea("");
+        consola_imprimir("  Monton "); consola_imprimir_dec(p.heap); consola_imprimir(" de 2560 | paginas "); consola_imprimir_dec(p.paginas);
+        consola_imprimir(" de 256 | DMA "); consola_imprimir_dec(p.dma); consola_imprimir(" de 64 | teclas encoladas ");
+        consola_imprimir_dec(p.teclas); consola_imprimir(" sacadas "); consola_imprimir_dec(sacadas);
+        consola_imprimir(" | fallos "); consola_imprimir_dec(p.fallos);
+        consola_imprimir(integro ? " | canarios intactos" : " | CANARIO ROTO"); consola_imprimir_linea("");
+        /* Un mapeo que CPU 0 cambia tiene que llegar a las demas */
+        const uint64_t va = 0x00007FFE00000000ULL, fa = UINT64_C(0xA1A1A1A1205F0A11), fb = UINT64_C(0xB2B2B2B2205F0B22);
+        uint64_t a = pmm_asignar_pagina_fisica(), b = pmm_asignar_pagina_fisica();
+        int tlb_ok = 0, ronda = -9, vistas = 0; uint32_t lec_a = 0, lec_b = 0, fallos_tlb = 0;
+        if (a && b && !paginacion_mapear(va, a, PAGINA_ATRIBUTOS_KERNEL)) {
+            *(volatile uint64_t *)(a + p.hhdm) = fa; *(volatile uint64_t *)(b + p.hhdm) = fb;
+            memset(&q, 0, sizeof(q)); q.va = (volatile uint64_t *)va; q.firma = fa;
+            trabajos_ejecutar(prueba_leer_region, &q, 32, 0, 0);
+            lec_a = q.lecturas; fallos_tlb += q.fallos;
+            paginacion_mapear(va, b, PAGINA_ATRIBUTOS_KERNEL);   /* Entrada presente que cambia: deja la ronda pendiente */
+            ronda = paginacion_tlb_sincronizar();
+            uint64_t epoca = 0; paginacion_tlb_estadisticas(&epoca, 0, 0, 0);
+            for (unsigned i = 0; i < cpus && i < 4; i++) if (paginacion_tlb_vista(i) == epoca) vistas++;
+            memset(&q, 0, sizeof(q)); q.va = (volatile uint64_t *)va; q.firma = fb;
+            trabajos_ejecutar(prueba_leer_region, &q, 32, 0, 0);
+            lec_b = q.lecturas; fallos_tlb += q.fallos;
+            paginacion_desmapear(va); paginacion_tlb_sincronizar();
+            tlb_ok = lec_a == 32 && lec_b == 32 && !fallos_tlb && !ronda && vistas == (int)(cpus < 4 ? cpus : 4);
+        }
+        if (a) pmm_liberar_pagina_fisica(a);
+        if (b) pmm_liberar_pagina_fisica(b);
+        consola_imprimir("  TLB: lecturas antes "); consola_imprimir_dec(lec_a); consola_imprimir(" de 32, despues "); consola_imprimir_dec(lec_b);
+        consola_imprimir(" de 32 | ronda "); consola_imprimir(ronda == 0 ? "atendida" : ronda == -1 ? "TARDIA" : "no se hizo");
+        consola_imprimir(" | CPU al dia "); consola_imprimir_dec((uint64_t)vistas); consola_imprimir(" de "); consola_imprimir_dec(cpus);
+        consola_imprimir_linea("");
+        int pasa = r1 && !p.fallos && p.heap == 2560 && p.paginas == 256 && p.dma == 64 && p.teclas == 64 && sacadas == 64 && integro && tlb_ok;
+        consola_imprimir_linea_color(pasa ? "[CERROJOS] RESULTADO=PASS" : "[CERROJOS] RESULTADO=FALLO", pasa ? COLOR_EXITO_DEFAULT : COLOR_ERROR_DEFAULT);
+    }
+    consola_imprimir_linea_color("--- CERROJOS DEL NUCLEO (H205, Fase 0.5 del gestor de hilos) ---", COLOR_AVISO_DEFAULT);
+    for (const cerrojo_t *c = cerrojo_primero(); c; c = c->siguiente) {
+        consola_imprimir("  "); consola_imprimir(c->nombre ? c->nombre : "?");
+        consola_imprimir(": tomas "); consola_imprimir_dec(c->tomas);
+        consola_imprimir(" | esperas a otra CPU "); consola_imprimir_dec(c->disputas);
+        consola_imprimir(" | mas tiempo tomado "); imprimir_us(c->max_ciclos);
+        if (c->max_desde) { consola_imprimir(" desde "); consola_imprimir_hex(c->max_desde); }
+        consola_imprimir_linea("");
+    }
+    uint64_t epoca, rondas, tardias, espera;
+    paginacion_tlb_estadisticas(&epoca, &rondas, &tardias, &espera);
+    consola_imprimir("  TLB: epoca "); consola_imprimir_dec(epoca); consola_imprimir(" | rondas "); consola_imprimir_dec(rondas);
+    consola_imprimir(" | tardias "); consola_imprimir_dec(tardias); consola_imprimir(" | espera mas larga "); imprimir_us(espera);
+    consola_imprimir(" | CPU "); consola_imprimir_dec(trabajos_cpu_arrancadas());
+    consola_imprimir_linea("");
+    consola_imprimir("  Cola de entrada: pendientes "); consola_imprimir_dec(cola_entrada_pendientes());
+    consola_imprimir(" | perdidas "); consola_imprimir_dec(cola_entrada_perdidas()); consola_imprimir_linea("");
+}
+
+/* H206, Fase A1 del gestor de hilos: 'hilos' muestra el tictac y los cambios de cada CPU; 'hilos prueba' comprueba el
+ * desalojo, la prioridad, el sueno, el despertar entre CPU y el mutex, con los lotes de video funcionando a la vez. */
+static struct {
+    volatile uint64_t giros[2], fin_tsc, senal_tsc, latencia_max, latencia_suma, sueno_max, sueno_min;
+    volatile uint32_t terminados, despertares, suma, suma_errores, suenos;
+    evento_t ev;
+    mutex_t mx;
+} g_ph = { .ev = EVENTO("prueba_hilos"), .mx = MUTEX("prueba_hilos_mutex") };
+static inline uint64_t tsc_ph(void) { uint32_t a, d; __asm__ volatile("rdtsc" : "=a"(a), "=d"(d)); return ((uint64_t)d << 32) | a; }
+static void ph_giro(void *u) {
+    unsigned k = (unsigned)(uintptr_t)u;
+    while (tsc_ph() < g_ph.fin_tsc) g_ph.giros[k]++;   /* Nunca cede: solo el tictac lo puede sacar */
+    __atomic_fetch_add(&g_ph.terminados, 1, __ATOMIC_RELEASE);
+}
+static void ph_espera(void *u) {
+    (void)u;
+    for (unsigned i = 0; i < 50; i++) {
+        hilo_esperar(&g_ph.ev);
+        uint64_t d = tsc_ph() - g_ph.senal_tsc;
+        if (d > g_ph.latencia_max) g_ph.latencia_max = d;
+        g_ph.latencia_suma += d;
+        __atomic_fetch_add(&g_ph.despertares, 1, __ATOMIC_RELEASE);
+    }
+    __atomic_fetch_add(&g_ph.terminados, 1, __ATOMIC_RELEASE);
+}
+static void ph_sueno(void *u) {
+    (void)u;
+    for (unsigned i = 0; i < 50; i++) {
+        uint64_t t = tsc_ph();
+        hilo_dormir_ms(1);
+        uint64_t d = tsc_ph() - t;
+        if (d > g_ph.sueno_max) g_ph.sueno_max = d;
+        if (!g_ph.sueno_min || d < g_ph.sueno_min) g_ph.sueno_min = d;
+        g_ph.suenos++;
+    }
+    __atomic_fetch_add(&g_ph.terminados, 1, __ATOMIC_RELEASE);
+}
+static void ph_mutex(void *u) {
+    (void)u;
+    for (unsigned i = 0; i < 2000; i++) {
+        mutex_tomar(&g_ph.mx);
+        uint32_t v = g_ph.suma;              /* Leer, ceder y escribir: sin exclusion se perderian sumas */
+        if (!(i % 64)) hilo_ceder();
+        g_ph.suma = v + 1;
+        mutex_soltar(&g_ph.mx);
+    }
+    __atomic_fetch_add(&g_ph.terminados, 1, __ATOMIC_RELEASE);
+}
+static void imprimir_us_ph(uint64_t ciclos) {
+    uint64_t por_ms = tiempo_ciclos_por_ms(), us = por_ms ? ciclos * 1000u / por_ms : 0;
+    consola_imprimir_dec(us); consola_imprimir(" us");
+}
+static void ejecutar_comando_hilos(int prueba) {
+    unsigned cpus = trabajos_cpu_arrancadas();
+    if (prueba) {
+        consola_imprimir_linea_color("--- PRUEBA DE HILOS (H206, Fase A1) ---", COLOR_AVISO_DEFAULT);
+        if (cpus < 4) { consola_imprimir_linea("[HILOS] Hacen falta 4 CPU arrancadas."); return; }
+        g_ph.giros[0] = g_ph.giros[1] = 0; g_ph.latencia_max = g_ph.latencia_suma = 0; g_ph.sueno_max = g_ph.sueno_min = 0;
+        g_ph.terminados = g_ph.despertares = g_ph.suma = g_ph.suenos = 0;
+        hilos_cero();
+        /* H207: cada CPU auxiliar ya tiene su hilo 'lotes'; al final tiene que quedar lo mismo que habia */
+        unsigned vivos_antes = 0, tictacs_antes = 0;
+        for (unsigned i = 1; i < 4; i++) { struct hilos_estadisticas e; hilos_estadisticas(i, &e); vivos_antes += (unsigned)e.vivos; tictacs_antes += (unsigned)e.tictac; }
+        uint64_t por_ms = tiempo_ciclos_por_ms();
+        g_ph.fin_tsc = tsc_ph() + por_ms * 400u;
+        unsigned creados = 0;
+        creados += hilo_crear(ph_giro, (void *)0, "giro-0", 1, HILO_NORMAL, 0) != 0;
+        creados += hilo_crear(ph_giro, (void *)1, "giro-1", 1, HILO_NORMAL, 0) != 0;
+        creados += hilo_crear(ph_espera, 0, "espera-tr", 1, HILO_TIEMPO_REAL, 0) != 0;
+        creados += hilo_crear(ph_sueno, 0, "sueno", 2, HILO_NORMAL, 0) != 0;
+        for (unsigned i = 1; i <= 3; i++) creados += hilo_crear(ph_mutex, 0, "mutex", i, HILO_NORMAL, 0) != 0;
+        /* Lotes de video mientras tanto: no tienen que notar a los hilos */
+        int lotes = trabajos_autoprueba();
+        /* CPU 0 despierta al hilo de tiempo real de CPU 1, que comparte CPU con dos hilos que giran */
+        for (unsigned i = 0; i < 50; i++) {
+            esperar_milisegundos(3);
+            g_ph.senal_tsc = tsc_ph();
+            evento_senalar(&g_ph.ev);
+        }
+        uint64_t limite = tsc_ph() + por_ms * 5000u;
+        while (__atomic_load_n(&g_ph.terminados, __ATOMIC_ACQUIRE) < creados && tsc_ph() < limite) esperar_milisegundos(1);
+        esperar_milisegundos(20);   /* La raiz de cada CPU libera a los muertos y apaga su tictac */
+        struct hilos_estadisticas e1; hilos_estadisticas(1, &e1);
+        unsigned vivos = 0, tictacs = 0;
+        for (unsigned i = 1; i < 4; i++) { struct hilos_estadisticas e; hilos_estadisticas(i, &e); vivos += (unsigned)e.vivos; tictacs += (unsigned)e.tictac; }
+        consola_imprimir("  Creados "); consola_imprimir_dec(creados); consola_imprimir(" de 7 | terminados ");
+        consola_imprimir_dec(g_ph.terminados); consola_imprimir(" | vivos al final "); consola_imprimir_dec(vivos); consola_imprimir(" (antes "); consola_imprimir_dec(vivos_antes); consola_imprimir(")");
+        consola_imprimir(" | tictacs encendidos al final "); consola_imprimir_dec(tictacs); consola_imprimir_linea("");
+        consola_imprimir("  Desalojo (CPU 1, dos hilos que no ceden): giros "); consola_imprimir_dec(g_ph.giros[0] / 1000);
+        consola_imprimir(" mil y "); consola_imprimir_dec(g_ph.giros[1] / 1000); consola_imprimir(" mil | desalojos ");
+        consola_imprimir_dec(e1.desalojos); consola_imprimir_linea("");
+        consola_imprimir("  Despertar desde CPU 0 (hilo de tiempo real en CPU 1): "); consola_imprimir_dec(g_ph.despertares);
+        consola_imprimir(" de 50 | max "); imprimir_us_ph(g_ph.latencia_max);
+        consola_imprimir(" | medio "); imprimir_us_ph(g_ph.despertares ? g_ph.latencia_suma / g_ph.despertares : 0); consola_imprimir_linea("");
+        consola_imprimir("  hilo_dormir_ms(1) en CPU 2: "); consola_imprimir_dec(g_ph.suenos); consola_imprimir(" de 50 | min ");
+        imprimir_us_ph(g_ph.sueno_min); consola_imprimir(" | max "); imprimir_us_ph(g_ph.sueno_max); consola_imprimir_linea("");
+        consola_imprimir("  Mutex (3 CPU x 2000 sumas): "); consola_imprimir_dec(g_ph.suma); consola_imprimir(" de 6000");
+        consola_imprimir(" | lotes de video durante la prueba: "); consola_imprimir(lotes ? "bien" : "FALLO"); consola_imprimir_linea("");
+        uint64_t us_lat = por_ms ? g_ph.latencia_max * 1000u / por_ms : 0, us_sueno = por_ms ? g_ph.sueno_max * 1000u / por_ms : 0;
+        /* H208: un hilo que duerme siempre (el del USB) deja su tictac encendido; se compara con como estaba */
+        int pasa = creados == 7 && g_ph.terminados == 7 && vivos == vivos_antes && tictacs <= tictacs_antes && g_ph.giros[0] && g_ph.giros[1] && e1.desalojos &&
+                   g_ph.despertares == 50 && us_lat < 1000 && g_ph.suenos == 50 && us_sueno < 3000 && g_ph.suma == 6000 && lotes;
+        consola_imprimir_linea_color(pasa ? "[HILOS] RESULTADO=PASS" : "[HILOS] RESULTADO=FALLO", pasa ? COLOR_EXITO_DEFAULT : COLOR_ERROR_DEFAULT);
+    }
+    consola_imprimir_linea_color("--- HILOS DEL NUCLEO (H206, Fase A1 del gestor de hilos) ---", COLOR_AVISO_DEFAULT);
+    for (unsigned i = 1; i < cpus && i < 4; i++) {
+        struct hilos_estadisticas e; hilos_estadisticas(i, &e);
+        consola_imprimir("  CPU "); consola_imprimir_dec(i);
+        consola_imprimir(": tictac "); consola_imprimir(e.tictac ? "encendido" : "apagado");
+        consola_imprimir(" | tictacs "); consola_imprimir_dec(e.tics);
+        consola_imprimir(" | desvio max "); imprimir_us_ph(e.tic_desvio_max_ciclos);
+        consola_imprimir(" | turnos "); consola_imprimir_dec(e.cambios);
+        consola_imprimir(" | desalojos "); consola_imprimir_dec(e.desalojos);
+        consola_imprimir(" | vivos "); consola_imprimir_dec(e.vivos);
+        consola_imprimir(" | creados "); consola_imprimir_dec(e.creados);
+        consola_imprimir(" | APIC/ms "); consola_imprimir_dec(e.apic_por_ms);
+        consola_imprimir_linea("");
+    }
+    /* H213, Fase D: sin programa abierto tiene que dar 0; si no, un hilo de Anillo 3 no se detuvo */
+    consola_imprimir("  Hilos de programa (Anillo 3) en marcha: "); consola_imprimir_dec(anillo3_hilos_vivos());
+    consola_imprimir_linea("");
 }
 
 static void ejecutar_comando_guia(const char *arg) {
@@ -2335,6 +2708,9 @@ static void ejecutar_comando_abrir(const char *arg) {
     }
 }
 
+/* H146: para el programa especial taek:abrir de Anillo 3 (videos, MP3 e imagenes con los reproductores del nucleo) */
+void terminal_abrir_archivo(const char *ruta) { ejecutar_comando_abrir(ruta); }
+
 static void ejecutar_comando_seleccionar(const char *arg) {
     const char *p=arg?str_saltar_espacios(arg):"";
     if(str_comienza_con(p,"disco "))p=str_saltar_espacios(p+6);
@@ -2681,6 +3057,30 @@ static void ejecutar_comando_disco(const char *arg) {
 static void ejecutar_comando_usb(const char *arg) {
     if (arg) arg = str_saltar_espacios(arg);
 
+    // H208, Fase B: usb hilo [encender|apagar] — el anillo de eventos del xHCI lo bombea un hilo de CPU 1
+    if (arg && (str_igual(arg, "hilo") || str_igual(arg, "hilo encender") || str_igual(arg, "hilo apagar"))) {
+        if (str_igual(arg, "hilo encender")) {
+            int r = xhci_hilo(1);
+            if (r == 1) entrada_hilo(1);
+            consola_imprimir_linea(r == 1 ? "[USB] Hilos de eventos, puertos y entrada encendidos en CPU 1."
+                                          : "[USB] No se pudieron crear los hilos (hacen falta las CPU auxiliares).");
+        } else if (str_igual(arg, "hilo apagar")) {
+            xhci_hilo(0);
+            entrada_hilo(0);
+            consola_imprimir_linea("[USB] Hilos apagados: CPU 0 vuelve a sondear USB, PS/2 e I2C, como antes de H208.");
+        }
+        int modo = 0; uint64_t bombeos = 0, ocupado = 0;
+        xhci_hilo_estado(&modo, &bombeos, &ocupado);
+        consola_imprimir("[USB] Hilo de eventos: "); consola_imprimir(modo ? "ENCENDIDO" : "apagado");
+        consola_imprimir(" | pasadas del hilo "); consola_imprimir_dec(bombeos);
+        consola_imprimir(" | cerrojo ocupado por CPU 0 "); consola_imprimir_dec(ocupado);
+        consola_imprimir(" | pasadas de puertos "); consola_imprimir_dec(xhci_hilo_puertos_pasadas());
+        consola_imprimir(" | pasadas de entrada "); consola_imprimir_dec(entrada_hilo_pasadas());
+        consola_imprimir(" | pasadas totales "); consola_imprimir_dec(atencion_usb.pasadas);
+        consola_imprimir(" | mayor hueco "); consola_imprimir_dec(atencion_usb.max_ms); consola_imprimir_linea(" ms");
+        return;
+    }
+
     // Subcomando: usb leer <lba> / usb read <lba> / usb dump <lba>
     if (arg && (str_comienza_con(arg, "leer") || str_comienza_con(arg, "read") || str_comienza_con(arg, "dump"))) {
         const char *p_lba = arg + 4;
@@ -2701,6 +3101,12 @@ static void ejecutar_comando_usb(const char *arg) {
             }
         }
         ejecutar_lectura_usb_msc(0, lba);
+        return;
+    }
+
+    // Subcomando: usb hub / usb hubs (H139)
+    if (arg && (str_igual(arg, "hub") || str_igual(arg, "hubs"))) {
+        xhci_hub_listar();
         return;
     }
 
@@ -3179,6 +3585,30 @@ static void ejecutar_comando_red(const char *arg) {
         return;
     }
 
+    /* H151: la cache ARP */
+    if (str_igual(arg, "arp")) {
+        uint8_t ip[8][4], mac[8][6]; uint64_t edad[8]; char t[20];
+        int n = red_arp_listar(ip, mac, edad, 8);
+        consola_imprimir_linea_color("--- CACHE ARP (8 vecinos, se reemplaza el menos usado) ---", COLOR_AVISO_DEFAULT);
+        if (!n) consola_imprimir_linea("  Vacia.");
+        for (int i = 0; i < n; i++) {
+            static const char h[] = "0123456789ABCDEF";
+            char m[18];
+            for (int k = 0; k < 6; k++) { m[k * 3] = h[mac[i][k] >> 4]; m[k * 3 + 1] = h[mac[i][k] & 15]; m[k * 3 + 2] = k < 5 ? ':' : 0; }
+            consola_imprimir("  "); consola_imprimir_color(red_ip_a_texto(ip[i], t, sizeof(t)), COLOR_USUARIO_DEFAULT);
+            consola_imprimir("  "); consola_imprimir(m);
+            consola_imprimir("  usada hace "); consola_imprimir_dec(edad[i] / 1000); consola_imprimir_linea(" s");
+        }
+        return;
+    }
+    if (str_igual(arg, "arp vaciar")) {
+        int n = red_arp_vaciar();
+        consola_imprimir_color("  [ OK ] Cache ARP vaciada: ", COLOR_EXITO_DEFAULT);
+        consola_imprimir_dec((uint64_t)n);
+        consola_imprimir_linea(" vecinos olvidados. Se vuelven a preguntar al hablarles.");
+        return;
+    }
+
     if (str_igual(arg, "dhcp") || str_igual(arg, "conectar")) {
         const struct red_info *info = red_obtener_info();
         if (!info->controlador_listo) {
@@ -3216,6 +3646,76 @@ static void ejecutar_comando_red(const char *arg) {
 
     if (str_igual(arg, "enlace") || str_igual(arg, "link") || str_igual(arg, "estado")) {
         red_imprimir_estado();
+        return;
+    }
+
+    // H175: velocidad TCP pura (sin USB) contra herramientas/intel/fuente_velocidad.py del PC.
+    if (str_comienza_con(arg, "velocidad")) {
+        char host[40];
+        const char *p = red_token(arg + 9, host, sizeof(host));
+        uint8_t ip[4];
+        if (!host[0] || red_texto_a_ip(host, ip)) { consola_imprimir_linea("  Uso: red velocidad <ip-del-pc> [MiB] (puerto 9156)"); return; }
+        int mib = red_parsear_entero(str_saltar_espacios(p), 8);
+        if (mib < 1) mib = 1;
+        if (mib > 256) mib = 256;
+        uint64_t total = (uint64_t)mib << 20, recibidos = 0;
+        static uint8_t tmp[16384];
+        red_stream_pausar(1); red_remoto_detener();
+        uint64_t crx0, cccmp0, ctx0, tsc0 = rdtsc();                         /* H178: perfilado */
+        wifi_ciclos(&crx0, &cccmp0, &ctx0);
+        int r = red_tcp_flujo_abrir_timeout(ip, 9156, 3000);
+        uint64_t t0 = tiempo_obtener_milisegundos(), ultimo = t0;
+        if (!r) {
+            uint8_t ped[16] = { 'T','A','E','K','V','E','L','1' };
+            for (int i = 0; i < 8; i++) ped[8 + i] = (uint8_t)(total >> (56 - 8 * i));
+            int e;
+            while ((e = red_tcp_flujo_enviar(ped, 16)) == 1) {
+                red_pila_sondeo();
+                if (tiempo_obtener_milisegundos() - t0 > 3000) { e = -2; break; }
+            }
+            if (e) r = -4;
+            t0 = ultimo = tiempo_obtener_milisegundos();
+            tsc0 = rdtsc(); wifi_ciclos(&crx0, &cccmp0, &ctx0);
+            while (!r && recibidos < total) {
+                int n = red_tcp_flujo_recibir(tmp, sizeof(tmp));
+                uint64_t ahora = tiempo_obtener_milisegundos();
+                if (n < 0) { r = -5; break; }
+                if (n) { recibidos += (uint64_t)n; ultimo = ahora; }
+                else if (ahora - ultimo > 5000) { r = -6; break; }
+            }
+        }
+        uint64_t ms = tiempo_obtener_milisegundos() - t0;
+        uint64_t tsc = rdtsc() - tsc0, crx, cccmp, ctx;
+        wifi_ciclos(&crx, &cccmp, &ctx);
+        crx -= crx0; cccmp -= cccmp0; ctx -= ctx0;
+        red_tcp_flujo_cerrar();
+        red_stream_pausar(0);
+        consola_imprimir("  [VELOCIDAD] "); consola_imprimir_dec(recibidos);
+        consola_imprimir(" B en "); consola_imprimir_dec(ms); consola_imprimir(" ms = ");
+        uint64_t kbps = ms ? recibidos * 8 / ms : 0;                       /* kbit/s */
+        consola_imprimir_dec(kbps / 1000); consola_imprimir(".");
+        consola_imprimir_dec((kbps % 1000) / 100); consola_imprimir(" Mbit/s  via ");
+        consola_imprimir(red_externa_activa() ? "WiFi" : "cable");
+        if (r) { consola_imprimir("  ERROR "); consola_imprimir_dec((uint64_t)(-r)); }
+        consola_imprimir_linea("");
+        if (tsc && red_externa_activa()) {                                  /* H178: reparto de CPU (TSC) */
+            consola_imprimir("  [CPU] TSC "); consola_imprimir_dec(ms ? tsc / ms / 1000 : 0); consola_imprimir(" MHz  RX WiFi ");
+            consola_imprimir_dec(crx * 100 / tsc); consola_imprimir("% (CCMP "); consola_imprimir_dec(cccmp * 100 / tsc);
+            consola_imprimir("%)  TX WiFi "); consola_imprimir_dec(ctx * 100 / tsc); consola_imprimir("%  ACK cada ");
+            consola_imprimir_dec((uint64_t)red_tcp_ack_cada(0)); consola_imprimir(" segmentos, ventana ");
+            consola_imprimir_dec((uint64_t)red_tcp_ventana_kib(0)); consola_imprimir_linea(" KiB");
+        }
+        return;
+    }
+
+    if (str_comienza_con(arg, "ventana")) {                                 // H182
+        int n = red_parsear_entero(str_saltar_espacios(arg + 7), 0);
+        consola_imprimir("  Ventana TCP maxima "); consola_imprimir_dec((uint64_t)red_tcp_ventana_kib(n)); consola_imprimir_linea(" KiB");
+        return;
+    }
+    if (str_comienza_con(arg, "ack")) {                                     // H178
+        int n = red_parsear_entero(str_saltar_espacios(arg + 3), 0);
+        consola_imprimir("  ACK de TCP cada "); consola_imprimir_dec((uint64_t)red_tcp_ack_cada(n)); consola_imprimir_linea(" segmentos");
         return;
     }
 
@@ -3357,6 +3857,7 @@ static void ejecutar_comando_red(const char *arg) {
     consola_imprimir_linea_color("  Subcomando no reconocido. Usa 'red' para ver la ayuda.", COLOR_ERROR_DEFAULT);
 }
 
+void terminal_ejecutar_orden(const char *linea);   /* H151: al final del archivo */
 static void procesar_comando(const char *linea_cruda) {
     const char *linea = str_saltar_espacios(linea_cruda);
     if (!linea || *linea == '\0') return;
@@ -3500,6 +4001,16 @@ static void procesar_comando(const char *linea_cruda) {
         consola_imprimir_linea(": Reporte de RAM, PMM, Heap kmalloc y canarios ('memoria probar').");
         consola_imprimir_color("  paginacion     ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Memoria virtual, árbol PML4, CR3 e invlpg ('paginacion probar').");
+        consola_imprimir_color("  menu           ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Interfaz gráfica en Ring 3. Esc vuelve a la terminal.");
+        consola_imprimir_color("  anillo3        ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Programas aislados en Ring 3 ('anillo3 prueba', 'compositor', 'demo [seg]').");
+        consola_imprimir_color("  raton          ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Mouse USB: 'raton probar' lo sigue en vivo; 'raton crudo [seg]' muestra cada reporte.");
+        consola_imprimir_color("  tactil         ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Trackpad por I2C: 'tactil iniciar', 'tactil probar', 'tactil crudo'.");
+        consola_imprimir_color("  i2c            ", COLOR_PROMPT_DEFAULT);
+        consola_imprimir_linea(": Buses I2C del chipset: 'i2c sondear', 'i2c leer <bus> <dir> <reg> <n>'.");
         consola_imprimir_color("  lspci / pci    ", COLOR_PROMPT_DEFAULT);
         consola_imprimir_linea(": Enumera dispositivos PCI/PCIe ('pci detalle', 'pci gpu').");
         consola_imprimir_color("  gpu            ", COLOR_PROMPT_DEFAULT);
@@ -3807,6 +4318,84 @@ static void procesar_comando(const char *linea_cruda) {
         return;
     }
 
+    // COMANDO: menu (interfaz grafica en Ring 3). Si el menu cae, la terminal sigue aqui.
+    // H149: 'menu' usa /menu.elf del USB si existe (se actualiza sin reiniciar); 'menu iso' fuerza el de la ISO.
+    if (str_igual(linea, "menu") || str_igual(linea, "menu prueba") || str_igual(linea, "menu medir") || str_igual(linea, "menu iso")) {
+        static uint32_t posicion;
+        int prueba = !linea[4] || linea[5] == 'i' ? 0 : linea[5] == 'p' ? 1 : 2;
+        anillo3_menu_cargar(linea[4] && linea[5] == 'i');
+        for (;;) {
+            struct anillo3_resultado r;
+            int e = anillo3_menu(posicion, prueba, &r);
+            if (e || r.fin != ANILLO3_SALIO) {
+                consola_imprimir_color("El menú terminó con un fallo y la terminal sigue viva. fin=", COLOR_ERROR_DEFAULT);
+                consola_imprimir_dec((uint64_t)r.fin);
+                consola_imprimir(" e="); consola_imprimir_dec((uint64_t)(e < 0 ? -e : e));
+                consola_imprimir(" vector="); consola_imprimir_dec(r.vector);
+                consola_imprimir(" rip="); consola_imprimir_hex(r.rip);
+                consola_imprimir(" cr2="); consola_imprimir_hex(r.cr2);
+                consola_imprimir(" ms="); consola_imprimir_dec(r.ms);
+                consola_imprimir_linea("");
+                return;
+            }
+            if (prueba && tiempo_ciclos_por_ms()) {
+                consola_imprimir("[UI] composiciones="); consola_imprimir_dec(r.composiciones);
+                consola_imprimir(" componer_ms="); consola_imprimir_dec(r.ciclos_componer / tiempo_ciclos_por_ms());
+                consola_imprimir(" presentar_ms="); consola_imprimir_dec(r.ciclos_presentar / tiempo_ciclos_por_ms());
+                consola_imprimir(" total_ms="); consola_imprimir_dec(r.ms);
+                consola_imprimir_linea("");
+                consola_imprimir_linea("[UI] MENU_TERMINADO");
+                return;
+            }
+            uint64_t c = (uint64_t)r.codigo;
+            posicion = (uint32_t)(c >> 8);
+            const char *orden = NULL;
+            switch (c & 0xFF) {
+            case TAEK_ACCION_REINICIAR: reiniciar_equipo();
+            case TAEK_ACCION_APAGAR: apagar_equipo();
+            case TAEK_ACCION_ESPECIFICACIONES: orden = "especificaciones"; break;
+            case TAEK_ACCION_BATERIA: orden = "bateria"; break;
+            case TAEK_ACCION_VIDEO: orden = "h264 prueba 360p"; break;
+            case TAEK_ACCION_DEMO: orden = "anillo3 demo 15"; break;
+            case TAEK_ACCION_PRUEBAS: orden = "anillo3 prueba"; break;
+            case TAEK_ACCION_APP:
+                /* H146: una aplicacion del disco, pedida desde el escritorio; al cerrarla se vuelve a el */
+                consola_limpiar();
+                anillo3_lanzar_pendiente();
+                /* H151: a donde se vuelve lo dice el menu en su posicion (TAEK_POS_ESCRITORIO si se pidio desde el
+                 * escritorio). Antes se forzaba el escritorio, y desde el menu (APLICACIONES) eso no corresponde. */
+                continue;
+            case TAEK_ACCION_ORDEN: {
+                /* H151: una orden de pantalla completa pedida por la interfaz (ruleta, cangrejo, estres...). Si el equipo
+                 * sigue en pie al terminar, se vuelve al menu donde estaba. */
+                static char pedida[TAEK_ORDEN_LINEA];
+                if (anillo3_orden_pendiente(pedida, sizeof(pedida))) continue;
+                consola_limpiar();
+                consola_imprimir_color("[UI] La interfaz pidió: ", COLOR_AVISO_DEFAULT);
+                consola_imprimir_linea(pedida);
+                consola_repintar_ahora();
+                terminal_ejecutar_orden(pedida);
+                consola_imprimir_linea("");
+                consola_imprimir_linea_color("Pulsa una tecla para volver al menú...", COLOR_AVISO_DEFAULT);
+                consola_repintar_ahora();
+                while (!consola_leer_caracter()) {}
+                continue;
+            }
+            default: return;
+            }
+            consola_limpiar();
+            procesar_comando(orden);
+            consola_imprimir_linea("");
+            consola_imprimir_linea_color("Pulsa una tecla para volver al menú...", COLOR_AVISO_DEFAULT);
+            consola_repintar_ahora();
+            while (!consola_leer_caracter()) {}
+        }
+    }
+    // COMANDO: anillo3 (programas aislados en Ring 3)
+    if (str_igual(linea, "anillo3") || str_comienza_con(linea, "anillo3 ")) {
+        anillo3_comando(linea[7] ? str_saltar_espacios(linea + 8) : NULL);
+        return;
+    }
     // COMANDO: bateria (una lectura al escribirlo, nada en segundo plano)
     if (str_igual(linea, "bateria") || str_igual(linea, "batería")) {
         bateria_comando();
@@ -3864,6 +4453,40 @@ static void procesar_comando(const char *linea_cruda) {
         }
         return;
     }
+
+    // COMANDO: latencia / latencia cero (H204, Fase 0 del gestor de hilos)
+    /* H211, Fase C: hilos de audio (CPU 2) y de red (CPU 3) */
+    if (str_igual(linea, "audio hilo") || str_igual(linea, "audio hilo encender") || str_igual(linea, "audio hilo apagar")) {
+        if (str_igual(linea, "audio hilo encender")) audio_hda_hilo(1);
+        if (str_igual(linea, "audio hilo apagar")) audio_hda_hilo(0);
+        const struct estado_hda *e = audio_hda_obtener_estado();
+        consola_imprimir("[AUDIO] Hilo HDA en CPU 2: "); consola_imprimir(audio_hda_hilo(-1) > 0 ? "ENCENDIDO" : "apagado");
+        consola_imprimir(" | pasadas "); consola_imprimir_dec(audio_hda_hilo_pasadas());
+        consola_imprimir(" | mayor hueco del DMA "); consola_imprimir_dec(e ? e->max_intervalo_sin_atencion_ms : 0);
+        consola_imprimir(" ms | saltos tardios "); consola_imprimir_dec(audio_hda_saltos_tardios()); consola_imprimir_linea("");
+        return;
+    }
+    if (str_igual(linea, "red hilo") || str_igual(linea, "red hilo encender") || str_igual(linea, "red hilo apagar")) {
+        if (str_igual(linea, "red hilo encender")) red_hilo(1);
+        if (str_igual(linea, "red hilo apagar")) red_hilo(0);
+        consola_imprimir("[RED] Hilo de red en CPU 3: "); consola_imprimir(red_hilo_activo() ? "ENCENDIDO" : "apagado");
+        consola_imprimir(" | pasadas "); consola_imprimir_dec(red_hilo_pasadas());
+        consola_imprimir(" | mayor hueco de la pila "); consola_imprimir_dec(atencion_red.max_ms); consola_imprimir_linea(" ms");
+        return;
+    }
+    /* H215, CONGELADO: thread director [encender|apagar|prueba] */
+    if (str_igual(linea, "thread director") || str_comienza_con(linea, "thread director ")) {
+        thread_director_comando(linea[15] ? linea + 16 : 0);
+        return;
+    }
+    if (str_igual(linea, "latencia")) { ejecutar_comando_latencia(0); return; }
+    if (str_igual(linea, "latencia cero")) { ejecutar_comando_latencia(1); return; }
+    // COMANDO: cerrojos / cerrojos prueba (H205, Fase 0.5 del gestor de hilos)
+    if (str_igual(linea, "cerrojos")) { ejecutar_comando_cerrojos(0); return; }
+    if (str_igual(linea, "cerrojos prueba")) { ejecutar_comando_cerrojos(1); return; }
+    // COMANDO: hilos / hilos prueba (H206, Fase A1 del gestor de hilos)
+    if (str_igual(linea, "hilos")) { ejecutar_comando_hilos(0); return; }
+    if (str_igual(linea, "hilos prueba")) { ejecutar_comando_hilos(1); return; }
 
     // COMANDO: version / ver
     if (str_igual(linea, "version") || str_igual(linea, "ver")) {
@@ -3968,6 +4591,21 @@ static void procesar_comando(const char *linea_cruda) {
     }
     if(str_igual(linea,"raton") || str_comienza_con(linea,"raton ")){
         puntero_comando(str_igual(linea,"raton")?"":str_saltar_espacios(linea+6));return;
+    }
+    /* Programas de Anillo 3 desde el disco, sin reiniciar (H143) */
+    if(str_igual(linea,"ejecutar") || str_comienza_con(linea,"ejecutar ")){
+        anillo3_ejecutar_archivo(str_igual(linea,"ejecutar")?"":str_saltar_espacios(linea+9));return;
+    }
+    /* Teclado interno y mouse PS/2 por el 8042, junto a xHCI (H142) */
+    if(str_igual(linea,"ps2") || str_comienza_con(linea,"ps2 ")){
+        ps2_comando(str_igual(linea,"ps2")?"":str_saltar_espacios(linea+4));return;
+    }
+    /* Trackpad por HID sobre I2C y el bus I2C del chipset (H138) */
+    if(str_igual(linea,"tactil") || str_comienza_con(linea,"tactil ")){
+        tactil_comando(str_igual(linea,"tactil")?"":str_saltar_espacios(linea+7));return;
+    }
+    if(str_igual(linea,"i2c") || str_comienza_con(linea,"i2c ")){
+        i2c_comando(str_igual(linea,"i2c")?"":str_saltar_espacios(linea+4));return;
     }
     if(str_igual(linea,"archivo") || str_comienza_con(linea,"archivo ")){
         red_archivos_comando(str_igual(linea,"archivo")?"":linea+8);return;
@@ -4084,6 +4722,127 @@ static void procesar_comando(const char *linea_cruda) {
             consola_imprimir("Windows: "); consola_imprimir_linea(respuesta);
             serial_imprimir("[MENSAJES_LAN] RECIBIDO=1 TEXTO="); serial_imprimir_linea(respuesta);
         }
+        return;
+    }
+
+    // COMANDO: wifi (H153, Fase 0: deteccion RTL8822CE y REG_SYS_CFG1)
+    if (str_igual(linea, "wifi")) {
+        wifi_imprimir_estado();
+        return;
+    }
+    // H154: enciende la MAC, vuelca el efuse (MAC real) y vuelve a apagar el chip.
+    if (str_igual(linea, "wifi efuse")) {
+        consola_imprimir_linea("[WIFI] Encendiendo MAC (card_enable_flow_8822c) y leyendo efuse...");
+        wifi_leer_efuse();
+        wifi_imprimir_efuse();
+        return;
+    }
+    // H160: radio encendida, canal y escaneo pasivo.
+    if (str_igual(linea, "wifi apagar")) {
+        wifi_apagar();
+        consola_imprimir_linea("[WIFI] Radio apagada (card_disable_flow_8822c), bus master desactivado.");
+        return;
+    }
+    if (str_igual(linea, "wifi encender") || str_comienza_con(linea, "wifi encender ") ||
+        str_igual(linea, "wifi escanear") || str_comienza_con(linea, "wifi escanear ")) {
+        int escanear = str_comienza_con(linea, "wifi escanear");
+        const char *ruta = str_saltar_espacios(linea + (escanear ? 13 : 13));
+        if (!*ruta) ruta = "/rtw8822c_fw.bin";
+        if (!wifi_obtener_info()->radio_activa) {
+            consola_imprimir("[WIFI] Encendiendo radio con "); consola_imprimir_linea(ruta);
+            if (wifi_encender(ruta) != 0) { wifi_imprimir_radio(); return; }
+            consola_imprimir_linea("[WIFI] Radio encendida: firmware, rtw_mac_init, tablas y calibracion OK.");
+        }
+        if (!escanear) return;
+        consola_imprimir_linea("[WIFI] Escaneo pasivo 2.4 GHz (1-13) y 5 GHz (36-165), 120 ms por canal...");
+        wifi_escanear(120);
+        wifi_imprimir_escaneo();
+        return;
+    }
+    // H163: auth + assoc + 4 vias con /wifi.conf (la clave nunca se imprime).
+    if (str_igual(linea, "wifi conectar")) {
+        if (!wifi_obtener_info()->radio_activa) { consola_imprimir_linea("[WIFI] Primero 'wifi escanear'."); return; }
+        consola_imprimir_linea("[WIFI] Conectando con /wifi.conf (SAE u Open, assoc RSN, 4 vias)...");
+        wifi_conectar();
+        wifi_imprimir_conexion();
+        return;
+    }
+    // H165: la pila IPv4 por WiFi (DHCP); vuelve sola al cable si el stream no reconecta en 90 s.
+    if (str_igual(linea, "wifi red")) {
+        if (!wifi_obtener_info()->radio_activa) {
+            consola_imprimir_linea("[WIFI] Encendiendo radio con /rtw8822c_fw.bin");
+            if (wifi_encender("/rtw8822c_fw.bin") != 0) { wifi_imprimir_radio(); return; }
+        }
+        if (!wifi_enlazado()) { wifi_escanear(120); consola_imprimir_linea("[WIFI] Escaneo hecho."); }
+        wifi_red_usar(90000);
+        return;
+    }
+    if (str_igual(linea, "wifi cable")) {
+        if (wifi_red_cable()) consola_imprimir_linea("[WIFI] La pila ya usa el cable.");
+        else consola_imprimir_linea("[WIFI] La pila volvio al cable; la asociacion WiFi sigue abierta.");
+        return;
+    }
+    if (str_igual(linea, "wifi desconectar")) {
+        wifi_red_cable();
+        wifi_desconectar();
+        consola_imprimir_linea("[WIFI] Asociacion cerrada (deauth protegido si hay PMF); la pila usa el cable.");
+        return;
+    }
+    if (str_igual(linea, "wifi enlace")) { wifi_imprimir_enlace(); return; }
+    // H179: descifrado CCMP de recepcion en la tarjeta (CAM) o por software.
+    if (str_igual(linea, "wifi cam") || str_igual(linea, "wifi cam on") || str_igual(linea, "wifi cam off")) {
+        int r = wifi_cam(str_igual(linea, "wifi cam on") ? 1 : str_igual(linea, "wifi cam off") ? 0 : -1);
+        consola_imprimir("[WIFI] CCMP RX por hardware: "); consola_imprimir_linea(r ? "activo" : "inactivo (software)");
+        return;
+    }
+    // H176: 11a (como H165-H175), 11ac (WMM+HT+VHT, 80 MHz) o 11ac con Block Ack. Rige en la proxima asociacion.
+    if (str_igual(linea, "wifi modo") || str_comienza_con(linea, "wifi modo ")) {
+        const char *m = str_igual(linea, "wifi modo") ? "" : str_saltar_espacios(linea + 10);
+        int r = str_igual(m, "a") ? wifi_modo(0) : str_igual(m, "ac") ? wifi_modo(1) : str_igual(m, "ba") ? wifi_modo(2) : wifi_modo(-1);
+        consola_imprimir("[WIFI] Modo: "); consola_imprimir_linea(r == 0 ? "11a" : r == 1 ? "11ac (WMM, HT, VHT, 80 MHz)" : "11ac + Block Ack de recepcion");
+        consola_imprimir_linea("       Rige en la proxima asociacion ('wifi desconectar' y 'wifi red').");
+        return;
+    }
+    // H161: probe request dirigido a una red ya oida en el ultimo escaneo.
+    if (str_comienza_con(linea, "wifi sondear ")) {
+        const char *ssid = str_saltar_espacios(linea + 13);
+        if (!wifi_obtener_info()->radio_activa) { consola_imprimir_linea("[WIFI] Primero 'wifi escanear'."); return; }
+        int r = wifi_sondear(ssid);
+        if (r == -2) { consola_imprimir_linea("[WIFI] Esa red no aparecio en el ultimo escaneo: no se transmite."); return; }
+        if (r == -3) consola_imprimir_linea("[WIFI] Indice de potencia fuera de rango (> 0x5A): NO se transmitio.");
+        if (r == -4) { consola_imprimir_linea("[WIFI] Red en 2.4 GHz: TX ahi necesita coex con BT (pendiente). Usa la de 5 GHz."); return; }
+        wifi_imprimir_sonda();
+        return;
+    }
+    if (str_comienza_con(linea, "wifi canal ")) {
+        const char *p = str_saltar_espacios(linea + 11);
+        unsigned c = 0;
+        while (*p >= '0' && *p <= '9') c = c * 10 + (unsigned)(*p++ - '0');
+        if (!wifi_obtener_info()->radio_activa || c == 0 || c > 177) {
+            consola_imprimir_linea("[WIFI] Uso: wifi canal <1-177> (con la radio encendida: 'wifi encender').");
+            return;
+        }
+        wifi_fijar_canal((uint8_t)c);
+        consola_imprimir("[WIFI] Canal "); consola_imprimir_dec(c); consola_imprimir_linea(" a 20 MHz (rtw8822c_set_channel).");
+        return;
+    }
+    // H158: firmware + rtw_mac_init + tablas PHY (MAC/BB/AGC/RFK/RF) y cristal.
+    if (str_igual(linea, "wifi radio") || str_comienza_con(linea, "wifi radio ")) {
+        const char *ruta = str_igual(linea, "wifi radio") ? 0 : str_saltar_espacios(linea + 11);
+        if (ruta && !*ruta) ruta = 0;
+        consola_imprimir_linea("[WIFI] Firmware + rtw_mac_init + tablas PHY...");
+        wifi_iniciar_radio(ruta);
+        wifi_imprimir_radio();
+        return;
+    }
+    // H155: descarga rtw8822c_fw.bin (modulo Limine rtw88:fw, o una ruta del USB) y lo valida.
+    if (str_igual(linea, "wifi firmware") || str_comienza_con(linea, "wifi firmware ")) {
+        const char *ruta = str_igual(linea, "wifi firmware") ? 0 : str_saltar_espacios(linea + 14);
+        if (ruta && !*ruta) ruta = 0;
+        consola_imprimir("[WIFI] Cargando firmware desde ");
+        consola_imprimir_linea(ruta ? ruta : "el modulo Limine rtw88:fw");
+        wifi_cargar_firmware(ruta);
+        wifi_imprimir_firmware();
         return;
     }
 
@@ -4667,7 +5426,9 @@ static void procesar_comando(const char *linea_cruda) {
         consola_lote_finalizar();consola_lote_iniciar();
         uint64_t fin=tiempo_obtener_milisegundos()+500;
         while(tiempo_obtener_milisegundos()<fin){red_stream_atender();__asm__ volatile("pause");}
-        red_stream_detener();reiniciar_equipo();
+        red_stream_detener();
+        if(wifi_enlazado())wifi_desconectar();   /* H172: sin esto el AP (PMF) rechaza el SAE del siguiente arranque con status 30 */
+        reiniciar_equipo();
     }
     // COMANDO: apagar
     if (str_igual(linea, "apagar") || str_igual(linea, "poweroff") || str_igual(linea, "shutdown")) {
@@ -4733,7 +5494,9 @@ void terminal_ejecutar(void) {
                 consola_imprimir(msc->producto);
                 consola_imprimir("): ");
                 consola_imprimir_linea_color(vfs_obtener_nombre_fs(), COLOR_AVISO_DEFAULT);
-                vfs_ejecutar_tree(NULL);
+                /* H152: ya no se vuelca el arbol entero al arrancar; el USB Ventoy guarda una ISO
+                 * por hito y la lista ocupaba varias pantallas. Se ve a pedido con 'arbol' o 'ls'. */
+                consola_imprimir_linea("          Escribe 'ls' o 'arbol' para ver su contenido.");
                 consola_imprimir_linea("");
                 break;
             }
@@ -4757,3 +5520,36 @@ void terminal_ejecutar(void) {
         }
     }
 }
+
+/* H151: ordenes que la interfaz de Anillo 3 puede pedir. Dos listas cerradas, nunca "cualquier cosa":
+ *  - TEXTO: solo imprimen; su salida se captura (SYS_ORDEN) y la interfaz la muestra en su propio panel.
+ *  - PANTALLA: se adueñan de la pantalla, del sonido o del equipo (ruleta, cangrejo, estres, video, triple fault);
+ *    el menu se cierra, el nucleo las corre en la consola y, si el equipo sigue en pie, vuelve al menu. */
+static const char *const g_orden_texto[] = {
+    "ayuda", "comandos", "help", "version", "ver", "info", "sistema", "huevo", "estado", "quiensoy", "whoami",
+    "memoria", "memoria probar", "free", "ram", "paginacion", "paginas", "paging", "lspci", "pci", "lspci detalle",
+    "gpu", "intel", "dmesg", "log", "bateria", "especificaciones", "acpi", "pray", "orar", "rezar", "oraculo",
+    "temple", "templeos", "godword", "stream", "red", "red arp", "red arp vaciar", "red dhcp", "apic", "irq", "dma",
+    "iommu", "vtd", "vt-d", "discos", "unidades", "dispositivos", "vram", "nvidia", "linux", "el comando", "transmitir",
+    "recibir", "ls", "dir", "arbol", "tree", "latencia", "latencia cero", "cerrojos", "hilos", "thread director", 0 };
+static const char *const g_orden_texto_prefijo[] = { "calc ", "calcular ", "paginacion ", "transmitir ", "ls ", "dir ",
+    "arbol ", "tree ", "echo ", "eco ", 0 };
+static const char *const g_orden_pantalla[] = {
+    "ruleta", "ruleta rusa", "cangrejo", "explotar", "stress", "h264 prueba 360p", "anillo3 prueba", "anillo3 demo 15",
+    "harakiri", "seppuku", "triple fault", "rm -rf /", 0 };
+
+static const char *orden_limpia(const char *linea) {
+    linea = str_saltar_espacios(linea);
+    if (str_comienza_con(linea, "sudo ")) linea = str_saltar_espacios(linea + 5);
+    return linea;
+}
+/* 1: solo texto; 2: pantalla completa; 0: no permitida desde la interfaz */
+int terminal_orden_clase(const char *linea) {
+    linea = orden_limpia(linea);
+    for (unsigned i = 0; linea[i]; i++) if ((unsigned char)linea[i] < 32) return 0;
+    for (int i = 0; g_orden_texto[i]; i++) if (str_igual_sin_caso(linea, g_orden_texto[i])) return 1;
+    for (int i = 0; g_orden_texto_prefijo[i]; i++) if (str_comienza_con_sin_caso(linea, g_orden_texto_prefijo[i])) return 1;
+    for (int i = 0; g_orden_pantalla[i]; i++) if (str_igual_sin_caso(linea, g_orden_pantalla[i])) return 2;
+    return 0;
+}
+void terminal_ejecutar_orden(const char *linea) { procesar_comando(orden_limpia(linea)); }

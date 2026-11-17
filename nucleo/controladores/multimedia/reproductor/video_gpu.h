@@ -12,4 +12,5 @@ int video_gpu_orden(struct taek_video_peticion *p, uint32_t orden);
 void video_gpu_inyeccion(struct taek_video_peticion *p);
 /* Atiende 'h264 motor ...' y 'h264 gpu ...'. 1 si el argumento era suyo. */
 int video_gpu_comando(const char *argumento);
+int video_gpu_presentar_iris(void);   /* H195: 'h264 presentar iris' */
 #endif

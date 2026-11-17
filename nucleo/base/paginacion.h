@@ -51,6 +51,15 @@ int  paginacion_alias_pml4(uint64_t dir_destino, uint64_t dir_origen);
 // Invalida la entrada correspondiente en el TLB de la CPU (instrucción invlpg)
 void paginacion_invalidar_tlb(uint64_t dir_virtual);
 
+/* H205: invalidacion entre CPU. Remapear o desmapear una pagina deja una sincronizacion pendiente; quien hace una
+ * tanda de cambios llama a paginacion_tlb_sincronizar() al terminar, sin cerrojos en la mano: manda la IPI y espera
+ * a que todas las CPU hayan vaciado su TLB (0 bien o nada que hacer, -1 si alguna no contesto en 200 ms).
+ * paginacion_tlb_atender() vacia la TLB de la CPU que la llama si quedo atras; la usan la IPI y los cerrojos. */
+void paginacion_tlb_atender(void);
+int  paginacion_tlb_sincronizar(void);
+void paginacion_tlb_estadisticas(uint64_t *epoca, uint64_t *rondas, uint64_t *tardias, uint64_t *espera_max_ciclos);
+uint64_t paginacion_tlb_vista(unsigned cpu);
+
 // Obtiene el registro de control CR3 actual de la CPU
 uint64_t paginacion_obtener_cr3(void);
 

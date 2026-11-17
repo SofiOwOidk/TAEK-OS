@@ -459,14 +459,24 @@ void vfs_cerrar(int fd) {
     desc->en_uso = 0;
 }
 
+/* H147: crear carpetas y escribir archivos, con el mismo motor transaccional que mover/copiar/eliminar */
+static int vfs_crear(const char *ruta,int carpeta,const void *datos,uint64_t n){
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    if(g_tipo_activo!=VFS_FS_FAT32 && g_tipo_activo!=VFS_FS_EXFAT)return VOLUMEN_SOLO_LECTURA;
+    if(fat32_transfer_activo() || exfat_transfer_activo())return VOLUMEN_OCUPADO;
+    for(unsigned i=0;i<VFS_MAX_FDS;i++)if(g_descriptores[i].en_uso)return VOLUMEN_OCUPADO;
+    g_cancelacion_lectura=0;
+    int r=fat_crear(&g_particion_activa,ruta,carpeta,datos,n);
+    struct fat_lector_volumen *v=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:&fat_lector_exfat;
+    memset(v->fat_valido,0,sizeof(v->fat_valido));v->bitmap_pagina=UINT64_MAX;v->bitmap.parcial_valido=0;
+    if(!r)vfs_limpiar_catalogo();g_error_volumen=r;return r;
+}
 int vfs_crear_archivo(const char *nombre, const char *contenido) {
-    (void)nombre;(void)contenido;
-    consola_imprimir_linea("Volumen abierto en solo lectura; escritor experimental fuera de este montaje.");
-    return VOLUMEN_SOLO_LECTURA;
+    size_t n=0;while(contenido && contenido[n])n++;
+    return vfs_crear(nombre,0,contenido,n);
 }
-int vfs_crear_directorio(const char *nombre) {
-    (void)nombre;return VOLUMEN_SOLO_LECTURA;
-}
+int vfs_crear_directorio(const char *nombre) { return vfs_crear(nombre,1,0,0); }
+int vfs_escribir_archivo(const char *ruta,const void *datos,uint64_t n) { return vfs_crear(ruta,0,datos,n); }
 static int vfs_operar_archivo(const char *origen,const char *destino,enum fat_operacion op){
     if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
     if(fat32_transfer_activo() || exfat_transfer_activo())return VOLUMEN_OCUPADO;
@@ -625,6 +635,31 @@ enum vfs_tipo_archivo vfs_inspeccionar_archivo(const char *ruta,int *error){
     if(t==VFS_TIPO_TEXTO){for(int64_t i=0;i<n;i++)if((prefijo[i]<32 && prefijo[i]!='\t' && prefijo[i]!='\r' && prefijo[i]!='\n') || prefijo[i]==127)return VFS_TIPO_OTRO;return t;}
     return VFS_TIPO_OTRO;
 }
+/* H145: recorre una carpeta sin imprimir nada ni tocar el catalogo de la terminal: para programas de Anillo 3.
+ * En FAT32/exFAT va directo al lector; en NTFS y ext4 pasa por el catalogo (que imprime) porque no hay iterador aparte. */
+int vfs_recorrer_directorio(const char *ruta,int (*f)(void *ctx,const char *nombre,uint64_t tam,int carpeta),void *ctx){
+    if(!vfs_esta_montado())return VOLUMEN_DESCONECTADO;
+    if(!ruta || !*ruta)ruta="/";
+    struct fat_lector_volumen *v=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:g_tipo_activo==VFS_FS_EXFAT?&fat_lector_exfat:0;
+    if(!v){
+        int r=vfs_listar_pagina(ruta,0);if(r)return r;
+        for(int i=0;i<g_catalogo_vfs.total;i++){const struct vfs_entrada *e=&g_catalogo_vfs.entradas[i];if(f(ctx,e->nombre,e->tamano,e->tipo_nodo==VFS_NODO_DIRECTORIO))break;}
+        return 0;
+    }
+    g_cancelacion_lectura=0;
+    struct fat_lector_nodo *n=asignar_memoria(sizeof(*n));struct fat_lector_iterador *it=asignar_memoria(sizeof(*it));
+    if(!n || !it){if(n)liberar_memoria(n);if(it)liberar_memoria(it);return VOLUMEN_NO_SOPORTADO;}
+    int r=fat_lector_resolver(v,ruta,n,0);
+    if(!r && !n->directorio)r=VOLUMEN_NO_SOPORTADO;
+    if(!r)r=fat_lector_iterar(v,n,it);
+    if(!r)while((r=fat_lector_siguiente(v,it,n,0))>0){
+        if(n->nombre[0]=='.' && (!n->nombre[1] || (n->nombre[1]=='.' && !n->nombre[2])))continue;
+        if(f(ctx,n->nombre,n->longitud,n->directorio)){r=0;break;}
+    }
+    liberar_memoria(n);liberar_memoria(it);
+    return r<0?r:0;
+}
+
 int vfs_consultar_ruta(const char *ruta,enum vfs_tipo_nodo *tipo){
     struct fat_lector_volumen *v=g_tipo_activo==VFS_FS_FAT32?&fat_lector_fat32:g_tipo_activo==VFS_FS_EXFAT?&fat_lector_exfat:0;
     if(!v || !tipo)return VOLUMEN_NO_SOPORTADO;

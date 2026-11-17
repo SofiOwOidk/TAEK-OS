@@ -119,6 +119,11 @@ void audio_hda_volcar_trazas(void);
 
 // Obtiene el estado actual del controlador Intel HDA
 const struct estado_hda *audio_hda_obtener_estado(void);
+// H203: avances de DMA atrasados que se aceptaron en vez de declarar atasco
+uint32_t audio_hda_saltos_tardios(void);
+// H211, Fase C: hilo de tiempo real en CPU 2 que atiende el DMA cada ~5 ms. 1 enciende, 0 apaga, -1 solo consulta; devuelve 1/0, o -1 si no se pudo
+int audio_hda_hilo(int encender);
+uint64_t audio_hda_hilo_pasadas(void);
 
 // Indica si el controlador Intel HDA fue detectado e inicializado exitosamente
 int  audio_hda_esta_operativo(void);

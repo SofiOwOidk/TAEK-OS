@@ -31,8 +31,11 @@
 #include "compatibilidad/linux.h"
 #include "controladores/video/nvidia/core/nvidia_core.h"
 #include "controladores/xhci.h"
+#include "controladores/entrada.h"
 #include "controladores/red/red.h"
+#include "controladores/red/wifi_rtw88.h"
 #include "controladores/red/stream.h"
+#include "controladores/red/red_cerrojo.h"
 #include "controladores/terminal.h"
 #include "controladores/teclado.h"
 #include "controladores/multimedia/reproductor/reproductor.h"
@@ -338,6 +341,13 @@ void principal(void) {
         huevo_etapa_ok();
     }
 
+    /* H153: Fase 0 WiFi (solo lectura, sin DMA). Ver PLAN_WIFI_RTL8822CE.md. */
+    huevo_etapa("Deteccion WiFi Realtek RTL8822CE (Fase 0)");
+    int wifi_rc = wifi_iniciar();
+    if (wifi_rc == 0) consola_imprimir(" [WiFi RTL8822CE detectada] ");
+    else if (wifi_rc == -2) consola_imprimir(" [WiFi RTL8822CE sin respuesta MMIO] ");
+    huevo_etapa_ok();
+
     huevo_etapa("Verificación de Pantalla GOP UEFI");
     if (g_peticion_framebuffer.response == NULL || g_peticion_framebuffer.response->framebuffer_count < 1) {
         serial_imprimir("[ERROR: SIN PANTALLA GOP] ");
@@ -367,6 +377,11 @@ void principal(void) {
         serial_imprimir_linea("[SMP activo; VMXON reservado para ejecución monoprocesador]");
         if(!trabajos_autoprueba()) {
             serial_imprimir_linea("[SMP autoprueba fallida; trabajadores detenidos]");trabajos_parar();
+        } else if(xhci_hilo(1)==1) {
+            /* H209/H210, Fase B: el USB (eventos y puertos) y la entrada (PS/2 e I2C) los atienden hilos de CPU 1 desde
+             * el arranque */
+            entrada_hilo(1);
+            serial_imprimir_linea("[USB] Hilos de eventos y puertos (CPU 1) y de entrada (CPU 2) encendidos ('usb hilo apagar' los apaga).");
         }
         huevo_etapa_ok();
     } else if (vmx_iniciar(base_fisica, base_virtual) == 0) {
@@ -399,6 +414,8 @@ void principal(void) {
             serial_imprimir(":");
             serial_imprimir_hex(ehda->id_dispositivo);
             serial_imprimir(" Listo a 44.1 kHz] ");
+            /* H211, Fase C: el servicio del DMA lo hace un hilo de tiempo real en CPU 2 ('audio hilo apagar' lo apaga) */
+            if (audio_hda_hilo(1) == 1) serial_imprimir("[Hilo de audio en CPU 2] ");
         } else {
             serial_imprimir("[Intel 82801AA AC97 Listo a 44.1 kHz] ");
         }
@@ -461,6 +478,10 @@ void principal(void) {
         video_h264_arranque(cl);
         red_stream_arranque(cl);
     }
+    /* H212, Fase C: la pila de red y el stream los bombea un hilo de CPU 3 (probado en H211 con 'red hilo encender':
+     * hueco de la red 4 ms con video, antes 1123). Va despues del DHCP de arranque, que tiene el cerrojo hasta 8 s.
+     * 'red hilo apagar' devuelve el sondeo a CPU 0. */
+    if (red_hilo(1) == 1) consola_imprimir_linea("[RED] Hilo de red en CPU 3 encendido ('red hilo apagar' lo apaga).");
     terminal_ejecutar();
 
     for (;;) {

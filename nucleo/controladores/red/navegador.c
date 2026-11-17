@@ -10,7 +10,7 @@
 #include "../../base/tiempo.h"
 #include "../../base/memoria.h"
 
-#define MAX_WEB_BUF 262144
+#define MAX_WEB_BUF (1024 * 1024)   /* H143: antes 256 KB; un articulo de Wikipedia ya pasa de eso */
 #define MAX_LINKS   24
 
 struct web_link {
@@ -421,6 +421,39 @@ static int web_elegir_destino(char url[WEB_URL_MAX],int *indice){
         *indice=-1;return 1;
     }
 }
+int navegador_descargar(char *url, size_t cap, const char **cuerpo, size_t *n, int *estado, int *detalle) {
+    *cuerpo = NULL; *n = 0; *estado = 0; *detalle = 0;
+    if(!url || !cap || web_str_len(url) >= cap || cap > WEB_URL_MAX) return 1;
+    for(int redirecciones = 0;; redirecciones++) {
+        int es_https; char host[254], ruta[WEB_URL_MAX]; uint16_t puerto;
+        if(web_url_parsear(url, &es_https, host, sizeof(host), &puerto, ruta, sizeof(ruta))) return 1;
+        int bytes = es_https ? red_https_obtener(host, ruta, puerto, s_web_buf, sizeof(s_web_buf), 30000) :
+                               red_http_obtener(host, ruta, puerto, s_web_buf, sizeof(s_web_buf), 10000);
+        if(bytes <= 0) { *detalle = -bytes; return 2; }
+        struct http_respuesta r;
+        if(http_respuesta_validar(s_web_buf, (size_t)bytes, 1, &r) != 1) return 3;
+        *estado = (int)r.estado;
+        if(r.estado == 301 || r.estado == 302 || r.estado == 303 || r.estado == 307 || r.estado == 308) {
+            char location[WEB_URL_MAX], destino[WEB_URL_MAX];
+            int found = web_location(s_web_buf, r.cuerpo, location, sizeof(location));
+            if(found < 0 || (found && web_url_resolver(url, location, destino, sizeof(destino)))) return 4;
+            if(found) {
+                int seguro; char h[254], path[WEB_URL_MAX]; uint16_t port;
+                if(redirecciones == 4 || web_url_parsear(destino, &seguro, h, sizeof(h), &port, path, sizeof(path)) ||
+                   (es_https && !seguro) || web_str_len(destino) >= cap) return 4;
+                web_str_copiar(url, destino, cap);
+                continue;
+            }
+        }
+        size_t t = (size_t)bytes;
+        if(http_respuesta_desempaquetar(s_web_buf, &t, &r)) return 3;
+        size_t fin = r.fin && r.fin <= t ? r.fin : t;   /* r.fin: fin del cuerpo segun Content-Length o los trozos */
+        *cuerpo = s_web_buf + r.cuerpo;
+        *n = fin > r.cuerpo ? fin - r.cuerpo : 0;
+        return 0;
+    }
+}
+
 void navegador_abrir_url(const char *url_o_host) {
     char url_actual[WEB_URL_MAX];
     if(!url_o_host || web_str_len(url_o_host)>=sizeof(url_actual)) {

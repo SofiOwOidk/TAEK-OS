@@ -5,6 +5,7 @@
 #include "../../base/memoria.h"
 #include "../../base/dma.h"
 #include "../../base/tiempo.h"
+#include "red_cerrojo.h"   /* H211: cerrojo de la red (Fase C) */
 
 // ------------------------------------------------------------------ Registros
 #define E1000_CTRL        0x00000
@@ -335,8 +336,36 @@ static void red_reiniciar_autonegociacion(void) {
     }
 }
 
+// ------------------------------------------------- H165: interfaz externa (WiFi)
+static const struct red_externa *g_ext;
+static struct red_info g_info_ext;
+
+void red_usar_externa(const struct red_externa *ext) { RED_EXCLUSIVA();
+    g_ext = ext;
+    if (!ext) return;
+    memset(&g_info_ext, 0, sizeof(g_info_ext));
+    g_info_ext.presente = 1;
+    g_info_ext.controlador_listo = 1;
+    g_info_ext.id_proveedor = ext->id_proveedor;
+    g_info_ext.id_dispositivo = ext->id_dispositivo;
+    memcpy(g_info_ext.mac, ext->mac, RED_MAX_MAC);
+    g_info_ext.modelo = ext->modelo;
+    g_info_ext.velocidad_mbps = ext->velocidad_mbps;
+    g_info_ext.enlace_activo = ext->enlace ? ext->enlace() : 1;
+}
+
+const struct red_externa *red_externa_activa(void) { RED_EXCLUSIVA(); return g_ext; }
+
+// H166: enlace del e1000 aunque la pila use la interfaz externa.
+int red_enlace_cable(void) { RED_EXCLUSIVA();
+    if (!g_info.controlador_listo) return 0;
+    g_info.enlace_activo = (red_mmio_leer32(E1000_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+    return g_info.enlace_activo;
+}
+
 // ------------------------------------------------------------- Enlace físico
-int red_enlace_actualizar(void) {
+int red_enlace_actualizar(void) { RED_EXCLUSIVA();
+    if (g_ext) return g_info_ext.enlace_activo = g_ext->enlace ? g_ext->enlace() : 1;
     if (!g_info.controlador_listo) return 0;
     uint32_t status = red_mmio_leer32(E1000_STATUS);
     g_info.enlace_activo = (status & E1000_STATUS_LU) ? 1 : 0;
@@ -444,7 +473,7 @@ static int red_asignar_anillos(void) {
 }
 
 // ---------------------------------------------------------------- API: inicio
-int red_iniciar(void) {
+int red_iniciar(void) { RED_EXCLUSIVA();
     if (g_info.controlador_listo) return 0;
     if (g_info.presente) return -1;
 
@@ -562,12 +591,18 @@ int red_iniciar(void) {
     return 0;
 }
 
-const struct red_info *red_obtener_info(void) {
-    return &g_info;
+const struct red_info *red_obtener_info(void) { RED_EXCLUSIVA();
+    return g_ext ? &g_info_ext : &g_info;
 }
 
 // -------------------------------------------------------------------- TX
-int red_enviar_trama(const void *datos, uint32_t longitud) {
+int red_enviar_trama(const void *datos, uint32_t longitud) { RED_EXCLUSIVA();
+    if (g_ext) {
+        int r = (datos && longitud) ? g_ext->enviar(datos, longitud) : -1;
+        if (r == 0) { g_info_ext.tx_paquetes++; g_info_ext.tx_bytes += longitud; }
+        else g_info_ext.tx_errores++;
+        return r;
+    }
     if (!g_info.controlador_listo || !datos || longitud == 0 || longitud > RED_TX_BUF_SIZE) {
         return -1;
     }
@@ -612,7 +647,14 @@ int red_enviar_trama(const void *datos, uint32_t longitud) {
 }
 
 // -------------------------------------------------------------------- RX
-int red_recibir_trama(void *buffer, uint32_t capacidad, uint32_t *longitud) {
+int red_recibir_trama(void *buffer, uint32_t capacidad, uint32_t *longitud) { RED_EXCLUSIVA();
+    if (g_ext) {
+        uint32_t l = 0;
+        if (!buffer || !g_ext->recibir(buffer, capacidad, &l)) return 0;
+        if (longitud) *longitud = l;
+        g_info_ext.rx_paquetes++; g_info_ext.rx_bytes += l;
+        return 1;
+    }
     if (!g_info.controlador_listo || !buffer) return 0;
 
     uint32_t rdh = red_mmio_leer32(E1000_RDH);

@@ -39,4 +39,12 @@
 int red_https_obtener(const char *host, const char *ruta, uint16_t puerto,
                       char *salida, uint32_t capacidad, int timeout_ms);
 
+/* H183: sesiones TLS 1.3 por manejador (hasta 4) sobre conexiones TCP 1-7; no pausan el stream de consola.
+ * abrir devuelve el id (0-3) o un TLS_ERR_*; recibir no bloquea (0 = aun no hay datos). */
+int  red_tls_abrir(const char *host, const uint8_t ip[4], uint16_t puerto, int timeout_ms);
+int  red_tls_enviar(int id, const void *datos, uint32_t n, int timeout_ms);
+int  red_tls_recibir(int id, void *datos, uint32_t capacidad);
+void red_tls_cerrar(int id);
+void red_tls_cerrar_todas(void);
+
 #endif // CONTROLADORES_RED_TLS_H

@@ -1,3 +1,4 @@
+#include "../base/cerrojo.h"
 #include "driver_ram.h"
 #include "driver_elf.h"
 #include "driver_abi.h"
@@ -20,7 +21,7 @@
 #include "iommu.h"
 #include "pantalla.h"
 #define DRIVER_VA UINT64_C(0x0000400000000000)
-#define OWN_MAX 4096
+#define OWN_MAX 65536u   /* H196: antes 4096 (Iris + Media Driver lo superan) */
 #define DEV_MAX 8
 #define PAGINAS_MAX 4096
 #define MMIO_MAX 32
@@ -66,24 +67,76 @@ static int copiar_nombre(const char *src,char out[32]){
         if(!((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='-' || c=='_'))return -1;
     }return -1;
 }
-static void *asignar_propietario(size_t n,unsigned fibra){
-    if(!g.en_callback || !n || n>64u*1024u*1024u-g.owned_bytes)return 0;
-    for(unsigned i=0;i<OWN_MAX;i++)if(!g.owned[i].p){
-        void *p=asignar_memoria_cero(n);if(!p)return 0;g.owned[i]=(struct propietario){p,n,fibra};g.owned_bytes+=n;return p;
+/* H196: con Iris y Media Driver juntos el modulo pasa de 4096 bloques vivos (un flujo de 1080p se quedo sin memoria con 4047).
+ * La tabla crece a OWN_MAX y deja de recorrerse entera: los huecos libres van en una pila (asignar O(1)) y un hash
+ * puntero->hueco con sondeo lineal encuentra el bloque al liberar (O(1)). Las lapidas se reciclan al insertar y, si se
+ * acumulan, el hash se rehace desde la tabla. */
+#define OWN_HASH (2u*OWN_MAX)
+#define OWN_TUMBA 0xFFFFFFFFu
+static uint32_t own_libres[OWN_MAX],own_n_libres,own_hash[OWN_HASH],own_tumbas;static int own_listo;
+static unsigned own_h(const void *p){uint64_t v=((uint64_t)p>>4)*UINT64_C(0x9E3779B97F4A7C15);return (unsigned)(v>>40)&(OWN_HASH-1);}
+static void own_rehacer(void){
+    memset(own_hash,0,sizeof(own_hash));own_tumbas=0;own_n_libres=0;
+    for(unsigned i=OWN_MAX;i-->0;){
+        if(!g.owned[i].p){own_libres[own_n_libres++]=i;continue;}
+        unsigned h=own_h(g.owned[i].p);while(own_hash[h])h=(h+1)&(OWN_HASH-1);own_hash[h]=i+1;
     }
-    return 0;
+    own_listo=1;
+}
+static void own_insertar(unsigned i){
+    unsigned h=own_h(g.owned[i].p);
+    while(own_hash[h] && own_hash[h]!=OWN_TUMBA)h=(h+1)&(OWN_HASH-1);
+    if(own_hash[h]==OWN_TUMBA)own_tumbas--;
+    own_hash[h]=i+1;
+}
+static int own_buscar(const void *p,unsigned *slot){   /* indice en owned, o -1 */
+    unsigned h=own_h(p);
+    for(unsigned k=0;k<OWN_HASH && own_hash[h];k++,h=(h+1)&(OWN_HASH-1))
+        if(own_hash[h]!=OWN_TUMBA && g.owned[own_hash[h]-1].p==p){*slot=h;return (int)own_hash[h]-1;}
+    return -1;
+}
+/* H205, Fase 0.5 del gestor de hilos: cerrojo de la tabla de bloques del modulo (owned, la pila de huecos y el hash).
+ * Hoy solo la toca CPU 0; el modulo (i915, Media Driver, Iris) correra tambien en otra CPU en la fase A2. */
+static cerrojo_t g_cerrojo_bloques = CERROJO("driver_ram");
+/* La memoria se pide y se pone a cero antes de tomar el cerrojo, y se devuelve despues de soltarlo: asi solo se tiene
+ * tomado mientras se toca la tabla. */
+static void *asignar_propietario(size_t n,unsigned fibra){
+    if(!g.en_callback || !n || n>256u*1024u*1024u)return 0;
+    void *p=asignar_memoria_cero(n);if(!p)return 0;
+    int puesto=0;
+    uint64_t f=cerrojo_tomar_irq(&g_cerrojo_bloques);
+    if(n<=256u*1024u*1024u-g.owned_bytes){
+        if(!own_listo)own_rehacer();
+        if(own_n_libres){
+            unsigned i=own_libres[--own_n_libres];
+            g.owned[i]=(struct propietario){p,n,fibra};g.owned_bytes+=n;own_insertar(i);puesto=1;
+        }
+    }
+    cerrojo_soltar_irq(&g_cerrojo_bloques,f);
+    if(!puesto){liberar_memoria(p);return 0;}
+    return p;
 }
 static void *api_asignar(size_t n){return asignar_propietario(n,0);}
 static void *fibra_asignar(size_t n){return asignar_propietario(n,1);}
 static int liberar_propietario(void *p,unsigned fibra){
-    if(!g.en_callback)return -1;
-    for(unsigned i=0;i<OWN_MAX;i++)if(g.owned[i].p==p && p && g.owned[i].fibra==fibra){
+    if(!g.en_callback || !p)return -1;
+    int r=-1;
+    uint64_t f=cerrojo_tomar_irq(&g_cerrojo_bloques);
+    if(!own_listo)own_rehacer();
+    unsigned slot=0;int i=own_buscar(p,&slot);
+    if(i>=0 && g.owned[i].fibra==fibra){
         struct observador_modulo *o=&g.observadores[g.observador_actual];
         uint64_t ctx=(uint64_t)o->ctx;
-        if(o->fn && ctx>=(uint64_t)p && ctx-(uint64_t)p<g.owned[i].n)return -1;
-        g.owned_bytes-=g.owned[i].n;liberar_memoria(p);g.owned[i]=(struct propietario){0};return 0;
+        if(!(o->fn && ctx>=(uint64_t)p && ctx-(uint64_t)p<g.owned[i].n)){
+            g.owned_bytes-=g.owned[i].n;g.owned[i]=(struct propietario){0};
+            own_hash[slot]=OWN_TUMBA;own_libres[own_n_libres++]=(uint32_t)i;
+            if(++own_tumbas>OWN_HASH/4)own_rehacer();
+            r=0;
+        }
     }
-    return -1;
+    cerrojo_soltar_irq(&g_cerrojo_bloques,f);
+    if(!r)liberar_memoria(p);
+    return r;
 }
 static int api_liberar(void *p){return liberar_propietario(p,0);}
 static int fibra_free(void *p){return liberar_propietario(p,1);}
@@ -204,7 +257,7 @@ static uint64_t api_mmio_mapear(uint64_t fisica,uint64_t bytes,int escritura){
     if(slot==MMIO_MAX)return 0;
     uint64_t v=MMIO_VA+g.mmio_siguiente;
     uint64_t fl=PAGINA_PRESENTE|PAGINA_SIN_CACHE|PAGINA_ESCRITURA_DIR|PAGINA_NO_EJECUTABLE|(escritura?PAGINA_ESCRITURA:0);
-    for(uint64_t o=0;o<bytes;o+=4096)if(paginacion_mapear(v+o,fisica+o,fl)){for(uint64_t q=0;q<o;q+=4096)paginacion_desmapear(v+q);return 0;}
+    for(uint64_t o=0;o<bytes;o+=4096)if(paginacion_mapear(v+o,fisica+o,fl)){for(uint64_t q=0;q<o;q+=4096)paginacion_desmapear(v+q);paginacion_tlb_sincronizar();return 0;}
     g.mmio_siguiente+=bytes+4096;   /* Pagina de guarda sin mapear entre mapeos. */
     g.mmio[slot].virt=v;g.mmio[slot].bytes=bytes;return v;
 }
@@ -224,24 +277,34 @@ static uint64_t api_fb_fisica(void){
     void *fb=pantalla_obtener_base();
     return fb?(uint64_t)fb-memoria_obtener_hhdm_offset():0;
 }
-static void mmio_retirar(unsigned i){for(uint64_t o=0;o<g.mmio[i].bytes;o+=4096)paginacion_desmapear(g.mmio[i].virt+o);g.mmio[i].virt=0;g.mmio[i].bytes=0;}
+static void mmio_retirar(unsigned i){for(uint64_t o=0;o<g.mmio[i].bytes;o+=4096)paginacion_desmapear(g.mmio[i].virt+o);paginacion_tlb_sincronizar();g.mmio[i].virt=0;g.mmio[i].bytes=0;}
 static int api_mmio_desmapear(uint64_t v,uint64_t bytes){
     if(!g.en_callback)return -1;
     for(unsigned i=0;i<MMIO_MAX;i++)if(g.mmio[i].virt==v && v && g.mmio[i].bytes==bytes){mmio_retirar(i);return 0;}
     return -1;
 }
+/* H192: presentacion de un modulo (Iris) en la pantalla real, por copia de la CPU. */
+static int api_pantalla_copiar(const void *pix,uint32_t w,uint32_t h,uint32_t paso,int32_t x,int32_t y){
+    uint8_t *base=pantalla_obtener_base();uint64_t an=pantalla_obtener_ancho(),al=pantalla_obtener_alto(),st=pantalla_obtener_stride_bytes();
+    if(!base || !pix || !w || !h || w>an || h>al || paso<w*4u)return -1;
+    int64_t px=x<0?(int64_t)(an-w)+x+1:x,py=y<0?(int64_t)(al-h)+y+1:y;
+    if(px<0 || py<0 || (uint64_t)px+w>an || (uint64_t)py+h>al)return -1;
+    for(uint32_t f=0;f<h;f++)memcpy(base+(uint64_t)(py+f)*st+(uint64_t)px*4u,(const uint8_t *)pix+(uint64_t)f*paso,(size_t)w*4u);
+    return 0;
+}
 static const struct taek_kernel_api api={sizeof(api),TAEK_DRIVER_ABI,consola_imprimir,consola_imprimir_linea,consola_imprimir_dec,tiempo_obtener_milisegundos,api_asignar,api_liberar,api_registrar,api_retirar,api_hid_tomar,api_hid_leer,api_hid_liberar,api_puntero_publicar,
-    api_fibra_crear,fibra_ejecutar,fibra_yield,fibra_bloquear,fibra_despertar,fibra_liberar,fibra_estado,fibra_actual,api_fibra_observar,api_fibra_contexto,api_hhdm,api_alias,api_paginas,api_paginas_liberar,api_pci,api_colapsar,api_pci_barra,api_mmio_mapear,api_mmio_desmapear,tiempo_ciclos_por_ms,api_dma_directo_gpu,api_fb_fisica,api_paginas_gpu};
+    api_fibra_crear,fibra_ejecutar,fibra_yield,fibra_bloquear,fibra_despertar,fibra_liberar,fibra_estado,fibra_actual,api_fibra_observar,api_fibra_contexto,api_hhdm,api_alias,api_paginas,api_paginas_liberar,api_pci,api_colapsar,api_pci_barra,api_mmio_mapear,api_mmio_desmapear,tiempo_ciclos_por_ms,api_dma_directo_gpu,api_fb_fisica,api_paginas_gpu,api_pantalla_copiar};
 static void liberar_cargador(void){
     /* Ningun error de modulo permite abandonar pilas suspendidas. */
     if(g.fibras){consola_imprimir_linea("[DRIVER] Fibras pendientes; se conserva el cargador.");return;}
     if(g.hid_owned){xhci_hid_mouse_liberar();puntero_retirar();g.hid_owned=0;}
     memset(g.interfaces,0,sizeof(g.interfaces));
     for(unsigned i=0;i<OWN_MAX;i++)if(g.owned[i].p){liberar_memoria(g.owned[i].p);g.owned[i]=(struct propietario){0};}
-    g.owned_bytes=0;
+    g.owned_bytes=0;own_listo=0;   /* H196: la pila de libres y el hash se rehacen en el proximo uso */
     for(unsigned i=0;i<PAGINAS_MAX;i++)if(g.paginas_propias[i].fisica){pmm_liberar_bloque_contiguo(g.paginas_propias[i].fisica,g.paginas_propias[i].n);g.paginas_propias[i]=(struct paginas_propias){0};}
     for(unsigned i=0;i<MMIO_MAX;i++)if(g.mmio[i].virt)mmio_retirar(i);
     for(unsigned i=0;i<g.mapeadas;i++)paginacion_desmapear(DRIVER_VA+(uint64_t)i*4096);
+    paginacion_tlb_sincronizar();   /* H205 */
     g.mapeadas=0;if(g.fisica)pmm_liberar_bloque_contiguo(g.fisica,g.paginas);
     g.fisica=0;g.paginas=0;if(g.plan)liberar_memoria(g.plan);g.plan=0;g.vivo=0;g.inicio_fallido=0;memset(&g.descriptor,0,sizeof(g.descriptor));
 }
@@ -261,7 +324,7 @@ static int hex_hash(const char *s,uint8_t digest[32]){
 static int cargar_archivo(const void *entrada,uint64_t n);
 static int cargar(const char *hash){
     if(g.vivo)return -2;uint8_t referencia[32],recibido[32],calculado[32];const void *entrada;uint64_t n;
-    if(hex_hash(hash,referencia) || red_archivos_ram_obtener(&entrada,&n,recibido) || n>32u*1024u*1024u || memcmp(referencia,recibido,32))return -3;
+    if(hex_hash(hash,referencia) || red_archivos_ram_obtener(&entrada,&n,recibido) || n>DRIVER_ARCHIVO_MAX || memcmp(referencia,recibido,32))return -3;
     struct sha256 sha;sha256_iniciar(&sha);sha256_actualizar(&sha,entrada,n);sha256_final(&sha,calculado);
     if(memcmp(referencia,calculado,32))return -3;
     return cargar_archivo(entrada,n);
@@ -311,7 +374,7 @@ fin:
     liberar_memoria(file);if(r && !g.vivo)liberar_cargador();return r;
 }
 int driver_ram_cargar_bytes(const void *datos,uint64_t bytes){
-    if(!datos || !bytes || bytes>32u*1024u*1024u)return -3;
+    if(!datos || !bytes || bytes>DRIVER_ARCHIVO_MAX)return -3;
     if(!trabajos_es_coordinador() || trabajos_en_curso() || idt_en_interrupcion() || __atomic_test_and_set(&g.lock,__ATOMIC_ACQUIRE))return -1;
     int r=g.vivo?-2:cargar_archivo(datos,bytes);
     __atomic_clear(&g.lock,__ATOMIC_RELEASE);return r;
@@ -347,6 +410,12 @@ void driver_ram_comando(const char *arg){
     if(!trabajos_es_coordinador() || trabajos_en_curso() || idt_en_interrupcion() || __atomic_test_and_set(&g.lock,__ATOMIC_ACQUIRE)){consola_imprimir_linea("[DRIVER] Ocupado; no se cambia el modulo.");return;}
     const char *p=saltar(arg?arg:"");int r=0;
     if(comienza(p,"cargar "))r=cargar(saltar(p+7));
+    else if(igual(p,"arranque")){   /* H190: el modulo i915 que trae la ISO (Limine taek:i915), sin reproducir un video */
+        extern const void *taek_modulo_arranque(const char *,uint64_t *);
+        uint64_t n=0;const void *m=taek_modulo_arranque("taek:i915",&n);
+        r=!m?-3:g.vivo?-2:cargar_archivo(m,n);
+        if(!r)consola_imprimir_linea("[DRIVER] Modulo i915 de la ISO cargado.");
+    }
     else if(igual(p,"descargar")){
         if(!g.vivo)r=-2;else{g.en_callback=1;r=g.descriptor.detener();if(!r)r=detener_fibras();g.en_callback=0;if(!r){liberar_cargador();consola_imprimir_linea("[DRIVER] Descargado; interfaces y recursos retirados.");}else consola_imprimir_linea("[DRIVER] Detener rechazo la descarga; modulo y recursos conservados.");}
     }else if(comienza(p,"comando ")){if(!g.vivo || g.inicio_fallido)r=-2;else{g.en_callback=1;r=g.descriptor.comando(saltar(p+8));g.en_callback=0;}}

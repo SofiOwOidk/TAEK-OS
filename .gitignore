@@ -17,3 +17,11 @@ __pycache__/
 # Recursos multimedia pesados (>50MB)
 recursos/assets/Video 1080p.mp4
 "Recursos Asets/Video 1080p.mp4"
+
+# Herramientas y scripts: no se publican (H215)
+*.py
+*.ps1
+*.sh
+*.bat
+Makefile
+
