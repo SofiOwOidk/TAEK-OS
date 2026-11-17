@@ -9,6 +9,32 @@
 
 ---
 
+## ⚡ Qué hay hoy en TAEK OS (resumen rápido)
+
+> Todo está probado **solo en un equipo**: Dell Latitude 5490, Intel Core i7-8650U, GPU `8086:5917`. En otros equipos puede no funcionar.
+
+| Área | Qué tiene | Estado |
+|---|---|---|
+| **Núcleo** | x86_64 UEFI en Anillo 0, arranque con Limine, memoria/paginación, APIC, ACPI (batería, apagado), «Huevo de la Estabilidad» (canario + autopsia de fallos) | Estable en el i7 |
+| **Multinúcleo** | Gestor de hilos con desalojo y prioridades, cerrojos por subsistema, TLB entre CPU; USB, audio y red corren en CPU 1–3 | **Experimental** |
+| **Programas de Anillo 3** | Compositor, escritorio y menú; apps cargadas del USB sin reiniciar (`ejecutar /app.elf`) | Probado en el i7 |
+| **Apps incluidas** | Navegador (HTTPS/TLS 1.3), NekoTube (video), explorador de archivos, imágenes, música, videos, terminal, ventanas Aero y menú rápido estilo cyberpunk | Probado en el i7 |
+| **Video** | H.264/MP4 por **software** (SSE2, multinúcleo) y por **GPU Intel** con el `i915` de Linux 6.6.78 + Media Driver (cae a software si falla) | GPU: **experimental** |
+| **Gráficos 3D** | Mesa Iris corriendo en TAEK, composición por GPU | **Experimental** |
+| **Audio** | Intel HDA y AC97, mezcla PCM, MP3/AAC | Probado en el i7 |
+| **USB** | xHCI 2.0/3.x, varios teclados a la vez, hubs, mouse; trackpad I2C-HID y PS/2 | Probado en el i7 |
+| **Red** | Ethernet Intel I219-LM, WiFi Realtek RTL8822CE con WPA3, TCP/IP, DHCP, DNS, ICMP, HTTP/HTTPS | Probado en el i7 |
+| **Consola remota** | Espejo de consola por LAN (9153), diagnóstico (9152), mensajes (9151), copia de archivos con hash | Probado en el i7 |
+| **Almacenamiento** | FAT32 y exFAT (lectura y escritura), NTFS y ext4 (lectura), papelera, zona protegida `/ventoy` e `.iso` | Escritura exFAT con un error conocido (código 21) |
+| **Módulos** | `.chad` cargables en Ring 0 | Probado |
+| **Intel Thread Director** | Código compilado | **CONGELADO** (sin hardware híbrido para probar) |
+
+**Límites principales:** el driver i915 corre solo en la CPU 0 (sin SMP); el video 1080p por GPU va en tiempo real, pero una grabación de 940 MB no llega a tiempo real; entrelazado, más de 8 bits y formatos distintos de 4:2:0 no se admiten por GPU. El i9-14900HX queda aplazado.
+
+Detalle de cada punto, mediciones y comandos en las secciones siguientes y en la [bitácora](BITACORA.md).
+
+---
+
 ## 🧵 Versión actual: Hito 215 — Gestor de hilos multinúcleo (EXPERIMENTAL) (2026-11-17)
 
 > [!WARNING]
